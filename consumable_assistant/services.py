@@ -190,6 +190,8 @@ def parse_transaction_preview(conn: sqlite3.Connection, text: str) -> dict[str, 
 
     operations = []
     for idx, op in enumerate(operations_data):
+        if not isinstance(op, dict):
+            op = {}
         action = normalize_action(
             op.get("action") if "action" in op else infer_action(text)
         )

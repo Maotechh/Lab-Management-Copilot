@@ -160,6 +160,9 @@ async function previewTransaction() {
     }
     renderPreview(data);
     if (window.lucide) window.lucide.createIcons();
+  } catch (err) {
+    toast(err.message || "解析失败");
+    console.error(err);
   } finally {
     $("#previewBtn").disabled = false;
   }
