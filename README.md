@@ -1,6 +1,10 @@
-# 耗材智能管理助手
+# 耗材智能管理助手 (Lab-Management-Copilot)
 
-这是一个面向化学实验教学平台的校内耗材管理 Web 应用。当前版本包含库存查询、聊天改数、库存预警、实验准备清单解析和 Excel 导出。
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![CI](https://github.com/Maotechh/Lab-Management-Copilot/actions/workflows/ci.yml/badge.svg)
+
+这是一个面向化学实验教学平台的校内耗材管理 Web 应用。提供现代化的极简界面，包含**库存查询、自然语言多目标识别改数、库存预警、实验准备清单自动解析、以及一键 Excel 导出**等功能。
 
 ## 功能
 
@@ -11,15 +15,25 @@
 - 低库存条目在页面内显示，并支持浏览器通知。
 - 上传实验准备 Excel，生成库存核对和采购清单。
 
-## 运行
+## 🚀 快速运行
 
+1. 安装依赖：
 ```bash
 python -m pip install -r requirements.txt
+```
+
+2. 导入种子数据（可选，第一次启动时也会自动检测导入）：
+```bash
 python scripts/seed_data.py
+```
+
+3. 启动服务：
+```bash
 uvicorn consumable_assistant.server:app --reload --host 0.0.0.0 --port 8000
 ```
 
-如果要启用校内 GenAI 接口，在项目根目录放一个 `.env.local`，写入 `GENAI_API_KEY`、`GENAI_MODEL=deepseek-pro` 和 `GENAI_MODE=completion` 即可。
+> **🔑 高级特性：大语言模型支持**  
+> 如果要启用基于大模型（GenAI）的复杂自然语言识别功能，请复制项目根目录下的 `.env.example` 为 `.env.local`，并填入相应的 `GENAI_API_KEY` 等参数。
 
 浏览器打开：
 
@@ -39,10 +53,20 @@ http://127.0.0.1:8000
 - 借出和归还只保留记录，不改变当前库存数量。
 - 消耗会减少当前库存，入库会增加当前库存。
 
-## 检查
+## ✅ 代码检查与测试
+
+本项目配置了自动化测试，如果你修改了核心逻辑，可以通过以下命令快速自测：
 
 ```bash
 python scripts/smoke_test.py
 ```
 
-该脚本会在临时数据库中导入三份数据，检查搜索、文本识别、库存变更和实验清单解析。
+该脚本会在内存临时数据库中导入示例数据，检查搜索逻辑、文本解析引擎、并发库存变更以及实验清单比对算法的准确性。
+
+## 🤝 参与贡献
+
+欢迎提交 Issue 和 Pull Request！参与开发前请查阅 [CONTRIBUTING.md](./CONTRIBUTING.md)。
+
+## 📄 许可协议
+
+本项目基于 [MIT License](./LICENSE) 协议开源。
