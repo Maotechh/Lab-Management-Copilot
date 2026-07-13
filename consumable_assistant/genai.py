@@ -106,10 +106,7 @@ SYSTEM_PROMPT = """
 
 
 def build_prompt(text: str) -> str:
-    return (
-        "请解析下面这条库存操作输入，并按要求输出 JSON：\n"
-        f"{text}\n"
-    )
+    return f"请解析下面这条库存操作输入，并按要求输出 JSON：\n{text}\n"
 
 
 def extract_text(payload: Any) -> str | None:

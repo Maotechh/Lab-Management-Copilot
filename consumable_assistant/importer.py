@@ -12,7 +12,13 @@ from typing import Any
 
 import pandas as pd
 
-from .normalization import clean_cell, extract_aliases, normalize_text, parse_float, stable_key
+from .normalization import (
+    clean_cell,
+    extract_aliases,
+    normalize_text,
+    parse_float,
+    stable_key,
+)
 from .settings import ATTACHMENT_DIR
 
 
@@ -80,7 +86,15 @@ def read_inventory_sheet(path: Path) -> pd.DataFrame:
             env["XDG_CACHE_HOME"] = os.path.join(tmp, "cache")
             os.makedirs(env["XDG_CACHE_HOME"], exist_ok=True)
             subprocess.run(
-                ["soffice", "--headless", "--convert-to", "xlsx", "--outdir", tmp, str(path)],
+                [
+                    "soffice",
+                    "--headless",
+                    "--convert-to",
+                    "xlsx",
+                    "--outdir",
+                    tmp,
+                    str(path),
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -111,7 +125,9 @@ def import_all_sources(
     }
 
 
-def import_source(conn: sqlite3.Connection, path: Path, config: SourceConfig) -> dict[str, Any]:
+def import_source(
+    conn: sqlite3.Connection, path: Path, config: SourceConfig
+) -> dict[str, Any]:
     job_id = conn.execute(
         "INSERT INTO import_jobs(source_file) VALUES (?)", (path.name,)
     ).lastrowid
@@ -219,7 +235,11 @@ def map_source_row(
         "unit": clean_cell(row.get(config.unit_col)),
         "threshold": float(threshold) if threshold is not None else 0.0,
         "remark": clean_cell(row.get(config.remark_col)) if config.remark_col else None,
-        "raw": {str(key): clean_cell(value) for key, value in row.items() if clean_cell(value) is not None},
+        "raw": {
+            str(key): clean_cell(value)
+            for key, value in row.items()
+            if clean_cell(value) is not None
+        },
     }
     mapped["item_key"] = stable_key(
         [
@@ -256,17 +276,26 @@ def map_source_row(
 
 
 def source_row_exists(conn: sqlite3.Connection, row_hash: str) -> bool:
-    return conn.execute("SELECT 1 FROM source_rows WHERE row_hash = ?", (row_hash,)).fetchone() is not None
+    return (
+        conn.execute(
+            "SELECT 1 FROM source_rows WHERE row_hash = ?", (row_hash,)
+        ).fetchone()
+        is not None
+    )
 
 
-def upsert_inventory_item(conn: sqlite3.Connection, mapped: dict[str, Any]) -> tuple[int, bool]:
+def upsert_inventory_item(
+    conn: sqlite3.Connection, mapped: dict[str, Any]
+) -> tuple[int, bool]:
     existing = conn.execute(
         "SELECT id, quantity, threshold, remark FROM inventory_items WHERE item_key = ?",
         (mapped["item_key"],),
     ).fetchone()
     if existing:
         item_id = int(existing["id"])
-        threshold = max(float(existing["threshold"] or 0), float(mapped["threshold"] or 0))
+        threshold = max(
+            float(existing["threshold"] or 0), float(mapped["threshold"] or 0)
+        )
         remark = existing["remark"] or mapped["remark"]
         conn.execute(
             """
@@ -320,7 +349,9 @@ def add_aliases(conn: sqlite3.Connection, item_id: int, name: str) -> None:
 def insert_import_transaction(
     conn: sqlite3.Connection, item_id: int, mapped: dict[str, Any]
 ) -> None:
-    item = conn.execute("SELECT quantity, unit FROM inventory_items WHERE id = ?", (item_id,)).fetchone()
+    item = conn.execute(
+        "SELECT quantity, unit FROM inventory_items WHERE id = ?", (item_id,)
+    ).fetchone()
     quantity_after = float(item["quantity"])
     quantity_before = quantity_after - float(mapped["quantity"])
     conn.execute(

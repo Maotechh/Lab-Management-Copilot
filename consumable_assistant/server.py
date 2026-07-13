@@ -97,7 +97,9 @@ def api_search_items(
     limit: int = 80,
 ) -> dict[str, Any]:
     with connect() as conn:
-        rows = search_items(conn, q=q, category=category, lab=lab, low_stock=low_stock, limit=limit)
+        rows = search_items(
+            conn, q=q, category=category, lab=lab, low_stock=low_stock, limit=limit
+        )
         return {"rows": rows, "row_count": len(rows)}
 
 
@@ -112,7 +114,10 @@ def api_alerts() -> dict[str, Any]:
 def api_update_threshold(item_id: int, payload: ThresholdRequest) -> dict[str, Any]:
     try:
         with connect() as conn:
-            return {"ok": True, "transaction": update_threshold(conn, item_id, payload.threshold)}
+            return {
+                "ok": True,
+                "transaction": update_threshold(conn, item_id, payload.threshold),
+            }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -144,7 +149,9 @@ def api_transaction_commit(payload: TransactionCommitRequest) -> dict[str, Any]:
 
 
 @app.post("/api/transactions/commit_bulk")
-def api_transaction_commit_bulk(payload: BulkTransactionCommitRequest) -> dict[str, Any]:
+def api_transaction_commit_bulk(
+    payload: BulkTransactionCommitRequest,
+) -> dict[str, Any]:
     try:
         with connect() as conn:
             transactions = []

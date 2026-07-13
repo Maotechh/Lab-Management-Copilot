@@ -44,7 +44,9 @@ ACTION_LABELS = {
 def get_stats(conn: sqlite3.Connection) -> dict[str, Any]:
     item_count = conn.execute("SELECT COUNT(*) FROM inventory_items").fetchone()[0]
     source_count = conn.execute("SELECT COUNT(*) FROM source_rows").fetchone()[0]
-    txn_count = conn.execute("SELECT COUNT(*) FROM inventory_transactions").fetchone()[0]
+    txn_count = conn.execute("SELECT COUNT(*) FROM inventory_transactions").fetchone()[
+        0
+    ]
     low_stock_count = conn.execute(
         "SELECT COUNT(*) FROM inventory_items WHERE threshold > 0 AND quantity < threshold"
     ).fetchone()[0]
@@ -90,7 +92,7 @@ def search_items(
             f"""
             SELECT *
             FROM inventory_items
-            WHERE {' AND '.join(where)}
+            WHERE {" AND ".join(where)}
             ORDER BY updated_at DESC, id DESC
             LIMIT 1500
             """,
@@ -113,12 +115,16 @@ def search_items(
     if query:
         ranked.sort(key=lambda item: (item["score"], item["quantity"]), reverse=True)
     else:
-        ranked.sort(key=lambda item: (item["low_stock"], item["updated_at"]), reverse=True)
+        ranked.sort(
+            key=lambda item: (item["low_stock"], item["updated_at"]), reverse=True
+        )
     return ranked[:limit]
 
 
 def load_alias_map(conn: sqlite3.Connection) -> dict[int, list[str]]:
-    rows = conn.execute("SELECT item_id, alias FROM item_aliases ORDER BY alias").fetchall()
+    rows = conn.execute(
+        "SELECT item_id, alias FROM item_aliases ORDER BY alias"
+    ).fetchall()
     alias_map: dict[int, list[str]] = {}
     for row in rows:
         alias_map.setdefault(int(row["item_id"]), []).append(str(row["alias"]))
@@ -171,31 +177,41 @@ def parse_transaction_preview(conn: sqlite3.Connection, text: str) -> dict[str, 
         if model_result:
             model_name = str(model_result.get("model") or "")
             engine = "deepseek-pro"
-            
+
     operations_data = []
-    if model_result and isinstance(model_result.get("operations"), list) and model_result["operations"]:
+    if (
+        model_result
+        and isinstance(model_result.get("operations"), list)
+        and model_result["operations"]
+    ):
         operations_data = model_result["operations"]
     else:
         operations_data = [model_result or {}]
-        
+
     operations = []
     for idx, op in enumerate(operations_data):
-        action = normalize_action(op.get("action") if "action" in op else infer_action(text))
-        raw_item_query = clean_cell(op.get("item_query")) or clean_cell(op.get("item_name")) or text
+        action = normalize_action(
+            op.get("action") if "action" in op else infer_action(text)
+        )
+        raw_item_query = (
+            clean_cell(op.get("item_query")) or clean_cell(op.get("item_name")) or text
+        )
         item_query = clean_item_query(raw_item_query, None)
         quantity_value = parse_number_value(op.get("quantity")) if op else None
         threshold_value = parse_number_value(op.get("threshold")) if op else None
-        
-        local_quantity_match = extract_quantity(text) if not op else QuantityMatch(None, None, None)
+
+        local_quantity_match = (
+            extract_quantity(text) if not op else QuantityMatch(None, None, None)
+        )
         if quantity_value is None and not op:
             quantity_value = local_quantity_match.value
             if not item_query:
                 item_query = clean_item_query(text, local_quantity_match.span)
-                
+
         unit_value = normalize_unit(op.get("unit")) if op else None
         if not unit_value and not op:
             unit_value = local_quantity_match.unit
-            
+
         candidates = search_items(conn, item_query or text, limit=8)
         needs_review = bool(op.get("needs_review")) if op else False
         if action == "needs_review" or not candidates:
@@ -206,22 +222,26 @@ def parse_transaction_preview(conn: sqlite3.Connection, text: str) -> dict[str, 
             quantity_value = 0.0
         if action == "threshold" and threshold_value is not None:
             quantity_value = threshold_value
-            
-        operations.append({
-            "id": f"op-{idx}",
-            "raw_text": text if len(operations_data) == 1 else f"解析部分: {op.get('item_query', '')} {op.get('action', '')} {op.get('quantity', '')}",
-            "action": action,
-            "action_label": ACTION_LABELS.get(action, action),
-            "quantity": quantity_value,
-            "unit": unit_value,
-            "threshold": threshold_value,
-            "item_query": item_query or text,
-            "candidates": candidates,
-            "needs_review": needs_review,
-            "message": build_preview_message(action, quantity_value, candidates),
-            "confidence": op.get("confidence") if op else None,
-        })
-        
+
+        operations.append(
+            {
+                "id": f"op-{idx}",
+                "raw_text": text
+                if len(operations_data) == 1
+                else f"解析部分: {op.get('item_query', '')} {op.get('action', '')} {op.get('quantity', '')}",
+                "action": action,
+                "action_label": ACTION_LABELS.get(action, action),
+                "quantity": quantity_value,
+                "unit": unit_value,
+                "threshold": threshold_value,
+                "item_query": item_query or text,
+                "candidates": candidates,
+                "needs_review": needs_review,
+                "message": build_preview_message(action, quantity_value, candidates),
+                "confidence": op.get("confidence") if op else None,
+            }
+        )
+
     return {
         "operations": operations,
         "engine": engine,
@@ -238,13 +258,31 @@ def infer_action(text: str) -> str:
         return "adjust"
     if any(word in compact for word in ["归还", "还回", "放回"]):
         return "return"
-    if any(word in compact for word in ["入库", "买了", "采购", "补充", "新增", "到货", "增加"]):
+    if any(
+        word in compact
+        for word in ["入库", "买了", "采购", "补充", "新增", "到货", "增加"]
+    ):
         return "inbound"
-    if any(word in compact for word in ["不放回", "消耗", "用了", "使用了", "报废", "破损", "碎了", "出库", "减少"]):
+    if any(
+        word in compact
+        for word in [
+            "不放回",
+            "消耗",
+            "用了",
+            "使用了",
+            "报废",
+            "破损",
+            "碎了",
+            "出库",
+            "减少",
+        ]
+    ):
         return "consume"
     if any(word in compact for word in ["借出", "借用", "借给", "暂借"]):
         return "borrow"
-    if any(word in compact for word in ["取出", "拿走"]) and any(word in compact for word in ["回头", "之后", "稍后"]):
+    if any(word in compact for word in ["取出", "拿走"]) and any(
+        word in compact for word in ["回头", "之后", "稍后"]
+    ):
         return "borrow"
     return "needs_review"
 
@@ -286,7 +324,9 @@ def normalize_unit(value: Any) -> str | None:
 
 
 def extract_quantity(text: str) -> QuantityMatch:
-    unit_pattern = "|".join(re.escape(unit) for unit in sorted(UNIT_WORDS, key=len, reverse=True))
+    unit_pattern = "|".join(
+        re.escape(unit) for unit in sorted(UNIT_WORDS, key=len, reverse=True)
+    )
     numeric_matches: list[QuantityMatch] = []
     for match in re.finditer(r"\d+(?:\.\d+)?", text):
         after = text[match.end() : match.end() + 8].strip().lower()
@@ -295,15 +335,21 @@ def extract_quantity(text: str) -> QuantityMatch:
         unit_match = re.match(rf"\s*({unit_pattern})", text[match.end() :])
         unit = unit_match.group(1) if unit_match else None
         end = match.end() + (unit_match.end() if unit_match else 0)
-        numeric_matches.append(QuantityMatch(float(match.group(0)), unit, (match.start(), end)))
+        numeric_matches.append(
+            QuantityMatch(float(match.group(0)), unit, (match.start(), end))
+        )
     if numeric_matches:
         with_unit = [item for item in numeric_matches if item.unit]
         return (with_unit or numeric_matches)[-1]
-    chinese_match = re.search(rf"([零一二两三四五六七八九十百]+)\s*({unit_pattern})", text)
+    chinese_match = re.search(
+        rf"([零一二两三四五六七八九十百]+)\s*({unit_pattern})", text
+    )
     if chinese_match:
         value = chinese_number_to_int(chinese_match.group(1))
         if value is not None:
-            return QuantityMatch(float(value), chinese_match.group(2), chinese_match.span())
+            return QuantityMatch(
+                float(value), chinese_match.group(2), chinese_match.span()
+            )
     return QuantityMatch(None, None, None)
 
 
@@ -359,7 +405,9 @@ def clean_item_query(text: str, quantity_span: tuple[int, int] | None) -> str:
     return re.sub(r"\s+", " ", working).strip()
 
 
-def build_preview_message(action: str, quantity: float | None, candidates: list[dict[str, Any]]) -> str:
+def build_preview_message(
+    action: str, quantity: float | None, candidates: list[dict[str, Any]]
+) -> str:
     if action == "needs_review":
         return "没有识别到明确的库存动作。"
     if quantity is None and action not in {"borrow", "return"}:
@@ -378,7 +426,9 @@ def apply_transaction(
     actor: str | None = None,
     unit: str | None = None,
 ) -> dict[str, Any]:
-    item = conn.execute("SELECT * FROM inventory_items WHERE id = ?", (item_id,)).fetchone()
+    item = conn.execute(
+        "SELECT * FROM inventory_items WHERE id = ?", (item_id,)
+    ).fetchone()
     if not item:
         raise ValueError("耗材不存在")
     before = float(item["quantity"])
@@ -445,15 +495,21 @@ def apply_transaction(
     return get_transaction(conn, int(txn_id))
 
 
-def undo_transaction(conn: sqlite3.Connection, txn_id: int, actor: str | None = None) -> dict[str, Any]:
-    txn = conn.execute("SELECT * FROM inventory_transactions WHERE id = ?", (txn_id,)).fetchone()
+def undo_transaction(
+    conn: sqlite3.Connection, txn_id: int, actor: str | None = None
+) -> dict[str, Any]:
+    txn = conn.execute(
+        "SELECT * FROM inventory_transactions WHERE id = ?", (txn_id,)
+    ).fetchone()
     if not txn:
         raise ValueError("操作记录不存在")
     if txn["source_type"] == "import":
         raise ValueError("初始导入记录不能撤销")
     if txn["undone_by"]:
         raise ValueError("该记录已经撤销")
-    item = conn.execute("SELECT * FROM inventory_items WHERE id = ?", (txn["item_id"],)).fetchone()
+    item = conn.execute(
+        "SELECT * FROM inventory_items WHERE id = ?", (txn["item_id"],)
+    ).fetchone()
     if not item:
         raise ValueError("耗材不存在")
     before = float(item["quantity"])
@@ -481,7 +537,10 @@ def undo_transaction(conn: sqlite3.Connection, txn_id: int, actor: str | None = 
             str(txn_id),
         ),
     ).lastrowid
-    conn.execute("UPDATE inventory_transactions SET undone_by = ? WHERE id = ?", (reverse_id, txn_id))
+    conn.execute(
+        "UPDATE inventory_transactions SET undone_by = ? WHERE id = ?",
+        (reverse_id, txn_id),
+    )
     conn.commit()
     return get_transaction(conn, int(reverse_id))
 
@@ -503,7 +562,9 @@ def get_transaction(conn: sqlite3.Connection, txn_id: int) -> dict[str, Any]:
     return result
 
 
-def list_transactions(conn: sqlite3.Connection, limit: int = 80) -> list[dict[str, Any]]:
+def list_transactions(
+    conn: sqlite3.Connection, limit: int = 80
+) -> list[dict[str, Any]]:
     rows = rows_to_dicts(
         conn.execute(
             """
@@ -527,20 +588,30 @@ def list_transactions(conn: sqlite3.Connection, limit: int = 80) -> list[dict[st
 def list_alerts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = search_items(conn, low_stock=True, limit=500)
     for row in rows:
-        row["missing_quantity"] = max(float(row["threshold"] or 0) - float(row["quantity"] or 0), 0.0)
+        row["missing_quantity"] = max(
+            float(row["threshold"] or 0) - float(row["quantity"] or 0), 0.0
+        )
         row["missing_quantity_text"] = quantity_to_text(row["missing_quantity"])
     return rows
 
 
-def update_threshold(conn: sqlite3.Connection, item_id: int, threshold: float) -> dict[str, Any]:
-    return apply_transaction(conn, item_id, "threshold", threshold, note="页面设置库存预警")
+def update_threshold(
+    conn: sqlite3.Connection, item_id: int, threshold: float
+) -> dict[str, Any]:
+    return apply_transaction(
+        conn, item_id, "threshold", threshold, note="页面设置库存预警"
+    )
 
 
 def parse_prepare_file(conn: sqlite3.Connection, path: Path) -> dict[str, Any]:
     df = read_inventory_sheet(path).dropna(how="all")
     df.columns = [str(col).strip() for col in df.columns]
-    name_col = resolve_column(df.columns, ["耗材名称", "产品名", "名称", "物品", "耗材", "item", "product"])
-    quantity_col = resolve_column(df.columns, ["需求数量", "所需数量", "数量", "用量", "需要数量", "qty"])
+    name_col = resolve_column(
+        df.columns, ["耗材名称", "产品名", "名称", "物品", "耗材", "item", "product"]
+    )
+    quantity_col = resolve_column(
+        df.columns, ["需求数量", "所需数量", "数量", "用量", "需要数量", "qty"]
+    )
     unit_col = resolve_column(df.columns, ["数量单位", "单位", "unit"])
     spec_col = resolve_column(df.columns, ["规格型号", "规格", "型号", "spec"])
     if not name_col or not quantity_col:
@@ -603,12 +674,12 @@ def resolve_column(columns: list[str] | pd.Index, names: list[str]) -> str | Non
     return None
 
 
-def choose_prepare_matches(query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def choose_prepare_matches(
+    query: str, candidates: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     q = normalize_text(query)
     exact = [
-        item
-        for item in candidates
-        if q and q == normalize_text(item.get("item_name"))
+        item for item in candidates if q and q == normalize_text(item.get("item_name"))
     ]
     if exact:
         return exact
@@ -616,7 +687,11 @@ def choose_prepare_matches(query: str, candidates: list[dict[str, Any]]) -> list
         return []
     top_score = float(candidates[0].get("score") or 0)
     if top_score >= 90:
-        return [item for item in candidates if float(item.get("score") or 0) >= top_score - 2]
+        return [
+            item
+            for item in candidates
+            if float(item.get("score") or 0) >= top_score - 2
+        ]
     return [item for item in candidates if float(item.get("score") or 0) >= 75][:3]
 
 
@@ -653,7 +728,19 @@ def export_inventory_workbook(conn: sqlite3.Connection) -> bytes:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "当前库存"
-    headers = ["类别", "实验室", "耗材名称", "规格型号", "品牌", "位置", "数量", "单位", "库存预警", "备注", "来源行数"]
+    headers = [
+        "类别",
+        "实验室",
+        "耗材名称",
+        "规格型号",
+        "品牌",
+        "位置",
+        "数量",
+        "单位",
+        "库存预警",
+        "备注",
+        "来源行数",
+    ]
     sheet.append(headers)
     for item in items:
         sheet.append(
@@ -678,7 +765,20 @@ def export_prepare_workbook(rows: list[dict[str, Any]]) -> bytes:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "实验准备核对"
-    sheet.append(["耗材名称", "规格", "需求数量", "单位", "可用数量", "还需采购", "采购数量", "采购单位", "位置", "状态"])
+    sheet.append(
+        [
+            "耗材名称",
+            "规格",
+            "需求数量",
+            "单位",
+            "可用数量",
+            "还需采购",
+            "采购数量",
+            "采购单位",
+            "位置",
+            "状态",
+        ]
+    )
     for row in rows:
         locations = "；".join(
             f"{item.get('lab') or ''} {item.get('location_code') or ''} {quantity_to_text(item.get('quantity'))}{item.get('unit') or ''}".strip()
