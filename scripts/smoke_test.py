@@ -48,7 +48,10 @@ def main() -> None:
             search_rows = search_items(conn, "100mL烧杯", limit=10)
             assert search_rows, "search returned no rows"
 
-            preview = parse_transaction_preview(conn, "100mL烧杯入库 2 个")
+            preview_res = parse_transaction_preview(conn, "100mL烧杯入库 2 个")
+            ops = preview_res["operations"]
+            assert len(ops) == 1, preview_res
+            preview = ops[0]
             assert preview["action"] == "inbound", preview
             assert preview["quantity"] == 2, preview
             assert preview["candidates"], preview
