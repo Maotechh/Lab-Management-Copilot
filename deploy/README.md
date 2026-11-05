@@ -2,6 +2,14 @@
 
 The application runs as the `lab-management` system user under systemd. Nginx listens on the server's private IPv4 address and proxies to `127.0.0.1:8000`.
 
+The application process is independent of an SSH window. For an interactive maintenance shell, use `scripts/ssh_keepalive.sh` from the release checkout. It sends a keepalive probe every 20 seconds, allows six missed probes, and retries a dropped connection three times by default:
+
+```bash
+scripts/ssh_keepalive.sh -p 22112 lihanze@10.15.66.32
+```
+
+Set `SSH_KEEPALIVE_MAX_RETRIES=0` only when an indefinitely reconnecting maintenance shell is wanted. Do not run application processes directly in that shell; use the systemd units below so a terminal disconnect does not stop the service.
+
 On Ubuntu 24.04, install `python3-venv`, `nginx`, and `libreoffice-calc`. Extract the current application, requirements, attachments, and this deployment directory into `/opt/lab-management/releases/<release-id>`.
 
 For the initial deployment, include a consistent SQLite backup as `bootstrap/consumables.db` and the existing application environment as `bootstrap/environment`. Treat this directory and transfer archives as secrets. Run `bash deploy/install.sh` as root from the extracted release. Remove bootstrap files after installation. Subsequent deployments preserve the existing database and environment.
