@@ -83,6 +83,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         and conn.execute("SELECT 1 FROM schema_migrations WHERE version=1").fetchone()
     ):
         migrate_history(conn)
+        migrate_chat(conn)
         return
     database = conn.execute("PRAGMA database_list").fetchone()[2]
     if database:
@@ -108,6 +109,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         )
         conn.commit()
         migrate_history(conn)
+        migrate_chat(conn)
     except Exception:
         conn.rollback()
         raise
@@ -144,6 +146,93 @@ def migrate_history(conn: sqlite3.Connection) -> None:
             (json.dumps({"legacy_snapshots": True}),),
         )
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def migrate_chat(conn: sqlite3.Connection) -> None:
+    if conn.execute("SELECT 1 FROM schema_migrations WHERE version=3").fetchone():
+        return
+    database = conn.execute("PRAGMA database_list").fetchone()[2]
+    if database:
+        backup = Path(database).with_suffix(".before-v3.db")
+        if not backup.exists():
+            with sqlite3.connect(backup) as destination:
+                conn.backup(destination)
+            backup.chmod(0o600)
+    try:
+        conn.executescript("""BEGIN IMMEDIATE;
+        CREATE TABLE chat_conversations(
+            id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '新对话',
+            version INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX idx_chat_conversations_updated ON chat_conversations(updated_at DESC);
+        CREATE TABLE chat_messages(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+            request_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            result_json TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(conversation_id,request_id,role)
+        );
+        CREATE INDEX idx_chat_messages_conversation ON chat_messages(conversation_id,id);
+        CREATE TABLE chat_tasks(
+            id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+            message_id INTEGER NOT NULL REFERENCES chat_messages(id),
+            status TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            plan_json TEXT NOT NULL,
+            plan_hash TEXT NOT NULL,
+            preview_json TEXT NOT NULL,
+            request_id TEXT,
+            result_json TEXT,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX idx_chat_tasks_conversation ON chat_tasks(conversation_id,created_at DESC);
+        CREATE TABLE chat_tool_calls(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+            message_id INTEGER NOT NULL REFERENCES chat_messages(id),
+            name TEXT NOT NULL,
+            arguments_json TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            provider TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE chat_attachments(
+            id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+            filename TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            path TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX idx_chat_attachments_conversation ON chat_attachments(conversation_id,created_at DESC);
+        CREATE TABLE ai_provider_checks(
+            provider TEXT PRIMARY KEY,
+            model TEXT NOT NULL,
+            status TEXT NOT NULL,
+            checked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            elapsed_ms INTEGER,
+            error_type TEXT
+        );
+        INSERT INTO schema_migrations(version,report)
+        VALUES (3,'{"chat":"persistent conversations and confirmation tasks","providers":"health checks"}');
+        COMMIT;
+        """)
     except Exception:
         conn.rollback()
         raise

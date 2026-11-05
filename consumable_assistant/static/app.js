@@ -9,6 +9,13 @@ const state = {
   locationPreview: null,
   preparePreviewId: null,
   prepareActions: {},
+  chatConversationId: null,
+  chatToken: null,
+  chatConversationPromise: null,
+  chatTaskId: null,
+  chatPhase: null,
+  chatPreview: null,
+  chatConfirmRequestId: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -30,6 +37,8 @@ async function api(path, options = {}) {
   const device = localStorage.getItem('lab-device') || newRequestId();
   localStorage.setItem('lab-device', device);
   headers.set('X-Device-ID', device);
+  const chatToken = localStorage.getItem('lab-chat-token');
+  if (chatToken && path.startsWith('/api/chat/')) headers.set('X-Chat-Token', chatToken);
   const previewOnly = ['/api/transactions/preview','/api/prepare/preview','/api/prepare/export','/api/import/preview','/api/import/upload','/api/locations/preview','/api/ai/check'].includes(path);
   const writing = options.method && options.method !== 'GET' && !previewOnly;
   let requestId;
@@ -45,7 +54,11 @@ async function api(path, options = {}) {
     if (pending && (pending.path !== path || pending.signature !== signature)) throw new Error('有一项操作结果尚未确认，请先查询原请求结果');
     actor=pending?.actor||actor;
     headers.set('X-Actor', encodeURIComponent(actor));
-    requestId = pending?.id || newRequestId();
+    let suppliedRequestId = '';
+    if (path.endsWith('/confirm') && options.body) {
+      try { suppliedRequestId = JSON.parse(options.body).request_id || ''; } catch {}
+    }
+    requestId = pending?.id || suppliedRequestId || newRequestId();
     const formEntries=options.body instanceof FormData?[...options.body.entries()].map(([key,value])=>[key,value instanceof File?{file:true,name:value.name,size:value.size,lastModified:value.lastModified}:value]):null;
     localStorage.setItem('lab-pending',JSON.stringify({id:requestId,path,signature,body:options.body instanceof FormData ? null : options.body,formEntries,actor}));
     headers.set('X-Request-ID',requestId);
@@ -69,6 +82,244 @@ async function api(path, options = {}) {
   const result=contentType.includes('application/json')?await response.json():response;
   if(writing)finishPending();
   return result;
+}
+
+async function chatApi(path, options = {}) {
+  const headers = new Headers(options.headers || {});
+  let device = localStorage.getItem('lab-device');
+  if (!device) { device = newRequestId(); localStorage.setItem('lab-device', device); }
+  headers.set('X-Device-ID', device);
+  const token = localStorage.getItem('lab-chat-token');
+  if (token && !path.endsWith('/api/chat/conversations')) headers.set('X-Chat-Token', token);
+  const actor = $('#operatorName')?.value.trim() || localStorage.getItem('lab-actor') || '';
+  if (actor) headers.set('X-Actor', encodeURIComponent(actor));
+  let response;
+  try { response = await fetch(path, {...options, headers}); }
+  catch { throw new Error('网络连接中断，聊天草稿仍保存在此设备'); }
+  if (!response.ok) {
+    let message = `${response.status} ${response.statusText}`;
+    try { message = (await response.json()).detail || message; } catch {}
+    throw new Error(message);
+  }
+  const result = await response.json();
+  return result;
+}
+
+async function ensureChatConversation() {
+  if (state.chatConversationPromise) return state.chatConversationPromise;
+  state.chatConversationPromise = ensureChatConversationOnce();
+  try {
+    return await state.chatConversationPromise;
+  } finally {
+    state.chatConversationPromise = null;
+  }
+}
+
+async function ensureChatConversationOnce() {
+  let conversationId = localStorage.getItem('lab-chat-conversation');
+  let token = localStorage.getItem('lab-chat-token');
+  if (conversationId && token) {
+    try {
+      const existing = await chatApi(`/api/chat/conversations/${conversationId}`);
+      state.chatConversationId = conversationId;
+      state.chatToken = token;
+      renderChatMessages(existing.messages || []);
+      restoreChatTask(existing.tasks || []);
+      return;
+    } catch {
+      localStorage.removeItem('lab-chat-conversation');
+      localStorage.removeItem('lab-chat-token');
+    }
+  }
+  const created = await chatApi('/api/chat/conversations', {method:'POST'});
+  state.chatConversationId = created.conversation_id;
+  state.chatToken = created.token;
+  localStorage.setItem('lab-chat-conversation', created.conversation_id);
+  localStorage.setItem('lab-chat-token', created.token);
+  renderChatMessages([]);
+}
+
+async function loadChat() {
+  await ensureChatConversation();
+  const config = await api('/api/config');
+  const banner = $('#profileBanner');
+  banner.hidden = !config.simulated;
+  if (config.simulated) banner.textContent = '当前为模拟数据环境。库存数量和位置不能作为实际实验室库存使用。';
+}
+
+function restoreChatTask(tasks) {
+  const active = tasks.find(task => ['awaiting_details','pending_confirmation'].includes(task.status));
+  if (!active) {
+    state.chatTaskId = null; state.chatPhase = null; state.chatPreview = null;
+    state.preview = null;
+    $('#previewBox').innerHTML = ''; $('#commitBtn').disabled = true;
+    $('#commitBtn').innerHTML = '<i data-lucide="check" class="icon-sm"></i>生成确认预览';
+    renderChatTaskActions();
+    return;
+  }
+  state.chatTaskId = active.id;
+  state.chatPhase = active.status === 'awaiting_details' ? 'details' : 'confirm';
+  state.chatPreview = active.preview;
+  if (state.chatPhase === 'details' && active.preview?.operations) {
+    state.preview = active.preview;
+    state.selectedItemIds = {};
+    renderPreview(active.preview);
+    $('#commitBtn').disabled = !active.preview.operations.some(op => op.candidates?.length);
+    $('#commitBtn').innerHTML = '<i data-lucide="check" class="icon-sm"></i>生成确认预览';
+  } else {
+    renderBusinessPreview(active.preview);
+    $('#commitBtn').disabled = false;
+    $('#commitBtn').innerHTML = '<i data-lucide="check" class="icon-sm"></i>确认执行';
+  }
+  renderChatTaskActions();
+  window.lucide?.createIcons();
+}
+
+function renderChatMessages(messages) {
+  $('#chatMessages').innerHTML = messages.map(message => {
+    const result = message.result || {};
+    const detail = result.tool_results?.map(entry => renderToolResult(entry)).join('') || '';
+    const completed = result.status === 'completed' ? renderCompletedResult(result.result) : '';
+    const attachments = (result.attachments || []).map(file => `<span class="chat-file-chip"><i data-lucide="paperclip" class="icon-sm"></i>${escapeHtml(file.filename)}</span>`).join('');
+    return `<article class="chat-message ${message.role === 'user' ? 'user' : 'assistant'}"><div class="chat-message-role">${message.role === 'user' ? '您' : '耗材助手'}</div><div class="chat-message-body">${escapeHtml(message.content || result.reply || '')}</div>${attachments}${detail}${completed}${result.status === 'pending_confirmation' ? businessPreviewHtml(result.preview) : ''}</article>`;
+  }).join('') || '<div class="chat-empty">';
+  if (!messages.length) $('#chatMessages').innerHTML = '<div class="chat-empty">请输入查询或操作内容。</div>';
+  $('#chatMessages').scrollTop = $('#chatMessages').scrollHeight;
+  window.lucide?.createIcons();
+}
+
+function renderToolResult(entry) {
+  const data = entry.result || {};
+  if (data.error) return `<div class="chat-result error">${escapeHtml(data.error)}</div>`;
+  const rows = data.rows || [];
+  if (data.type === 'inventory' || data.type === 'alerts') {
+    return `<div class="chat-result"><strong>${data.type === 'alerts' ? '库存预警' : '物品位置与库存'}</strong>${tableHtml(['耗材','规格','实验室','位置','可用','总拥有'], rows.slice(0,30).map(row=>[escapeHtml(row.item_name),escapeHtml(row.spec || '未填写'),escapeHtml(row.lab),escapeHtml(row.location_code),formatQuantity(row.available_quantity,row.unit),formatQuantity(row.owned_quantity,row.unit)]))}</div>`;
+  }
+  if (data.type === 'history') {
+    return `<div class="chat-result"><strong>操作记录</strong>${tableHtml(['时间','耗材','动作','数量','操作人'],rows.slice(0,30).map(row=>[formatDate(row.created_at),escapeHtml(row.item_name),escapeHtml(row.action_label),formatDelta(row.delta_quantity,row.unit),escapeHtml(row.actor)]))}</div>`;
+  }
+  if (data.type === 'preparation') {
+    return `<div class="chat-result"><strong>实验准备清单</strong>${tableHtml(['项目','规格','需求','可用','还需采购','位置','使用方式'],rows.slice(0,100).map(row=>[escapeHtml(row.name),escapeHtml(row.spec || '需确认'),formatQuantity(row.required_quantity,row.unit),formatQuantity(row.available_quantity,row.unit),formatQuantity(row.purchase_quantity,row.purchase_unit),escapeHtml((row.locations||[]).map(item=>`${item.lab} ${item.location_code}`).join('、') || '未匹配'),escapeHtml(row.action || '待确认')]))}</div>`;
+  }
+  if (data.type === 'inventory_import') {
+    return `<div class="chat-result"><strong>库存导入预览</strong><p>新增或匹配 ${data.rows?.length || 0} 行，错误 ${data.errors?.length || 0} 行${data.duplicate_file ? '，检测到重复文件' : ''}。</p>${tableHtml(['行','耗材','单位','数量','重复'],(data.rows||[]).slice(0,30).map(row=>[row.row_number,escapeHtml(row.item_name),escapeHtml(row.unit),escapeHtml(row.quantity),row.duplicate_row?'是':'否']))}</div>`;
+  }
+  if (data.type === 'export') return `<div class="chat-result"><a class="button secondary" href="${escapeHtml(data.url)}"><i data-lucide="download" class="icon-sm"></i>导出库存</a></div>`;
+  return `<div class="chat-result">${tableHtml(['记录','内容'],rows.slice(0,30).map(row=>[escapeHtml(row.id ?? row.name ?? ''),escapeHtml(row.item_name ?? row.name ?? row.status ?? '')]))}</div>`;
+}
+
+function tableHtml(headers, rows) {
+  return `<div class="table-wrap responsive-cards"><table><thead><tr>${headers.map(value=>`<th>${escapeHtml(value)}</th>`).join('')}</tr></thead><tbody>${rows.map(row=>`<tr>${row.map((cell,index)=>`<td data-label="${escapeHtml(headers[index])}">${cell}</td>`).join('')}</tr>`).join('') || `<tr><td colspan="${headers.length}">没有匹配记录</td></tr>`}</tbody></table></div>`;
+}
+
+function renderCompletedResult(result) {
+  if (!result) return '';
+  const rows = result.transactions || [];
+  return `<div class="chat-result"><strong>实际操作结果</strong>${rows.length ? tableHtml(['耗材','动作','数量','操作记录'],rows.map(row=>[escapeHtml(row.item?.item_name || row.item_name || ''),escapeHtml(row.action || ''),escapeHtml(row.quantity ?? row.delta_quantity ?? ''),escapeHtml(row.id ?? '')])) : `<pre>${escapeHtml(JSON.stringify(result,null,2))}</pre>`}</div>`;
+}
+
+function businessPreviewHtml(preview) {
+  const rows = preview?.changes || [];
+  const changeTable = rows.length
+    ? tableHtml(['耗材','位置','当前可用','执行后可用','当前总量','执行后总量'],rows.map(row=>[escapeHtml(row.item_name),escapeHtml(`${row.lab || ''} ${row.location_code || ''}`),escapeHtml(row.before?.available_quantity || ''),escapeHtml(row.after?.available_quantity || ''),escapeHtml(row.before?.owned_quantity || ''),escapeHtml(row.after?.owned_quantity || '')]))
+    : '';
+  const business = preview?.business_result ? `<details><summary>操作项目</summary><pre>${escapeHtml(JSON.stringify(preview.business_result,null,2))}</pre></details>` : '';
+  return `<section class="chat-result chat-confirm-preview"><h2>待确认操作</h2>${changeTable}${business}<p class="muted">计划在确认时重新检查数据版本。</p></section>`;
+}
+
+function renderBusinessPreview(preview) {
+  $('#previewBox').innerHTML = businessPreviewHtml(preview);
+}
+
+function renderChatTaskActions() {
+  const root = $('#chatTaskActions');
+  const visible = Boolean(state.chatTaskId && state.chatPhase);
+  root.hidden = !visible;
+  root.innerHTML = visible
+    ? '<button id="cancelChatTaskBtn" type="button" class="secondary"><i data-lucide="x" class="icon-sm"></i>取消当前计划</button>'
+    : '';
+  window.lucide?.createIcons();
+}
+
+async function cancelChatTask() {
+  if (!state.chatTaskId) return;
+  try {
+    await chatApi(`/api/chat/tasks/${state.chatTaskId}/cancel`, {method:'POST'});
+    state.chatTaskId = null; state.chatPhase = null; state.chatPreview = null; state.preview = null;
+    $('#previewBox').innerHTML = ''; $('#commitBtn').disabled = true;
+    $('#commitBtn').innerHTML = '<i data-lucide="check" class="icon-sm"></i>生成确认预览';
+    renderChatTaskActions();
+    await loadChat();
+    toast('计划已取消，没有修改库存');
+  } catch (error) { showError(error); }
+}
+
+async function sendChatMessage() {
+  const text = $('#chatText').value.trim();
+  const file = $('#chatFile').files[0];
+  if (!text && !file) { toast('请输入消息或附加文件'); return; }
+  $('#previewBtn').disabled = true;
+  try {
+    await ensureChatConversation();
+    let pendingMessage = JSON.parse(localStorage.getItem('lab-chat-pending') || 'null');
+    const fileMeta = file ? {name:file.name,size:file.size,lastModified:file.lastModified} : null;
+    const effectiveFileMeta = fileMeta || (pendingMessage?.attachments?.length ? pendingMessage.file_meta : null);
+    if (pendingMessage && (pendingMessage.text !== text || JSON.stringify(pendingMessage.file_meta || null) !== JSON.stringify(effectiveFileMeta))) {
+      if (!file && pendingMessage.file_meta) throw new Error(`请重新选择原附件：${pendingMessage.file_meta.name}`);
+      throw new Error('有一条聊天请求尚未确认结果，请恢复原请求后再发送新消息');
+    }
+    const messageId = pendingMessage?.message_id || newRequestId();
+    pendingMessage ||= {message_id:messageId,text,file_meta:fileMeta,attachments:[]};
+    localStorage.setItem('lab-chat-pending',JSON.stringify(pendingMessage));
+    let attachments = pendingMessage.attachments || [];
+    if (file && !attachments.length) {
+      const form = new FormData(); form.append('file',file);
+      const uploaded = await chatApi(`/api/chat/conversations/${state.chatConversationId}/attachments`,{method:'POST',body:form});
+      attachments = [uploaded.id];
+      pendingMessage = {...pendingMessage,attachments};
+      localStorage.setItem('lab-chat-pending',JSON.stringify(pendingMessage));
+    }
+    const signature = JSON.stringify({text,attachments});
+    if (pendingMessage.signature && pendingMessage.signature !== signature) {
+      throw new Error('有一条聊天请求尚未确认结果，请恢复原请求后再发送新消息');
+    }
+    pendingMessage = {...pendingMessage,signature};
+    localStorage.setItem('lab-chat-pending',JSON.stringify(pendingMessage));
+    const result = await chatApi(`/api/chat/conversations/${state.chatConversationId}/messages`,{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message_id:messageId,text,attachments}),
+    });
+    if(result.status==='ai_unavailable'){
+      pendingMessage={...pendingMessage,signature};
+      localStorage.setItem('lab-chat-pending',JSON.stringify(pendingMessage));
+      toast('校内 AI 暂时不可用。原消息已保留，再次发送会重试同一条请求。');
+    }else localStorage.removeItem('lab-chat-pending');
+    if(result.status!=='ai_unavailable'){
+      $('#chatText').value = ''; $('#chatFile').value = ''; $('#chatAttachmentName').textContent = '';
+      localStorage.removeItem('lab-chat-draft');
+    }
+    state.chatTaskId = result.task_id || null;
+    state.chatPhase = result.status === 'awaiting_details' ? 'details' : result.status === 'pending_confirmation' ? 'confirm' : null;
+    state.chatPreview = result.preview || null;
+    renderChatTaskActions();
+    if (state.chatPhase === 'details') {
+      state.preview = result.preview;
+      state.selectedItemIds = {};
+      renderPreview(result.preview);
+      $('#commitBtn').disabled = !result.preview.operations.some(op=>op.candidates?.length);
+      $('#commitBtn').innerHTML = '<i data-lucide="check" class="icon-sm"></i>生成确认预览';
+    } else if (state.chatPhase === 'confirm') {
+      renderBusinessPreview(result.preview);
+      $('#commitBtn').disabled = false;
+      $('#commitBtn').innerHTML = '<i data-lucide="check" class="icon-sm"></i>确认执行';
+    } else {
+      $('#previewBox').innerHTML = ''; $('#commitBtn').disabled = true;
+    }
+    await loadChat();
+    restoreChatTask(result.task_id ? [{id:result.task_id,status:result.status,preview:result.preview}] : []);
+    await refreshAll();
+  } catch (error) { showError(error); }
+  finally { $('#previewBtn').disabled = false; }
 }
 
 function escapeHtml(value) {
@@ -266,8 +517,8 @@ async function previewTransaction() {
 }
 
 function renderPreview(data) {
-  const engineLabel = data.engine === "deepseek-pro"
-    ? `${data.model_name || 'AI'}${data.local_split_used ? ' + 规则校验' : ''}`
+  const engineLabel = data.engine && data.engine !== 'heuristic'
+    ? `${data.engine}${data.model_name ? ` · ${data.model_name}` : ''}${data.local_split_used ? ' + 规则校验' : ''}`
     : (data.local_split_used ? "本地多条规则" : "本地规则");
   const modelWarning = data.model_enabled && data.engine !== "deepseek-pro" && !data.local_split_used
     ? `<span class="badge warn">模型未返回可用结果，已使用本地规则</span>`
@@ -430,6 +681,48 @@ async function commitTransaction() {
   if (payloadOperations.length === 0) {
     toast("没有可提交的耗材操作");
     return;
+  }
+
+  if (state.chatTaskId && state.chatPhase === 'details') {
+    try {
+      $('#commitBtn').disabled = true;
+      const result = await chatApi(`/api/chat/tasks/${state.chatTaskId}/prepare`, {
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({operations:payloadOperations}),
+      });
+      state.chatPhase = 'confirm'; state.chatPreview = result.preview;
+      renderBusinessPreview(result.preview);
+      $('#commitBtn').disabled = false;
+      $('#commitBtn').innerHTML = '<i data-lucide="check" class="icon-sm"></i>确认执行';
+      renderChatTaskActions();
+      window.lucide?.createIcons();
+      await loadChat();
+      return;
+    } catch (error) {
+      showError(error); $('#commitBtn').disabled = false; return;
+    }
+  }
+  if (state.chatTaskId && state.chatPhase === 'confirm') {
+    const requestId = state.chatConfirmRequestId || newRequestId();
+    state.chatConfirmRequestId = requestId;
+    try {
+      $('#commitBtn').disabled = true;
+      await api(`/api/chat/tasks/${state.chatTaskId}/confirm`, {
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({request_id:requestId}),
+      });
+      state.chatTaskId = null; state.chatPhase = null; state.chatPreview = null;
+      state.chatConfirmRequestId = null; state.preview = null;
+      localStorage.removeItem('lab-chat-draft'); $('#chatText').value = '';
+      $('#previewBox').innerHTML = ''; $('#commitBtn').disabled = true;
+      $('#commitBtn').innerHTML = '<i data-lucide="check" class="icon-sm"></i>生成确认预览';
+      renderChatTaskActions();
+      await Promise.all([loadChat(),refreshAll()]);
+      toast('已完成确认的操作');
+      return;
+    } catch (error) {
+      showError(error); $('#commitBtn').disabled = false; return;
+    }
   }
 
   try {
@@ -770,7 +1063,7 @@ function bindEvents() {
   });
   $("#categoryFilter").addEventListener("change", loadSearch);
   $("#lowStockFilter").addEventListener("change", loadSearch);
-  $("#previewBtn").addEventListener("click", previewTransaction);
+  $("#previewBtn").addEventListener("click", sendChatMessage);
   $("#commitBtn").addEventListener("click", commitTransaction);
   $("#prepareBtn").addEventListener("click", preparePreview);
   $("#exportPrepareBtn").addEventListener("click", exportPrepareRows);
@@ -819,6 +1112,15 @@ function bindEvents() {
     state.preview=null; state.previewInputs={}; $('#previewBox').innerHTML=''; $('#commitBtn').disabled=true;
     localStorage.removeItem('lab-chat-preview');
   });
+  $('#chatText').addEventListener('keydown',event=>{
+    if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChatMessage();}
+  });
+  $('#chatFile').addEventListener('change',()=>{
+    $('#chatAttachmentName').textContent=$('#chatFile').files[0]?.name||'';
+  });
+  $('#chatTaskActions').addEventListener('click',event=>{
+    if(event.target.closest('#cancelChatTaskBtn'))cancelChatTask();
+  });
   $("#seedBtn").addEventListener("click", seedData);
   $("#batchUploadBtn").addEventListener("click", batchUploadInventory);
   $("#previewLocationBtn").addEventListener("click", previewSelectedLocation);
@@ -855,7 +1157,7 @@ $('#prepareFile').addEventListener('change',()=>{state.prepareRows=[];state.prep
 
 async function refreshAll() {
   try {
-    await Promise.all([loadStats(), loadSearch(), loadAlerts(), loadTransactions(), loadLocations()]);
+    await Promise.all([loadStats(), loadSearch(), loadAlerts(), loadTransactions(), loadLocations(), loadChat()]);
     await window.refreshWorkflows?.();
   } catch (error) {
     console.error(error);

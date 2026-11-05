@@ -419,7 +419,7 @@ def parse_transaction_preview(conn: sqlite3.Connection, text: str) -> dict[str, 
     model_result = None
     model_name = None
     model_error = None
-    engine = "heuristic"
+    engine = "institutional"
     if model_is_enabled():
         try:
             model_result = parse_inventory_message(text)
@@ -432,7 +432,7 @@ def parse_transaction_preview(conn: sqlite3.Connection, text: str) -> dict[str, 
                 ) from exc
         if model_result:
             model_name = str(model_result.get("model") or "")
-            engine = "deepseek-pro"
+            engine = str(model_result.get("provider") or model_name or "institutional")
 
     local_operations = parse_local_operations(conn, text)
     local_split_used = False
@@ -660,7 +660,7 @@ def normalize_action(value: Any) -> str:
 def parse_number_value(value: Any) -> float | None:
     if value is None:
         return None
-    if isinstance(value, (int, float)):
+    if isinstance(value, int | float):
         if isinstance(value, float) and math.isnan(value):
             return None
         return float(value)
@@ -1159,16 +1159,28 @@ def infer_package_suggestion(
     return {"purchase_quantity": normalize_quantity(missing), "purchase_unit": unit}
 
 
-def export_inventory_workbook(conn: sqlite3.Connection) -> bytes:
-    items = rows_to_dicts(
-        conn.execute(
-            """
-            SELECT id, category, lab, item_name, spec, brand, location_code, quantity, unit, threshold, remark, source_count
-            FROM inventory_items
-            ORDER BY category, lab, item_name, location_code
-            """
+def export_inventory_workbook(
+    conn: sqlite3.Connection,
+    q: str = "",
+    category: str | None = None,
+    lab: str | None = None,
+) -> bytes:
+    matches = search_items(conn, q=q, category=category, lab=lab, limit=2000)
+    item_ids = [item["id"] for item in matches]
+    if item_ids:
+        placeholders = ",".join("?" for _ in item_ids)
+        items = rows_to_dicts(
+            conn.execute(
+                f"""
+                SELECT id, category, lab, item_name, spec, brand, location_code, quantity, unit, threshold, remark, source_count
+                FROM inventory_items WHERE id IN ({placeholders})
+                ORDER BY category, lab, item_name, location_code
+                """,
+                item_ids,
+            )
         )
-    )
+    else:
+        items = []
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "当前库存"

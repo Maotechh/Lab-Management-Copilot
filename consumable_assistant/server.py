@@ -16,7 +16,9 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook
+from pydantic import BaseModel, Field
 
+from . import chat as chat_session
 from . import ledger as stock
 from . import workflows as flow
 from .database import connect, init_db, inventory_is_empty
@@ -33,9 +35,23 @@ from .services import (
     save_upload_to_temp,
     search_items,
 )
-from .settings import AUTO_SEED, DB_PATH, STATIC_DIR
+from .settings import (
+    AUTO_SEED,
+    CHAT_UPLOAD_DIR,
+    CONSUMABLE_PROFILE,
+    PHOTO_DIR,
+    STATIC_DIR,
+)
 
 app = FastAPI(title="耗材智能管理助手", version="0.2.0")
+
+
+class ChatPrepareRequest(BaseModel):
+    operations: list[dict] = Field(min_length=1, max_length=200)
+
+
+class ChatConfirmRequest(BaseModel):
+    request_id: str = Field(min_length=8, max_length=100)
 
 
 @app.middleware("http")
@@ -84,6 +100,219 @@ def startup():
 @app.get("/")
 def index():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/api/config")
+def app_config():
+    return {
+        "profile": CONSUMABLE_PROFILE,
+        "simulated": CONSUMABLE_PROFILE == "simulation",
+        "write_access": True,
+    }
+
+
+def chat_authorize(conn, conversation_id: str, request: Request):
+    return chat_session.authorize(
+        conn,
+        conversation_id,
+        request.headers.get("x-chat-token", ""),
+        request.headers.get("x-device-id", ""),
+    )
+
+
+@app.post("/api/chat/conversations")
+def create_chat_conversation(request: Request):
+    with connect() as conn:
+        return chat_session.new_conversation(
+            conn, request.headers.get("x-device-id", "")
+        )
+
+
+@app.get("/api/chat/conversations/{conversation_id}")
+def get_chat_conversation(conversation_id: str, request: Request):
+    with connect() as conn:
+        chat_authorize(conn, conversation_id, request)
+        return chat_session.conversation_view(conn, conversation_id)
+
+
+@app.post("/api/chat/conversations/{conversation_id}/messages")
+def send_chat_message(
+    conversation_id: str, payload: chat_session.ChatMessageRequest, request: Request
+):
+    with connect() as conn:
+        chat_authorize(conn, conversation_id, request)
+        return chat_session.process_message(
+            conn,
+            conversation_id,
+            payload,
+            actor_name(request),
+            request.headers.get("x-device-id", ""),
+            dispatch,
+            history_rows,
+        )
+
+
+@app.post("/api/chat/conversations/{conversation_id}/attachments")
+async def upload_chat_attachment(
+    conversation_id: str, request: Request, file: Annotated[UploadFile, File()]
+):
+    with connect() as conn:
+        chat_authorize(conn, conversation_id, request)
+        filename = Path(file.filename or "attachment").name
+        suffix = Path(filename).suffix.lower()
+        if suffix not in {".xlsx", ".xls", ".png", ".jpg", ".jpeg", ".webp"}:
+            raise ValueError("聊天附件支持 Excel 表格和位置照片")
+        content = await file.read(20 * 1024 * 1024 + 1)
+        if not content or len(content) > 20 * 1024 * 1024:
+            raise ValueError("附件不能为空，且大小不能超过 20 MB")
+        digest = hashlib.sha256(content).hexdigest()
+        existing = conn.execute(
+            "SELECT id,filename,content_type,size,sha256 FROM chat_attachments WHERE conversation_id=? AND sha256=? ORDER BY created_at DESC LIMIT 1",
+            (conversation_id, digest),
+        ).fetchone()
+        if existing:
+            return {**dict(existing), "reused": True}
+        if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+            from PIL import Image
+
+            try:
+                image = Image.open(io.BytesIO(content))
+                if image.width * image.height > 20_000_000:
+                    raise ValueError("照片尺寸过大")
+                image.verify()
+            except ValueError:
+                raise
+            except Exception as exc:
+                raise ValueError("图片文件无法读取") from exc
+        attachment_id = uuid.uuid4().hex
+        CHAT_UPLOAD_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        destination = CHAT_UPLOAD_DIR / f"{attachment_id}{suffix}"
+        destination.write_bytes(content)
+        content_type = file.content_type or "application/octet-stream"
+        conn.execute(
+            "INSERT INTO chat_attachments(id,conversation_id,filename,content_type,size,sha256,path) VALUES (?,?,?,?,?,?,?)",
+            (
+                attachment_id,
+                conversation_id,
+                filename[:250],
+                content_type,
+                len(content),
+                digest,
+                str(destination),
+            ),
+        )
+        conn.commit()
+        return {
+            "id": attachment_id,
+            "filename": filename[:250],
+            "content_type": content_type,
+            "size": len(content),
+            "sha256": digest,
+        }
+
+
+@app.post("/api/chat/tasks/{task_id}/prepare")
+def prepare_chat_task(
+    task_id: str, payload: ChatPrepareRequest, request: Request
+):
+    with connect() as conn:
+        task = conn.execute("SELECT * FROM chat_tasks WHERE id=?", (task_id,)).fetchone()
+        if not task:
+            raise ValueError("聊天计划不存在")
+        chat_authorize(conn, task["conversation_id"], request)
+        result = chat_session.prepare_transaction_task(
+            conn,
+            task["conversation_id"],
+            task_id,
+            payload.operations,
+            actor_name(request),
+            dispatch,
+        )
+        conn.commit()
+        return result
+
+
+@app.post("/api/chat/tasks/{task_id}/confirm")
+def confirm_chat_task(
+    task_id: str, payload: ChatConfirmRequest, request: Request
+):
+    with connect() as conn:
+        task = conn.execute("SELECT * FROM chat_tasks WHERE id=?", (task_id,)).fetchone()
+        if not task:
+            raise ValueError("聊天计划不存在")
+        chat_authorize(conn, task["conversation_id"], request)
+        actor = actor_name(request)
+
+        def dispatch_chat(tx, kind, data, user):
+            photo_id = data.get("photo_attachment_id") if kind == "location_details" else None
+            target = None
+            if photo_id:
+                attachment = tx.execute(
+                    "SELECT * FROM chat_attachments WHERE id=? AND conversation_id=?",
+                    (photo_id, task["conversation_id"]),
+                ).fetchone()
+                if not attachment or not attachment["content_type"].startswith("image/"):
+                    raise ValueError("位置照片不属于当前对话")
+                PHOTO_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+                from PIL import Image
+
+                photo_name = f"chat-{attachment['id']}.jpg"
+                target = PHOTO_DIR / photo_name
+                created = not target.exists()
+                if created:
+                    with Image.open(attachment["path"]) as image:
+                        image.thumbnail((1600, 1600))
+                        image.convert("RGB").save(target, format="JPEG", quality=85)
+                data["photo_path"] = photo_name
+            try:
+                return dispatch(tx, kind, data, user)
+            except Exception:
+                if target and created and target.exists():
+                    target.unlink()
+                raise
+
+        result = chat_session.confirm_task(
+            conn,
+            task,
+            actor,
+            request.headers.get("x-device-id", ""),
+            payload.request_id,
+            dispatch_chat,
+        )
+        message_id = f"confirm-{payload.request_id}"
+        conn.execute(
+            "INSERT OR IGNORE INTO chat_messages(conversation_id,request_id,role,content,result_json) VALUES (?,?,?,?,?)",
+            (
+                task["conversation_id"],
+                message_id,
+                "assistant",
+                "已完成确认的操作。以下结果来自实际业务记录。",
+                json.dumps(
+                    {"reply": "已完成确认的操作。以下结果来自实际业务记录。", "status": "completed", "task_id": task_id, "result": result},
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            ),
+        )
+        conn.commit()
+        return {"status": "completed", "task_id": task_id, "result": result}
+
+
+@app.post("/api/chat/tasks/{task_id}/cancel")
+def cancel_chat_task(task_id: str, request: Request):
+    with connect() as conn:
+        task = conn.execute("SELECT * FROM chat_tasks WHERE id=?", (task_id,)).fetchone()
+        if not task:
+            raise ValueError("聊天计划不存在")
+        chat_authorize(conn, task["conversation_id"], request)
+        if task["status"] not in ("awaiting_details", "pending_confirmation"):
+            raise ValueError("此计划已经变更，不能取消")
+        conn.execute(
+            "UPDATE chat_tasks SET status='cancelled',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (task_id,),
+        )
+        conn.commit()
+        return {"status": "cancelled", "task_id": task_id}
 
 
 @app.get("/sw.js")
@@ -332,9 +561,26 @@ def dispatch(conn: sqlite3.Connection, kind: str, data: dict, actor: str) -> dic
         if old and old["version"] != int(data.get("version", 0)):
             raise stock.Conflict("位置说明已经变化")
         conn.execute(
-            "INSERT INTO location_details(lab,location_code,description) VALUES (?,?,?) ON CONFLICT(lab,location_code) DO UPDATE SET description=excluded.description,version=location_details.version+1",
-            (lab, location, str(data.get("description") or "")),
+            "INSERT INTO location_details(lab,location_code,description,photo_path) VALUES (?,?,?,?) ON CONFLICT(lab,location_code) DO UPDATE SET description=excluded.description,photo_path=COALESCE(excluded.photo_path,location_details.photo_path),version=location_details.version+1",
+            (
+                lab,
+                location,
+                str(data.get("description") or ""),
+                data.get("photo_path"),
+            ),
         )
+        for item in conn.execute(
+            "SELECT id FROM inventory_items WHERE lab=? AND location_code=?",
+            (lab, location),
+        ).fetchall():
+            stock.event(
+                conn,
+                item["id"],
+                "metadata",
+                {},
+                actor,
+                f"位置资料更新：{data.get('description') or ''}",
+            )
         return {"ok": True}
     if kind == "alert":
         item_id = int(data["item_id"])
@@ -686,9 +932,12 @@ def excel(content: bytes, name: str):
 
 
 @app.get("/api/export/inventory")
-def export_inventory():
+def export_inventory(q: str = "", category: str = "", lab: str = ""):
     with connect() as conn:
-        return excel(export_inventory_workbook(conn), "inventory.xlsx")
+        return excel(
+            export_inventory_workbook(conn, q=q, category=category or None, lab=lab or None),
+            "inventory.xlsx",
+        )
 
 
 @app.post("/api/prepare/export")
@@ -707,7 +956,13 @@ async def events(request: Request):
                 alert = conn.execute(
                     "SELECT COALESCE(MAX(id),0) FROM notification_events"
                 ).fetchone()[0]
-            marker = f"{current}:{alert}"
+                chat_messages = conn.execute(
+                    "SELECT COALESCE(MAX(id),0) FROM chat_messages"
+                ).fetchone()[0]
+                chat_tasks = conn.execute(
+                    "SELECT COALESCE(MAX(updated_at),'') FROM chat_tasks"
+                ).fetchone()[0]
+            marker = f"{current}:{alert}:{chat_messages}:{chat_tasks}"
             if marker != getattr(stream, "previous", None):
                 stream.previous = marker
                 yield f"id: {current}\ndata: {json.dumps({'revision': marker})}\n\n"
@@ -808,7 +1063,7 @@ async def location_photo(
         if old and old["version"] != version:
             raise stock.Conflict("位置照片已经变化，请刷新")
         name = uuid.uuid4().hex + ".jpg"
-        directory = DB_PATH.parent / "photos"
+        directory = PHOTO_DIR
         directory.mkdir(mode=0o750, parents=True, exist_ok=True)
         (directory / name).write_bytes(buffer.getvalue())
         conn.execute(
@@ -833,9 +1088,9 @@ async def location_photo(
 
 @app.get("/api/media/{name}")
 def media(name: str):
-    if not __import__("re").fullmatch(r"[0-9a-f]{32}\.jpg", name):
+    if not __import__("re").fullmatch(r"(?:[0-9a-f]{32}|chat-[0-9a-f]{32})\.jpg", name):
         raise HTTPException(status_code=404)
-    return FileResponse(DB_PATH.parent / "photos" / name, media_type="image/jpeg")
+    return FileResponse(PHOTO_DIR / name, media_type="image/jpeg")
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

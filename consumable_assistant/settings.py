@@ -7,6 +7,9 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 ATTACHMENT_DIR = BASE_DIR / "Attachment"
 DATA_DIR = BASE_DIR / "data"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+CONSUMABLE_PROFILE = os.environ.get("CONSUMABLE_PROFILE", "simulation").strip().lower()
+if CONSUMABLE_PROFILE not in {"simulation", "production"}:
+    raise ValueError("CONSUMABLE_PROFILE must be simulation or production")
 
 
 def load_env_file(path: Path) -> None:
@@ -26,8 +29,19 @@ def load_env_file(path: Path) -> None:
 load_env_file(BASE_DIR / ".env.local")
 load_env_file(BASE_DIR / ".env")
 
-DB_PATH = Path(os.environ.get("CONSUMABLE_DB_PATH", DATA_DIR / "consumables.db"))
-AUTO_SEED = os.environ.get("CONSUMABLE_AUTO_SEED", "1") != "0"
+DB_PATH = Path(
+    os.environ.get(
+        "CONSUMABLE_DB_PATH", DATA_DIR / f"{CONSUMABLE_PROFILE}.db"
+    )
+)
+AUTO_SEED = os.environ.get(
+    "CONSUMABLE_AUTO_SEED", "1" if CONSUMABLE_PROFILE == "simulation" else "0"
+) != "0"
+CHAT_UPLOAD_DIR = Path(
+    os.environ.get("CONSUMABLE_CHAT_UPLOAD_DIR", DB_PATH.parent / f"{DB_PATH.stem}-uploads")
+)
+PHOTO_DEFAULT = DB_PATH.parent / "photos" if DB_PATH.name == "consumables.db" else DB_PATH.parent / f"{DB_PATH.stem}-photos"
+PHOTO_DIR = Path(os.environ.get("CONSUMABLE_PHOTO_DIR", PHOTO_DEFAULT))
 GENAI_API_KEY = os.environ.get("GENAI_API_KEY", "")
 GENAI_MODEL = os.environ.get("GENAI_MODEL", "deepseek-pro")
 GENAI_MODE = os.environ.get("GENAI_MODE", "completion")
@@ -44,6 +58,8 @@ GENAI_BASE_URL = os.environ.get(
 GENAI_TIMEOUT = float(os.environ.get("GENAI_TIMEOUT", "18"))
 GENAI_TEMPERATURE = float(os.environ.get("GENAI_TEMPERATURE", "0.2"))
 GENAI_MAX_OUTPUT_TOKENS = int(os.environ.get("GENAI_MAX_OUTPUT_TOKENS", "450"))
+GENAI_TOTAL_TIMEOUT = float(os.environ.get("GENAI_TOTAL_TIMEOUT", "75"))
+GENAI_PROVIDER_TIMEOUT = float(os.environ.get("GENAI_PROVIDER_TIMEOUT", "10"))
 
 
 def ensure_data_dir() -> None:

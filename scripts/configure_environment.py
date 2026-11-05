@@ -11,10 +11,6 @@ def configure(path: Path) -> None:
         for line in lines
         if "=" in line and not line.lstrip().startswith("#")
     }
-    if not existing.get("GENAI_API_KEY", "").strip("\"' "):
-        raise RuntimeError(
-            "Institutional AI credential must be configured before deployment"
-        )
     updates = {"GENAI_REQUIRED": "1"}
     if not existing.get("VAPID_PRIVATE_KEY"):
         updates["VAPID_PRIVATE_KEY"] = "/etc/lab-management/push/vapid-private.pem"

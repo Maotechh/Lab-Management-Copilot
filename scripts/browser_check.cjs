@@ -88,9 +88,14 @@ let runningBrowser;
  await submit('#locationDetailsForm','/api/locations/photo');await page.locator('#locationPhotos img').first().waitFor();
  assert.equal(await page.locator('#locationPhotos img').first().evaluate(img=>img.complete&&img.naturalWidth>0),true);
  await tab('chat');await page.locator('#chatText').fill('100mL烧杯用了2个不放回');
- response=page.waitForResponse(r=>r.url().endsWith('/api/transactions/preview'));await page.locator('#previewBtn').click();const model=await response;assert.equal(model.status(),200);const parsed=await model.json();assert.equal(parsed.engine,'deepseek-pro');assert.equal(parsed.operations[0].action,'consume');
- await page.locator('#chatText').fill('准备采购10个100mL烧杯');assert.equal(await page.locator('#commitBtn').isDisabled(),true);
- response=page.waitForResponse(r=>r.url().endsWith('/api/transactions/preview'));await page.locator('#previewBtn').click();assert.equal((await (await response).json()).operations[0].action,'needs_review');
+ response=page.waitForResponse(r=>r.url().includes('/api/chat/conversations/')&&r.url().endsWith('/messages'));await page.locator('#previewBtn').click();const model=await response;assert.equal(model.status(),200,await model.text());const parsed=await model.json();assert.equal(parsed.status,'awaiting_details');assert.equal(parsed.preview.operations[0].action,'consume');
+ await page.locator('#chatText').fill('查找100mL烧杯');
+ response=page.waitForResponse(r=>r.url().includes('/api/chat/conversations/')&&r.url().endsWith('/messages'));await page.locator('#previewBtn').click();const chatResult=await response;assert.equal(chatResult.status(),200,await chatResult.text());
+ await page.waitForFunction(()=>document.querySelectorAll('#chatMessages .chat-message').length>=2);
+ const conversation=await page.evaluate(()=>localStorage.getItem('lab-chat-conversation'));
+ await page.reload();await page.waitForFunction(id=>localStorage.getItem('lab-chat-conversation')===id&&document.querySelectorAll('#chatMessages .chat-message').length>=2,conversation);
+ const planned=await page.evaluate(async()=>{const response=await fetch('/api/transactions/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:'准备采购10个100mL烧杯'})});return {status:response.status,body:await response.json()};});
+ assert.equal(planned.status,200);assert.equal(planned.body.operations[0].action,'needs_review');
  for(const size of [{width:1440,height:1000},{width:390,height:844},{width:844,height:390}]){
    await page.setViewportSize(size);
    for(const name of ['search','chat','prepare','loans','lessons','purchases','maintenance','history','alerts','admin']){

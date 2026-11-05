@@ -16,7 +16,7 @@ def verify(source: Path, directory: Path) -> dict:
     with sqlite3.connect(snapshot) as old, sqlite3.connect(candidate) as new:
         old.backup(new)
     report = migrate(candidate)
-    for version in (1, 2):
+    for version in (1, 2, 3):
         before = candidate.with_suffix(f".before-v{version}.db")
         if before.exists():
             verify_restore(before)

@@ -10,6 +10,7 @@ Group=lab-management
 WorkingDirectory=/opt/lab-management/current
 Environment=HOME=/var/lib/lab-management
 Environment=CONSUMABLE_DB_PATH=/var/lib/lab-management/consumables.db
+Environment=CONSUMABLE_PROFILE=production
 Environment=CONSUMABLE_AUTO_SEED=0
 Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=-/etc/lab-management/environment

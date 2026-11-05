@@ -272,6 +272,26 @@ def write(
     payload: dict,
     fn: Callable[[], dict],
 ) -> dict:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        result = write_in_transaction(
+            conn, request_id, actor, device_id, payload, fn
+        )
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def write_in_transaction(
+    conn: sqlite3.Connection,
+    request_id: str,
+    actor: str,
+    device_id: str,
+    payload: dict,
+    fn: Callable[[], dict],
+) -> dict:
     if (
         not request_id
         or len(request_id) > 100
@@ -282,43 +302,34 @@ def write(
     fingerprint = hashlib.sha256(
         json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode()
     ).hexdigest()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        old = conn.execute(
-            "SELECT * FROM operation_requests WHERE request_id=?", (request_id,)
-        ).fetchone()
-        if old:
-            if (
-                old["fingerprint"] != fingerprint
-                or old["actor"] != actor
-                or old["device_id"] != device_id
-            ):
-                raise Conflict("请求编号已经用于其他操作")
-            conn.rollback()
-            return json.loads(old["result"])
-        first = conn.execute("SELECT COALESCE(MAX(id),0) FROM stock_events").fetchone()[
-            0
-        ]
-        result = fn()
-        conn.execute(
-            "UPDATE stock_events SET request_id=?,device_id=? WHERE id>?",
-            (request_id, device_id, first),
-        )
-        conn.execute(
-            "INSERT INTO operation_requests(request_id,fingerprint,result,actor,device_id) VALUES (?,?,?,?,?)",
-            (
-                request_id,
-                fingerprint,
-                json.dumps(result, ensure_ascii=False, default=str),
-                actor,
-                device_id,
-            ),
-        )
-        conn.commit()
-        return result
-    except Exception:
-        conn.rollback()
-        raise
+    old = conn.execute(
+        "SELECT * FROM operation_requests WHERE request_id=?", (request_id,)
+    ).fetchone()
+    if old:
+        if (
+            old["fingerprint"] != fingerprint
+            or old["actor"] != actor
+            or old["device_id"] != device_id
+        ):
+            raise Conflict("请求编号已经用于其他操作")
+        return json.loads(old["result"])
+    first = conn.execute("SELECT COALESCE(MAX(id),0) FROM stock_events").fetchone()[0]
+    result = fn()
+    conn.execute(
+        "UPDATE stock_events SET request_id=?,device_id=? WHERE id>?",
+        (request_id, device_id, first),
+    )
+    conn.execute(
+        "INSERT INTO operation_requests(request_id,fingerprint,result,actor,device_id) VALUES (?,?,?,?,?)",
+        (
+            request_id,
+            fingerprint,
+            json.dumps(result, ensure_ascii=False, default=str),
+            actor,
+            device_id,
+        ),
+    )
+    return result
 
 
 def operate(

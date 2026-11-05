@@ -23,8 +23,8 @@
           面向化学实验教学平台的库存查询、预警、出入库和实验准备清单。
         </p>
         <nav class="tabs" aria-label="主导航">
-          <button class="tab active" data-tab="search"><i data-lucide="search" class="icon-sm"></i>库存查询</button>
-          <button class="tab" data-tab="chat"><i data-lucide="message-square" class="icon-sm"></i>聊天改数</button>
+          <button class="tab active" data-tab="chat"><i data-lucide="message-square" class="icon-sm"></i>聊天助手</button>
+          <button class="tab" data-tab="search"><i data-lucide="search" class="icon-sm"></i>库存查询</button>
           <button class="tab" data-tab="alerts"><i data-lucide="alert-triangle" class="icon-sm"></i>库存预警</button>
           <button class="tab" data-tab="prepare"><i data-lucide="scan-search" class="icon-sm"></i>批量查询</button>
           <button class="tab" data-tab="admin"><i data-lucide="database" class="icon-sm"></i>数据管理</button>
@@ -61,11 +61,12 @@
         </header>
 
         <main class="app-shell">
+          <div id="profileBanner" class="notice" role="status" hidden></div>
           <div id="pendingRequest" class="notice" role="status" hidden></div>
           <div id="pageError" role="alert" class="notice danger" hidden></div>
           <section class="metrics" id="metrics"></section>
 
-          <section class="tab-panel active" id="tab-search">
+          <section class="tab-panel" id="tab-search">
             <div class="surface">
               <div class="toolbar">
                 <input id="searchInput" type="search" placeholder="名称、规格、实验室、位置" />
@@ -100,24 +101,22 @@
             </div>
           </section>
 
-          <section class="tab-panel" id="tab-chat">
-            <div class="two-column">
-              <div class="surface">
-                <label class="field-label" for="chatText">库存变更</label>
-                <textarea id="chatText" rows="5" placeholder="例如：100mL烧杯用了 2 个不放回"></textarea>
-                <div class="quick-prompts" aria-label="常用库存变更示例">
-                  <button class="secondary" data-prompt="100mL烧杯入库 2 个">入库示例</button>
-                  <button class="secondary" data-prompt="100mL烧杯用了 2 个不放回">消耗示例</button>
-                  <button class="secondary" data-prompt="100mL烧杯借出 1 个">借出示例</button>
-                  <button class="secondary" data-prompt="100mL烧杯预警设置为 10 个">预警示例</button>
-                </div>
-                <div class="toolbar compact">
-                  <button id="previewBtn"><i data-lucide="wand-2" class="icon-sm"></i>识别</button>
-                  <button id="commitBtn" class="primary" disabled><i data-lucide="check" class="icon-sm"></i>提交变更</button>
-                </div>
-                <div id="previewBox" class="preview"></div>
+          <section class="tab-panel active" id="tab-chat">
+            <div class="surface chat-surface">
+              <div id="chatMessages" class="chat-transcript" aria-live="polite"></div>
+              <label class="field-label" for="chatText">消息</label>
+              <textarea id="chatText" rows="3" placeholder="查找物品、准备实验或记录耗材操作"></textarea>
+              <div class="toolbar compact chat-composer-actions">
+                <label class="chat-attachment-label" for="chatFile"><i data-lucide="paperclip" class="icon-sm"></i>附加文件</label>
+                <input id="chatFile" type="file" accept=".xlsx,.xls,image/jpeg,image/png,image/webp" />
+                <span id="chatAttachmentName" class="muted small-text"></span>
+                <button id="previewBtn" type="button" class="primary"><i data-lucide="send" class="icon-sm"></i>发送</button>
+                <button id="commitBtn" type="button" class="secondary" disabled><i data-lucide="check" class="icon-sm"></i>生成确认预览</button>
               </div>
-              <div class="surface">
+              <div id="chatTaskActions" class="toolbar compact" hidden></div>
+              <div id="previewBox" class="preview"></div>
+            </div>
+            <div class="surface">
                 <h2>最近操作</h2>
                 <div class="table-wrap short responsive-cards">
                   <table>
@@ -134,7 +133,6 @@
                     <tbody id="transactionRows"></tbody>
                   </table>
                 </div>
-              </div>
             </div>
           </section>
 

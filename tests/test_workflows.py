@@ -660,6 +660,259 @@ def test_api_requires_request_identity_and_retries(db, monkeypatch):
         )
 
 
+def test_chat_conversation_preview_confirm_is_idempotent(db, monkeypatch):
+    from consumable_assistant import server, services
+
+    item = make_item(db)
+    path = Path(db.execute("PRAGMA database_list").fetchone()[2])
+    monkeypatch.setattr(server, "connect", lambda: connect(path))
+    monkeypatch.setattr(services, "model_is_enabled", lambda: True)
+    monkeypatch.setattr(
+        services,
+        "parse_inventory_message",
+        lambda _: {
+            "operations": [
+                {"action": "consume", "quantity": 2, "item_query": "玻璃烧杯"}
+            ],
+            "model": "test-model",
+            "provider": "test-provider",
+        },
+    )
+    with TestClient(server.app) as client:
+        headers = {"X-Device-ID": "chat-device"}
+        created = client.post("/api/chat/conversations", headers=headers)
+        assert created.status_code == 200, created.text
+        identity = created.json()
+        auth = {**headers, "X-Chat-Token": identity["token"], "X-Actor": "Teacher"}
+        message = {
+            "message_id": uuid.uuid4().hex,
+            "text": "玻璃烧杯用了2个不放回",
+        }
+        response = client.post(
+            f"/api/chat/conversations/{identity['conversation_id']}/messages",
+            headers=auth,
+            json=message,
+        )
+        assert response.status_code == 200, response.text
+        task = response.json()
+        assert task["status"] == "awaiting_details"
+        assert stock.view(db, item)["ready"] == "100"
+        repeated = client.post(
+            f"/api/chat/conversations/{identity['conversation_id']}/messages",
+            headers=auth,
+            json=message,
+        )
+        assert repeated.json() == task
+        selected = client.post(
+            f"/api/chat/tasks/{task['task_id']}/prepare",
+            headers=auth,
+            json={
+                "operations": [
+                    {
+                        "item_id": item,
+                        "version": 1,
+                        "action": "consume",
+                        "quantity": "2",
+                        "unit": "个",
+                    }
+                ]
+            },
+        )
+        assert selected.status_code == 200, selected.text
+        assert selected.json()["status"] == "pending_confirmation"
+        assert stock.view(db, item)["ready"] == "100"
+        confirmation = uuid.uuid4().hex
+        confirmed = client.post(
+            f"/api/chat/tasks/{task['task_id']}/confirm",
+            headers=auth,
+            json={"request_id": confirmation},
+        )
+        assert confirmed.status_code == 200, confirmed.text
+        assert stock.view(db, item)["ready"] == "98"
+        repeated_confirmation = client.post(
+            f"/api/chat/tasks/{task['task_id']}/confirm",
+            headers=auth,
+            json={"request_id": uuid.uuid4().hex},
+        )
+        assert repeated_confirmation.json() == confirmed.json()
+        assert stock.view(db, item)["ready"] == "98"
+        assert client.get(
+            f"/api/chat/conversations/{identity['conversation_id']}",
+            headers={**headers, "X-Chat-Token": "invalid"},
+        ).status_code == 400
+
+
+def test_chat_rejects_confirmed_write_with_stale_version(db, monkeypatch):
+    from consumable_assistant import chat
+
+    item = make_item(db)
+    conversation = chat.new_conversation(db, "device")
+    preview = {
+        "operations": [
+            {
+                "id": "op-0",
+                "raw_text": "玻璃烧杯消耗2个",
+                "action": "consume",
+                "action_label": "消耗",
+                "quantity": 2,
+                "unit": "个",
+                "item_query": "玻璃烧杯",
+                "candidates": [stock.view(db, item)],
+                "needs_review": False,
+                "confidence": 1,
+            }
+        ]
+    }
+    response = chat._transaction_task(
+        db,
+        conversation["conversation_id"],
+        1,
+        uuid.uuid4().hex,
+        "玻璃烧杯消耗2个",
+        preview,
+        [],
+    )
+    chat.prepare_transaction_task(
+        db,
+        conversation["conversation_id"],
+        response["task_id"],
+        [{"item_id": item, "action": "consume", "quantity": 2}],
+        "Teacher",
+        lambda conn, kind, data, actor: __import__(
+            "consumable_assistant.server", fromlist=["dispatch"]
+        ).dispatch(conn, kind, data, actor),
+    )
+    operation(db, item, "consume", 1)
+    task = db.execute("SELECT * FROM chat_tasks WHERE id=?", (response["task_id"],)).fetchone()
+    with pytest.raises(stock.Conflict):
+        chat.confirm_task(
+            db,
+            task,
+            "Teacher",
+            "device",
+            uuid.uuid4().hex,
+            lambda conn, kind, data, actor: __import__(
+                "consumable_assistant.server", fromlist=["dispatch"]
+            ).dispatch(conn, kind, data, actor),
+        )
+    assert stock.view(db, item)["ready"] == "99"
+    assert db.execute("SELECT status FROM chat_tasks WHERE id=?", (response["task_id"],)).fetchone()[0] == "expired"
+
+
+def test_ai_provider_fallback_uses_school_glm(monkeypatch):
+    import httpx
+
+    from consumable_assistant import genai
+
+    calls = []
+    monkeypatch.setattr(genai, "GENAI_API_KEY", "test-key")
+    monkeypatch.setattr(genai, "GENAI_MODEL", "deepseek-pro")
+    monkeypatch.setattr(genai, "GENAI_MODE", "openai")
+    monkeypatch.setattr(genai, "GENAI_BASE_URL", "http://primary.test/v1")
+    monkeypatch.setenv("GENAI_FALLBACK_MODELS", "")
+    monkeypatch.setenv(
+        "GENAI_FALLBACK_PROVIDERS_JSON",
+        '[{"name":"GLM test","model":"glm-chat","base_url":"http://glm.test/v1"}]',
+    )
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def post(self, url, **kwargs):
+            calls.append(url)
+            if "primary.test" in url:
+                raise httpx.ConnectTimeout("primary unavailable")
+            return httpx.Response(
+                200,
+                json={"choices":[{"message":{"content":"{\"operations\":[{\"action\":\"consume\",\"quantity\":2}]}"}}]},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(genai.httpx, "Client", Client)
+    monkeypatch.setattr(genai, "record_provider_check", lambda *args: None)
+    monkeypatch.setattr(genai, "record_health", lambda *args: None)
+    result = genai.parse_inventory_message("玻璃烧杯消耗2个")
+    assert result["provider"] == "GLM test"
+    assert result["model"] == "glm-chat"
+    assert len(calls) == 2
+
+
+def test_school_fallbacks_work_without_primary_key(monkeypatch):
+    from consumable_assistant import genai
+
+    monkeypatch.setattr(genai, "GENAI_API_KEY", "")
+    monkeypatch.setattr(genai, "GENAI_BASE_URL", "")
+    monkeypatch.setenv("GENAI_FALLBACK_MODELS", "")
+    monkeypatch.delenv("GENAI_FALLBACK_PROVIDERS_JSON", raising=False)
+    providers = genai.provider_entries()
+    assert [provider["model"] for provider in providers] == [
+        "qwen-instruct",
+        "glm-chat",
+        "deepseek-pro",
+        "kimi",
+    ]
+    assert genai.model_is_enabled()
+
+
+def test_deployment_accepts_school_model_fallbacks_without_primary_key(tmp_path):
+    from scripts.configure_environment import configure
+
+    path = tmp_path / "environment"
+    path.write_text(
+        "GENAI_REQUIRED=0\nVAPID_PRIVATE_KEY=existing\nVAPID_PUBLIC_KEY=existing\n",
+        encoding="utf-8",
+    )
+    configure(path)
+    configured = path.read_text(encoding="utf-8")
+    assert "GENAI_REQUIRED=1" in configured
+    assert "GENAI_API_KEY" not in configured
+
+
+def test_chat_retries_saved_message_after_ai_outage(db, monkeypatch):
+    from consumable_assistant import chat
+
+    conversation = chat.new_conversation(db, "device")
+    replies = iter(
+        [
+            None,
+            {"reply": "已查询当前校内记录。", "calls": [], "_provider": "Qwen"},
+        ]
+    )
+    monkeypatch.setattr(chat, "request_json", lambda *args, **kwargs: next(replies))
+    request = chat.ChatMessageRequest(message_id=uuid.uuid4().hex, text="有哪些烧杯")
+
+    first = chat.process_message(
+        db,
+        conversation["conversation_id"],
+        request,
+        "Teacher",
+        "device",
+        lambda *args: {},
+        lambda *args: [],
+    )
+    assert first["status"] == "ai_unavailable"
+
+    second = chat.process_message(
+        db,
+        conversation["conversation_id"],
+        request,
+        "Teacher",
+        "device",
+        lambda *args: {},
+        lambda *args: [],
+    )
+    assert second["status"] == "answered"
+    assert db.execute(
+        "SELECT COUNT(*) FROM chat_messages WHERE conversation_id=? AND request_id=? AND role='assistant'",
+        (conversation["conversation_id"], request.message_id),
+    ).fetchone()[0] == 1
 def test_ai_retries_and_auth_failure(monkeypatch):
     import httpx
 
