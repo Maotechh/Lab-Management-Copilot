@@ -9,6 +9,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 os.environ["GENAI_API_KEY"] = ""
+os.environ["GENAI_BASE_URL"] = ""
+os.environ["GENAI_FALLBACK_PROVIDERS_JSON"] = "[]"
+os.environ["GENAI_FALLBACK_MODELS"] = ""
 os.environ["GENAI_REQUIRED"] = "0"
 os.environ["CONSUMABLE_AUTO_SEED"] = "0"
 

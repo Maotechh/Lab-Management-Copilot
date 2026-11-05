@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import uuid
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
@@ -43,7 +44,21 @@ from .settings import (
     STATIC_DIR,
 )
 
-app = FastAPI(title="耗材智能管理助手", version="0.2.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    with connect() as conn:
+        init_db(conn)
+        if AUTO_SEED and inventory_is_empty(conn):
+            import_all_sources(conn)
+        stock.initialize_balances(conn)
+        for row in conn.execute("SELECT item_id FROM stock_balances").fetchall():
+            stock.alerts_changed(conn, row["item_id"])
+        conn.commit()
+    yield
+
+
+app = FastAPI(title="耗材智能管理助手", version="0.2.0", lifespan=lifespan)
 
 
 class ChatPrepareRequest(BaseModel):
@@ -83,18 +98,6 @@ async def database_error(request: Request, exc: sqlite3.OperationalError):
     return JSONResponse(
         {"detail": "数据库暂时忙碌，请查询原请求结果后重试"}, status_code=503
     )
-
-
-@app.on_event("startup")
-def startup():
-    with connect() as conn:
-        init_db(conn)
-        if AUTO_SEED and inventory_is_empty(conn):
-            import_all_sources(conn)
-        stock.initialize_balances(conn)
-        for row in conn.execute("SELECT item_id FROM stock_balances").fetchall():
-            stock.alerts_changed(conn, row["item_id"])
-        conn.commit()
 
 
 @app.get("/")
@@ -310,6 +313,14 @@ def cancel_chat_task(task_id: str, request: Request):
         conn.execute(
             "UPDATE chat_tasks SET status='cancelled',updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (task_id,),
+        )
+        chat_session._record_task_event(
+            conn,
+            task_id,
+            task["status"],
+            "cancelled",
+            "cancelled_by_user",
+            request.headers.get("x-request-id"),
         )
         conn.commit()
         return {"status": "cancelled", "task_id": task_id}

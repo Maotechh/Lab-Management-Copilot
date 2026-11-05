@@ -103,8 +103,14 @@ def read_inventory_sheet(path: Path) -> pd.DataFrame:
             converted = list(Path(tmp).glob("*.xlsx"))
             if not converted:
                 raise RuntimeError(f"无法读取 {path.name}，没有得到转换后的 xlsx 文件")
-            return pd.read_excel(converted[0], dtype=object)
-    return pd.read_excel(path, dtype=object)
+            workbook = pd.ExcelFile(converted[0])
+            frame = pd.read_excel(workbook, sheet_name=workbook.sheet_names[0], dtype=object)
+            frame.attrs["source_sheet"] = workbook.sheet_names[0]
+            return frame
+    workbook = pd.ExcelFile(path)
+    frame = pd.read_excel(workbook, sheet_name=workbook.sheet_names[0], dtype=object)
+    frame.attrs["source_sheet"] = workbook.sheet_names[0]
+    return frame
 
 
 def import_all_sources(
@@ -125,6 +131,68 @@ def import_all_sources(
     }
 
 
+def backfill_duplicate_source_rows(
+    conn: sqlite3.Connection, attachment_dir: Path = ATTACHMENT_DIR
+) -> int:
+    """Restore provenance for duplicate rows without changing inventory balances."""
+    inserted = 0
+    for config in SOURCE_CONFIGS:
+        path = attachment_dir / config.filename
+        if not path.exists():
+            continue
+        frame = read_inventory_sheet(path)
+        source_sheet = frame.attrs.get("source_sheet", "Sheet1")
+        frame.columns = [str(column).strip() for column in frame.columns]
+        for index, row in frame.dropna(how="all").iterrows():
+            mapped = map_source_row(
+                row.to_dict(), config, path.name, int(index) + 2, source_sheet
+            )
+            if not mapped:
+                continue
+            existing = source_row_by_hash(conn, mapped["row_hash"])
+            if not existing:
+                continue
+            same_source = conn.execute(
+                "SELECT 1 FROM source_rows WHERE row_hash=? AND source_file=? "
+                "AND COALESCE(source_sheet,'')=? AND source_row_number=? LIMIT 1",
+                (
+                    mapped["row_hash"],
+                    mapped["source_file"],
+                    mapped["source_sheet"],
+                    mapped["source_row_number"],
+                ),
+            ).fetchone()
+            if same_source:
+                continue
+            conn.execute(
+                "INSERT INTO source_rows(row_hash,source_file,source_sheet,source_row_number,"
+                "category,lab,location_code,item_name,normalized_name,spec,brand,quantity,unit,"
+                "threshold,remark,raw_json,duplicate_of) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    mapped["row_hash"],
+                    mapped["source_file"],
+                    mapped["source_sheet"],
+                    mapped["source_row_number"],
+                    mapped["category"],
+                    mapped["lab"],
+                    mapped["location_code"],
+                    mapped["item_name"],
+                    mapped["normalized_name"],
+                    mapped["spec"],
+                    mapped["brand"],
+                    mapped["quantity"],
+                    mapped["unit"],
+                    mapped["threshold"],
+                    mapped["remark"],
+                    mapped["raw_json"],
+                    existing["id"],
+                ),
+            )
+            inserted += 1
+    conn.commit()
+    return inserted
+
+
 def import_source(
     conn: sqlite3.Connection, path: Path, config: SourceConfig
 ) -> dict[str, Any]:
@@ -136,14 +204,28 @@ def import_source(
     created_items = 0
     try:
         df = read_inventory_sheet(path)
+        source_sheet = df.attrs.get("source_sheet", "Sheet1")
         df.columns = [str(col).strip() for col in df.columns]
         df = df.dropna(how="all")
         for index, row in df.iterrows():
-            mapped = map_source_row(row.to_dict(), config, path.name, int(index) + 2)
+            mapped = map_source_row(
+                row.to_dict(), config, path.name, int(index) + 2, source_sheet
+            )
             if mapped is None:
                 skipped_rows += 1
                 continue
-            if source_row_exists(conn, mapped["row_hash"]):
+            existing = source_row_by_hash(conn, mapped["row_hash"])
+            same_source = conn.execute(
+                "SELECT 1 FROM source_rows WHERE row_hash=? AND source_file=? "
+                "AND COALESCE(source_sheet,'')=? AND source_row_number=? LIMIT 1",
+                (
+                    mapped["row_hash"],
+                    mapped["source_file"],
+                    mapped["source_sheet"],
+                    mapped["source_row_number"],
+                ),
+            ).fetchone()
+            if same_source:
                 skipped_rows += 1
                 continue
             conn.execute(
@@ -151,9 +233,9 @@ def import_source(
                 INSERT INTO source_rows(
                     row_hash, source_file, source_sheet, source_row_number, category,
                     lab, location_code, item_name, normalized_name, spec, brand,
-                    quantity, unit, threshold, remark, raw_json
+                    quantity, unit, threshold, remark, raw_json, duplicate_of
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     mapped["row_hash"],
@@ -172,8 +254,12 @@ def import_source(
                     mapped["threshold"],
                     mapped["remark"],
                     mapped["raw_json"],
+                    existing["id"] if existing else None,
                 ),
             )
+            if existing:
+                skipped_rows += 1
+                continue
             item_id, was_created = upsert_inventory_item(conn, mapped)
             if was_created:
                 created_items += 1
@@ -211,7 +297,11 @@ def import_source(
 
 
 def map_source_row(
-    row: dict[str, Any], config: SourceConfig, source_file: str, row_number: int
+    row: dict[str, Any],
+    config: SourceConfig,
+    source_file: str,
+    row_number: int,
+    source_sheet: str = "Sheet1",
 ) -> dict[str, Any] | None:
     item_name = clean_cell(row.get(config.name_col))
     if not item_name:
@@ -222,7 +312,7 @@ def map_source_row(
     threshold = parse_float(row.get(config.threshold_col))
     mapped = {
         "source_file": source_file,
-        "source_sheet": "Sheet1",
+        "source_sheet": source_sheet,
         "source_row_number": row_number,
         "category": config.category,
         "lab": lab,
@@ -276,12 +366,13 @@ def map_source_row(
 
 
 def source_row_exists(conn: sqlite3.Connection, row_hash: str) -> bool:
-    return (
-        conn.execute(
-            "SELECT 1 FROM source_rows WHERE row_hash = ?", (row_hash,)
-        ).fetchone()
-        is not None
-    )
+    return source_row_by_hash(conn, row_hash) is not None
+
+
+def source_row_by_hash(conn: sqlite3.Connection, row_hash: str):
+    return conn.execute(
+        "SELECT id FROM source_rows WHERE row_hash = ? ORDER BY id LIMIT 1", (row_hash,)
+    ).fetchone()
 
 
 def upsert_inventory_item(

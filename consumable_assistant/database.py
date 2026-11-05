@@ -23,7 +23,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS source_rows (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            row_hash TEXT NOT NULL UNIQUE,
+            row_hash TEXT NOT NULL,
             source_file TEXT NOT NULL,
             source_sheet TEXT,
             source_row_number INTEGER,
@@ -39,6 +39,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             threshold REAL,
             remark TEXT,
             raw_json TEXT NOT NULL,
+            duplicate_of INTEGER,
             imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 

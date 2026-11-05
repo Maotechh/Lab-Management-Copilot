@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from urllib.parse import urlencode
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import ledger as stock
 from . import workflows as flow
@@ -23,6 +23,7 @@ from .services import (
 
 MAX_MESSAGE_LENGTH = 10000
 MAX_TOOL_ROUNDS = 4
+MESSAGE_LEASE_SECONDS = 120
 CHAT_SYSTEM = """
 你是校内化学实验耗材管理助手。你只能提出固定业务工具请求，不能声称工具已经执行，也不能编造库存、位置、人员、记录编号或计算结果。
 
@@ -68,6 +69,8 @@ class ChatPlan(BaseModel):
 
 
 class ToolArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     query: str | None = Field(default=None, max_length=300)
     category: str | None = Field(default=None, max_length=100)
     lab: str | None = Field(default=None, max_length=50)
@@ -84,10 +87,6 @@ class ToolArguments(BaseModel):
     mode: str | None = Field(default=None, max_length=30)
     course: str | None = Field(default=None, max_length=200)
     payload: dict[str, Any] | None = None
-
-    class Config:
-        extra = "forbid"
-
 
 def json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
@@ -156,6 +155,119 @@ def process_message(
     dispatch_fn,
     history_fn,
 ) -> dict:
+    if not request.text.strip() and not request.attachments:
+        raise ValueError("請輸入內容或附加 Excel 文件")
+    attachments = _attachments(conn, conversation_id, request.attachments)
+    request_hash = hashlib.sha256(
+        json_text(
+            {"text": request.text.strip(), "attachments": request.attachments}
+        ).encode("utf-8")
+    ).hexdigest()
+    label = request.text.strip()
+    if attachments:
+        label += ("\n" if label else "") + "附件：" + "、".join(
+            item["filename"] for item in attachments
+        )
+
+    now = datetime.now(UTC)
+    lease_until = (now + timedelta(seconds=MESSAGE_LEASE_SECONDS)).isoformat()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conversation = conn.execute(
+            "SELECT active_message_id,active_until FROM chat_conversations WHERE id=?",
+            (conversation_id,),
+        ).fetchone()
+        if not conversation:
+            raise ValueError("对话不存在，请重新建立对话")
+        user_message = conn.execute(
+            "SELECT id,content,request_hash FROM chat_messages "
+            "WHERE conversation_id=? AND request_id=? AND role='user'",
+            (conversation_id, request.message_id),
+        ).fetchone()
+        previous = conn.execute(
+            "SELECT result_json FROM chat_messages "
+            "WHERE conversation_id=? AND request_id=? AND role='assistant'",
+            (conversation_id, request.message_id),
+        ).fetchone()
+        if user_message:
+            saved_hash = user_message["request_hash"]
+            if saved_hash and saved_hash != request_hash:
+                raise stock.Conflict("此消息编号已用于不同内容，请使用新的消息编号")
+            if not saved_hash:
+                if user_message["content"] != label:
+                    raise stock.Conflict("此消息编号已用于不同内容，请使用新的消息编号")
+                conn.execute(
+                    "UPDATE chat_messages SET request_hash=? WHERE id=?",
+                    (request_hash, user_message["id"]),
+                )
+        elif previous:
+            raise stock.Conflict("此消息编号已有处理结果，但缺少原消息内容，无法安全重试")
+
+        if previous:
+            cached = json.loads(previous["result_json"] or "{}")
+            if cached.get("status") != "ai_unavailable":
+                conn.commit()
+                return cached
+
+        active_message_id = conversation["active_message_id"]
+        active_until_value = conversation["active_until"]
+        active_until = None
+        if active_until_value:
+            try:
+                active_until = datetime.fromisoformat(active_until_value)
+                if active_until.tzinfo is None:
+                    active_until = active_until.replace(tzinfo=UTC)
+            except ValueError:
+                active_until = None
+        if active_message_id and active_until and active_until > now:
+            raise stock.Conflict("此对话的另一条消息仍在处理，请稍后查看对话状态")
+
+        if not user_message:
+            conn.execute(
+                "INSERT INTO chat_messages(conversation_id,request_id,role,content,request_hash) "
+                "VALUES (?,?,?,?,?)",
+                (conversation_id, request.message_id, "user", label, request_hash),
+            )
+        conn.execute(
+            "UPDATE chat_conversations SET active_message_id=?,active_until=?, "
+            "version=version+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (request.message_id, lease_until, conversation_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    try:
+        return _process_claimed_message(
+            conn,
+            conversation_id,
+            request,
+            actor,
+            device_id,
+            dispatch_fn,
+            history_fn,
+        )
+    finally:
+        conn.rollback()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE chat_conversations SET active_message_id=NULL,active_until=NULL "
+            "WHERE id=? AND active_message_id=?",
+            (conversation_id, request.message_id),
+        )
+        conn.commit()
+
+
+def _process_claimed_message(
+    conn,
+    conversation_id: str,
+    request: ChatMessageRequest,
+    actor: str,
+    device_id: str,
+    dispatch_fn,
+    history_fn,
+) -> dict:
     previous = conn.execute(
         "SELECT result_json FROM chat_messages WHERE conversation_id=? AND request_id=? AND role='assistant'",
         (conversation_id, request.message_id),
@@ -206,20 +318,43 @@ def process_message(
             "result": result,
         }
         _assistant_message(conn, conversation_id, request.message_id, response)
+        conn.commit()
         return response
     if pending and _is_cancel(request.text):
         conn.execute(
             "UPDATE chat_tasks SET status='cancelled',updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (pending["id"],),
         )
+        _record_task_event(
+            conn,
+            pending["id"],
+            pending["status"],
+            "cancelled",
+            "cancelled_by_message",
+            request.message_id,
+        )
         response = {"reply": "已取消待确认计划，没有修改库存。", "status": "cancelled"}
         _assistant_message(conn, conversation_id, request.message_id, response)
         conn.commit()
         return response
+    expired_tasks = conn.execute(
+        "SELECT id,status FROM chat_tasks WHERE conversation_id=? "
+        "AND status IN ('awaiting_details','pending_confirmation')",
+        (conversation_id,),
+    ).fetchall()
     conn.execute(
         "UPDATE chat_tasks SET status='expired',updated_at=CURRENT_TIMESTAMP WHERE conversation_id=? AND status IN ('awaiting_details','pending_confirmation')",
         (conversation_id,),
     )
+    for expired in expired_tasks:
+        _record_task_event(
+            conn,
+            expired["id"],
+            expired["status"],
+            "expired",
+            "superseded_by_message",
+            request.message_id,
+        )
     conn.commit()
 
     inferred = infer_action(request.text)
@@ -289,15 +424,15 @@ def process_message(
         provider = raw.pop("_provider", None)
         raw.pop("_model", None)
         try:
-            plan = ChatPlan.parse_obj(raw)
-            plan = plan.copy(
+            plan = ChatPlan.model_validate(raw)
+            plan = plan.model_copy(
                 update={
                     "calls": [
-                        call.copy(
+                        call.model_copy(
                             update={
-                                "arguments": ToolArguments.parse_obj(
+                                "arguments": ToolArguments.model_validate(
                                     call.arguments
-                                ).dict(exclude_none=True)
+                                ).model_dump(exclude_none=True)
                             }
                         )
                         for call in plan.calls
@@ -598,6 +733,7 @@ def _business_task(
             expires,
         ),
     )
+    _record_task_event(conn, task_id, None, "awaiting_details", "created", request_id)
     return {
         "reply": "已按当前数据生成预览。请核对物品、位置、数量和状态，再确认执行。",
         "status": "pending_confirmation",
@@ -684,6 +820,13 @@ def prepare_transaction_task(
         "UPDATE chat_tasks SET status='pending_confirmation',kind=?,plan_json=?,plan_hash=?,preview_json=?,expires_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
         (kind, json_text(body), digest, json_text(summary), expires, task_id),
     )
+    _record_task_event(
+        conn,
+        task_id,
+        "awaiting_details",
+        "pending_confirmation",
+        "prepared",
+    )
     return {"task_id": task_id, "status": "pending_confirmation", "preview": summary, "expires_at": expires}
 
 
@@ -740,7 +883,23 @@ def _transaction_task(
             expires,
         ),
     )
+    _record_task_event(conn, task_id, None, "awaiting_details", "created", request_id)
     return response
+
+
+def _record_task_event(
+    conn,
+    task_id: str,
+    from_status: str | None,
+    to_status: str,
+    event_type: str,
+    request_id: str | None = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO chat_task_events(task_id,from_status,to_status,event_type,request_id) "
+        "VALUES (?,?,?,?,?)",
+        (task_id, from_status, to_status, event_type, request_id),
+    )
 
 
 def _preview_dispatch(conn, kind: str, payload: dict, actor: str, dispatch_fn) -> dict:
@@ -1017,6 +1176,14 @@ def confirm_task(
             "UPDATE chat_tasks SET status='expired',updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (task["id"],),
         )
+        _record_task_event(
+            conn,
+            task["id"],
+            task["status"],
+            "expired",
+            "preview_expired",
+            request_id,
+        )
         conn.commit()
         raise ValueError("預覽已超過三十分鐘，請重新查詢並生成計劃")
     plan = json.loads(task["plan_json"])
@@ -1050,6 +1217,14 @@ def confirm_task(
             "UPDATE chat_tasks SET status='completed',request_id=?,result_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending_confirmation'",
             (request_id, json_text(result), live["id"]),
         )
+        _record_task_event(
+            conn,
+            live["id"],
+            "pending_confirmation",
+            "completed",
+            "confirmed",
+            request_id,
+        )
         conn.commit()
         return result
     except stock.Conflict:
@@ -1057,6 +1232,14 @@ def confirm_task(
         conn.execute(
             "UPDATE chat_tasks SET status='expired',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending_confirmation'",
             (task["id"],),
+        )
+        _record_task_event(
+            conn,
+            task["id"],
+            "pending_confirmation",
+            "expired",
+            "stale_plan",
+            request_id,
         )
         conn.commit()
         raise

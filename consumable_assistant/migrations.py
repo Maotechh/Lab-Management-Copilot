@@ -84,6 +84,7 @@ def migrate(conn: sqlite3.Connection) -> None:
     ):
         migrate_history(conn)
         migrate_chat(conn)
+        migrate_runtime(conn)
         return
     database = conn.execute("PRAGMA database_list").fetchone()[2]
     if database:
@@ -110,6 +111,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.commit()
         migrate_history(conn)
         migrate_chat(conn)
+        migrate_runtime(conn)
     except Exception:
         conn.rollback()
         raise
@@ -236,3 +238,101 @@ def migrate_chat(conn: sqlite3.Connection) -> None:
     except Exception:
         conn.rollback()
         raise
+
+
+def migrate_runtime(conn: sqlite3.Connection) -> None:
+    if conn.execute("SELECT 1 FROM schema_migrations WHERE version=4").fetchone():
+        return
+    database = conn.execute("PRAGMA database_list").fetchone()[2]
+    if database:
+        backup = Path(database).with_suffix(".before-v4.db")
+        if not backup.exists():
+            with sqlite3.connect(backup) as destination:
+                conn.backup(destination)
+            backup.chmod(0o600)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_column(conn, "chat_messages", "request_hash", "TEXT")
+        _ensure_column(conn, "chat_conversations", "active_message_id", "TEXT")
+        _ensure_column(conn, "chat_conversations", "active_until", "TEXT")
+        _ensure_column(conn, "source_rows", "duplicate_of", "INTEGER")
+        indexes = {
+            row["name"]: row
+            for row in conn.execute("PRAGMA index_list(source_rows)")
+        }
+        if any(index["unique"] for index in indexes.values()):
+            conn.execute(
+                "CREATE TABLE source_rows_v4 ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, row_hash TEXT NOT NULL, "
+                "source_file TEXT NOT NULL, source_sheet TEXT, source_row_number INTEGER, "
+                "category TEXT, lab TEXT, location_code TEXT, item_name TEXT NOT NULL, "
+                "normalized_name TEXT NOT NULL, spec TEXT, brand TEXT, quantity REAL NOT NULL DEFAULT 0, "
+                "unit TEXT, threshold REAL, remark TEXT, raw_json TEXT NOT NULL, "
+                "duplicate_of INTEGER, imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            )
+            conn.execute(
+                "INSERT INTO source_rows_v4(id,row_hash,source_file,source_sheet,source_row_number,"
+                "category,lab,location_code,item_name,normalized_name,spec,brand,quantity,unit,"
+                "threshold,remark,raw_json,duplicate_of,imported_at) "
+                "SELECT id,row_hash,source_file,source_sheet,source_row_number,category,lab,"
+                "location_code,item_name,normalized_name,spec,brand,quantity,unit,threshold,"
+                "remark,raw_json,duplicate_of,imported_at FROM source_rows"
+            )
+            conn.execute("DROP TABLE source_rows")
+            conn.execute("ALTER TABLE source_rows_v4 RENAME TO source_rows")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_source_rows_hash ON source_rows(row_hash)")
+        conn.execute(
+            "UPDATE source_rows SET source_sheet='实验室耗材数据' "
+            "WHERE source_file='普通化学实验室耗材（不单列规格、带库存预警）.xlsx' "
+            "AND COALESCE(source_sheet,'') IN ('','Sheet1')"
+        )
+        active_tasks = conn.execute(
+            "SELECT id,conversation_id FROM chat_tasks "
+            "WHERE status IN ('awaiting_details','pending_confirmation','executing') "
+            "ORDER BY conversation_id,created_at DESC,id DESC"
+        ).fetchall()
+        seen = set()
+        for task in active_tasks:
+            if task["conversation_id"] in seen:
+                conn.execute(
+                    "UPDATE chat_tasks SET status='expired',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (task["id"],),
+                )
+            else:
+                seen.add(task["conversation_id"])
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_one_active_task "
+            "ON chat_tasks(conversation_id) "
+            "WHERE status IN ('awaiting_details','pending_confirmation','executing')"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS chat_task_events ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL REFERENCES chat_tasks(id), "
+            "from_status TEXT, to_status TEXT NOT NULL, event_type TEXT NOT NULL, "
+            "request_id TEXT, detail_json TEXT NOT NULL DEFAULT '{}', "
+            "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_task_events_task ON chat_task_events(task_id,id)"
+        )
+        conn.execute(
+            "INSERT INTO chat_task_events(task_id,from_status,to_status,event_type) "
+            "SELECT id,NULL,status,'migration_snapshot' FROM chat_tasks "
+            "WHERE NOT EXISTS (SELECT 1 FROM chat_task_events e WHERE e.task_id=chat_tasks.id)"
+        )
+        conn.execute(
+            "INSERT INTO schema_migrations(version,report) VALUES (4,?)",
+            (json.dumps({"chat_claims": True, "task_events": True, "source_duplicates": True}),),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _ensure_column(
+    conn: sqlite3.Connection, table_name: str, column_name: str, column_type: str
+) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})")}
+    if column_name not in columns:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")

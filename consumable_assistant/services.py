@@ -74,6 +74,10 @@ UPLOAD_COLUMNS = {
 
 
 def get_stats(conn: sqlite3.Connection) -> dict[str, Any]:
+    from decimal import Decimal
+
+    from .ledger import number, text
+
     items = search_items(conn, limit=1_000_000)
     item_count = len(items)
     source_count = conn.execute("SELECT COUNT(*) FROM source_rows").fetchone()[0]
@@ -89,7 +93,9 @@ def get_stats(conn: sqlite3.Connection) -> dict[str, Any]:
             {
                 "category": category,
                 "item_count": len(rows),
-                "total_quantity": sum(float(item["ready_quantity"]) for item in rows),
+                "total_quantity": text(
+                    sum((number(item["ready_quantity"]) for item in rows), Decimal(0))
+                ),
             }
         )
     return {
@@ -954,7 +960,7 @@ def list_locations(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         ) + number(item["ready_quantity"])
     result = []
     for key, row in sorted(grouped.items()):
-        row["total_quantity"] = float(row["total_quantity"])
+        row["total_quantity"] = text(row["total_quantity"])
         row["quantity_by_unit"] = {
             unit: text(value) for unit, value in row["quantity_by_unit"].items()
         }
@@ -966,6 +972,10 @@ def list_locations(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 def preview_location(
     conn: sqlite3.Connection, lab: str | None, location_code: str | None
 ) -> dict[str, Any]:
+    from decimal import Decimal
+
+    from .ledger import number, text
+
     lab_value = clean_cell(lab) or ""
     location_value = clean_cell(location_code) or ""
     rows = rows_to_dicts(
@@ -993,8 +1003,8 @@ def preview_location(
         "rows": rows,
         "row_count": len(rows),
         "zero_count": sum(float(row["quantity"] or 0) == 0 for row in rows),
-        "total_quantity": normalize_quantity(
-            sum(float(row["quantity"] or 0) for row in rows)
+        "total_quantity": text(
+            sum((number(row["quantity"]) for row in rows), Decimal(0))
         ),
     }
 

@@ -11,6 +11,9 @@ from fastapi.testclient import TestClient
 from openpyxl import Workbook
 
 os.environ["GENAI_REQUIRED"] = "0"
+os.environ["GENAI_BASE_URL"] = ""
+os.environ["GENAI_FALLBACK_PROVIDERS_JSON"] = "[]"
+os.environ["GENAI_FALLBACK_MODELS"] = ""
 os.environ["CONSUMABLE_AUTO_SEED"] = "0"
 
 from consumable_assistant import ledger as stock
@@ -550,8 +553,8 @@ def test_location_totals_exclude_invalid_legacy_quantity(db):
     item = make_item(db, quantity=-2)
     db.execute("DELETE FROM stock_balances WHERE item_id=?", (item,))
     db.commit()
-    assert list_locations(db)[0]["total_quantity"] == 0
-    assert preview_location(db, "实验室", "A1")["total_quantity"] == 0
+    assert list_locations(db)[0]["total_quantity"] == "0"
+    assert preview_location(db, "实验室", "A1")["total_quantity"] == "0"
     assert (
         db.execute(
             "SELECT quantity FROM inventory_items WHERE id=?", (item,)
@@ -913,6 +916,190 @@ def test_chat_retries_saved_message_after_ai_outage(db, monkeypatch):
         "SELECT COUNT(*) FROM chat_messages WHERE conversation_id=? AND request_id=? AND role='assistant'",
         (conversation["conversation_id"], request.message_id),
     ).fetchone()[0] == 1
+
+
+def test_chat_rejects_reused_message_id_with_different_content(db, monkeypatch):
+    from consumable_assistant import chat
+
+    conversation = chat.new_conversation(db, "device")
+    monkeypatch.setattr(
+        chat, "request_json", lambda *args, **kwargs: {"reply": "已查询", "calls": []}
+    )
+    message_id = uuid.uuid4().hex
+    first = chat.process_message(
+        db,
+        conversation["conversation_id"],
+        chat.ChatMessageRequest(message_id=message_id, text="查询100mL烧杯"),
+        "Teacher",
+        "device",
+        lambda *args: {},
+        lambda *args: [],
+    )
+    with pytest.raises(stock.Conflict):
+        chat.process_message(
+            db,
+            conversation["conversation_id"],
+            chat.ChatMessageRequest(message_id=message_id, text="查询完全不同的物品"),
+            "Teacher",
+            "device",
+            lambda *args: {},
+            lambda *args: [],
+        )
+    assert first["status"] == "answered"
+    assert db.execute(
+        "SELECT content FROM chat_messages WHERE conversation_id=? AND request_id=? AND role='user'",
+        (conversation["conversation_id"], message_id),
+    ).fetchone()[0] == "查询100mL烧杯"
+
+
+def test_chat_serializes_concurrent_messages_per_conversation(db, monkeypatch):
+    from consumable_assistant import chat
+
+    conversation = chat.new_conversation(db, "device")
+    model_started = threading.Event()
+    release_model = threading.Event()
+
+    def fake_model(*args, **kwargs):
+        model_started.set()
+        assert release_model.wait(timeout=5)
+        return {"reply": "已查询", "calls": []}
+
+    monkeypatch.setattr(chat, "request_json", fake_model)
+    first_result = []
+    database_path = Path(db.execute("PRAGMA database_list").fetchone()[2])
+
+    def first_request():
+        with connect(database_path) as conn:
+            first_result.append(
+                chat.process_message(
+                    conn,
+                    conversation["conversation_id"],
+                    chat.ChatMessageRequest(message_id=uuid.uuid4().hex, text="查询烧杯"),
+                    "Teacher",
+                    "device",
+                    lambda *args: {},
+                    lambda *args: [],
+                )
+            )
+
+    thread = threading.Thread(target=first_request)
+    thread.start()
+    assert model_started.wait(timeout=5)
+    with connect(database_path) as conn:
+        with pytest.raises(stock.Conflict):
+            chat.process_message(
+                conn,
+                conversation["conversation_id"],
+                chat.ChatMessageRequest(message_id=uuid.uuid4().hex, text="查询量筒"),
+                "Teacher",
+                "device",
+                lambda *args: {},
+                lambda *args: [],
+            )
+    release_model.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert first_result[0]["status"] == "answered"
+    assert db.execute(
+        "SELECT COUNT(*) FROM chat_tasks WHERE conversation_id=? "
+        "AND status IN ('awaiting_details','pending_confirmation','executing')",
+        (conversation["conversation_id"],),
+    ).fetchone()[0] <= 1
+
+
+def test_v4_migration_preserves_source_rows_and_expires_older_active_tasks(db):
+    from consumable_assistant.migrations import migrate_runtime
+
+    conversation = __import__("consumable_assistant.chat", fromlist=["new_conversation"]).new_conversation(
+        db, "migration-device"
+    )
+    message_ids = []
+    for request_id in ("migration-old", "migration-new"):
+        cursor = db.execute(
+            "INSERT INTO chat_messages(conversation_id,request_id,role,content) VALUES (?,?,?,?)",
+            (conversation["conversation_id"], request_id, "user", request_id),
+        )
+        message_ids.append(cursor.lastrowid)
+    db.execute("DROP INDEX idx_chat_one_active_task")
+    for index, message_id in enumerate(message_ids):
+        db.execute(
+            "INSERT INTO chat_tasks(id,conversation_id,message_id,status,kind,plan_json,plan_hash,preview_json,expires_at,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                f"migration-task-{index}",
+                conversation["conversation_id"],
+                message_id,
+                "pending_confirmation",
+                "stock",
+                "{}",
+                "hash",
+                "{}",
+                "2099-01-01T00:00:00+00:00",
+                f"2026-01-0{index + 1} 00:00:00",
+            ),
+        )
+    db.execute("DROP TABLE chat_task_events")
+    db.execute("DELETE FROM schema_migrations WHERE version=4")
+    db.execute("CREATE UNIQUE INDEX legacy_source_rows_hash ON source_rows(row_hash)")
+    db.commit()
+    migrate_runtime(db)
+    statuses = {
+        row["id"]: row["status"]
+        for row in db.execute("SELECT id,status FROM chat_tasks WHERE id LIKE 'migration-task-%'")
+    }
+    assert statuses == {
+        "migration-task-0": "expired",
+        "migration-task-1": "pending_confirmation",
+    }
+    assert db.execute("SELECT COUNT(*) FROM chat_task_events").fetchone()[0] == 2
+    assert not any(
+        index["unique"]
+        for index in db.execute("PRAGMA index_list(source_rows)")
+    )
+
+
+def test_source_import_retains_duplicate_rows_and_actual_sheet_name(db, tmp_path):
+    from consumable_assistant.importer import SourceConfig, import_source
+
+    path = tmp_path / "duplicates.xlsx"
+    sheet(
+        path,
+        ["类别", "耗材名称", "位置", "数量", "单位", "预警"],
+        [
+            ["测试", "重复烧杯", "A1", 10, "个", 2],
+            ["测试", "重复烧杯", "A1", 10, "个", 2],
+        ],
+    )
+    config = SourceConfig(
+        filename=path.name,
+        category="测试",
+        lab="测试室",
+        name_col="耗材名称",
+        location_col="位置",
+        quantity_col="数量",
+        unit_col="单位",
+        threshold_col="预警",
+    )
+    result = import_source(db, path, config)
+    rows = list(db.execute("SELECT source_sheet,source_row_number,duplicate_of FROM source_rows ORDER BY id"))
+    item = db.execute("SELECT quantity FROM inventory_items WHERE item_name='重复烧杯'").fetchone()
+    assert result["imported_rows"] == 1
+    assert result["skipped_rows"] == 1
+    assert [(row["source_sheet"], row["source_row_number"]) for row in rows] == [
+        ("Sheet", 2),
+        ("Sheet", 3),
+    ]
+    assert rows[0]["duplicate_of"] is None
+    assert rows[1]["duplicate_of"] == db.execute(
+        "SELECT id FROM source_rows ORDER BY id LIMIT 1"
+    ).fetchone()[0]
+    assert item["quantity"] == 10
+    repeated = import_source(db, path, config)
+    assert repeated["imported_rows"] == 0
+    assert db.execute("SELECT COUNT(*) FROM source_rows").fetchone()[0] == 2
+    assert db.execute(
+        "SELECT quantity FROM inventory_items WHERE item_name='重复烧杯'"
+    ).fetchone()[0] == 10
 def test_ai_retries_and_auth_failure(monkeypatch):
     import httpx
 
@@ -949,9 +1136,18 @@ def test_ai_retries_and_auth_failure(monkeypatch):
             )
 
     monkeypatch.setattr(genai, "model_is_enabled", lambda: True)
+    monkeypatch.setattr(genai, "GENAI_API_KEY", "test-key")
+    monkeypatch.setattr(genai, "GENAI_BASE_URL", "http://primary.test/v1")
+    monkeypatch.setattr(genai, "GENAI_MODE", "openai")
+    monkeypatch.setenv(
+        "GENAI_FALLBACK_PROVIDERS_JSON",
+        '[{"name":"fallback-a","model":"glm-chat","base_url":"http://fallback-a.test/v1"},'
+        '{"name":"fallback-b","model":"qwen-instruct","base_url":"http://fallback-b.test/v1"}]',
+    )
     monkeypatch.setattr(genai.httpx, "Client", Client)
     monkeypatch.setattr(genai.time, "sleep", lambda _: None)
     monkeypatch.setattr(genai, "record_health", lambda *args: None)
+    monkeypatch.setattr(genai, "record_provider_check", lambda *args: None)
     assert genai.parse_inventory_message("test")["operations"][0]["quantity"] == 1
     assert len(calls) == 3
 
@@ -1117,6 +1313,26 @@ def test_stats_and_export_use_state_balances(db):
     assert get_stats(db)["transaction_count"] == 1
     row = list(load_workbook(io.BytesIO(export_inventory_workbook(db))).active.values)
     assert row[1][6] == 80 and row[1][11:13] == ("100", "20")
+
+
+def test_summary_totals_preserve_decimal_precision(db):
+    from consumable_assistant.services import (
+        get_stats,
+        list_locations,
+        preview_location,
+    )
+
+    first = make_item(db, name="精度测试甲", quantity="0.1")
+    second = make_item(db, name="精度测试乙", quantity="0.2", location="A1")
+    assert first != second
+    category = next(
+        row for row in get_stats(db)["categories"] if row["category"] == ""
+    )
+    assert category["total_quantity"] == "0.3"
+    assert next(
+        row for row in list_locations(db) if row["lab"] == "实验室" and row["location_code"] == "A1"
+    )["total_quantity"] == "0.3"
+    assert preview_location(db, "实验室", "A1")["total_quantity"] == "0.3"
 
 
 def test_restore_is_complete(db, tmp_path):
