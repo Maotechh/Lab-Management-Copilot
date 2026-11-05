@@ -41,7 +41,7 @@ This release retains FastAPI, SQLite, the current web interface, campus/VPN scop
 
 ## Required External Checks
 
-- Campus client: HTTP/HTTPS must reach `10.15.21.115`. Earlier campus requests timed out, with zero corresponding packets observed on the server.
+- Campus HTTP passed on 2026-11-05: real desktop/mobile page checks and actual institutional AI parsing succeeded. See `DEPLOYMENT-2026-11-05.md`. Campus HTTPS still has no configured listener/certificate and remains incomplete. Earlier timeout evidence is retained in the historical deployment records.
 - School VPN client: confirm the approved VPN source range and verify page load, AI parsing and the main stock workflows.
 - Institution: assign a school DNS name and install a trusted HTTPS certificate. Use `nginx-https.conf.example`, then configure `PUBLIC_BASE_URL` and a valid `VAPID_SUBJECT` contact.
 - Authorized phone: authorize Web Push, close the page, generate an alert, and verify generic notification delivery. Verify opening details only from campus/VPN. This cannot be established with a desktop simulation.
