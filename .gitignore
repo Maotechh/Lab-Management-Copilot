@@ -9,3 +9,11 @@ dist/
 .env
 *.env
 录音*.txt
+.pytest_cache/
+.ruff_cache/
+playwright-report/
+test-results/
+bootstrap/
+*.db
+*.db-wal
+*.db-shm

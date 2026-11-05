@@ -6,7 +6,6 @@ import unicodedata
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-
 NULL_LIKE = {"", "nan", "none", "null", "na", "n/a"}
 
 UNIT_WORDS = [

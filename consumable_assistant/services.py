@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import math
 import re
 import sqlite3
@@ -15,7 +16,6 @@ from openpyxl import Workbook
 
 from .database import row_to_dict, rows_to_dicts
 from .genai import model_is_enabled, parse_inventory_message
-from .importer import read_inventory_sheet
 from .normalization import (
     SPEC_UNITS,
     UNIT_WORDS,
@@ -25,8 +25,8 @@ from .normalization import (
     normalize_text,
     parse_float,
     quantity_to_text,
+    stable_key,
 )
-
 
 ACTION_LABELS = {
     "inbound": "入库",
@@ -37,29 +37,61 @@ ACTION_LABELS = {
     "threshold": "预警设置",
     "needs_review": "需要确认",
     "import": "初始导入",
+    "batch_import": "批量导入",
+    "move": "位置转移",
+    "batch_delete": "批量删除",
     "undo": "撤销",
+    "count": "实物清点",
+    "state": "状态变更",
+    "create": "新建物品",
+    "metadata": "资料维护",
+    "transfer_out": "转移出库",
+    "transfer_in": "转移入库",
+    "archive": "停用",
+    "reserve": "实验预留",
+    "cancel_reservation": "取消实验预留",
+    "purchase_order": "登记采购",
+    "purchase_receive": "采购到货",
+    "purchase_cancel": "取消采购余量",
+    "alert_acknowledge": "确认预警",
+    "alert_snooze": "暂缓提醒",
+    "alert_remind": "恢复提醒",
+}
+
+
+UPLOAD_COLUMNS = {
+    "category": ["类别", "分类", "category"],
+    "lab": ["实验室", "所属实验室", "lab"],
+    "location": ["位置", "存放地", "耗材位置", "柜位", "位置编码", "location"],
+    "name": ["耗材名称", "产品名", "名称", "物品", "耗材", "item", "product"],
+    "spec": ["规格型号", "规格", "型号", "spec"],
+    "brand": ["品牌", "brand"],
+    "quantity": ["数量", "耗材数量", "库存数量", "qty", "quantity"],
+    "unit": ["数量单位", "单位", "unit"],
+    "threshold": ["库存预警", "数量预警", "预警数量", "安全库存", "threshold"],
+    "remark": ["备注", "说明", "remark", "note"],
 }
 
 
 def get_stats(conn: sqlite3.Connection) -> dict[str, Any]:
-    item_count = conn.execute("SELECT COUNT(*) FROM inventory_items").fetchone()[0]
+    items = search_items(conn, limit=1_000_000)
+    item_count = len(items)
     source_count = conn.execute("SELECT COUNT(*) FROM source_rows").fetchone()[0]
     txn_count = conn.execute("SELECT COUNT(*) FROM inventory_transactions").fetchone()[
         0
     ]
-    low_stock_count = conn.execute(
-        "SELECT COUNT(*) FROM inventory_items WHERE threshold > 0 AND quantity < threshold"
-    ).fetchone()[0]
-    categories = rows_to_dicts(
-        conn.execute(
-            """
-            SELECT category, COUNT(*) AS item_count, SUM(quantity) AS total_quantity
-            FROM inventory_items
-            GROUP BY category
-            ORDER BY category
-            """
+    txn_count += conn.execute("SELECT COUNT(*) FROM stock_events").fetchone()[0]
+    low_stock_count = sum(item["low_stock"] for item in items)
+    categories = []
+    for category in sorted({item["category"] or "" for item in items}):
+        rows = [item for item in items if (item["category"] or "") == category]
+        categories.append(
+            {
+                "category": category,
+                "item_count": len(rows),
+                "total_quantity": sum(float(item["ready_quantity"]) for item in rows),
+            }
         )
-    )
     return {
         "item_count": item_count,
         "source_row_count": source_count,
@@ -76,6 +108,8 @@ def search_items(
     lab: str | None = None,
     low_stock: bool = False,
     limit: int = 80,
+    starts_at: str | None = None,
+    ends_at: str | None = None,
 ) -> list[dict[str, Any]]:
     params: list[Any] = []
     where: list[str] = ["1 = 1"]
@@ -85,8 +119,6 @@ def search_items(
     if lab:
         where.append("lab = ?")
         params.append(lab)
-    if low_stock:
-        where.append("threshold > 0 AND quantity < threshold")
     rows = rows_to_dicts(
         conn.execute(
             f"""
@@ -94,7 +126,6 @@ def search_items(
             FROM inventory_items
             WHERE {" AND ".join(where)}
             ORDER BY updated_at DESC, id DESC
-            LIMIT 1500
             """,
             params,
         )
@@ -103,13 +134,26 @@ def search_items(
     query = normalize_text(q)
     ranked: list[dict[str, Any]] = []
     for row in rows:
+        from .ledger import view
+
+        details = view(conn, row["id"], starts_at, ends_at)
+        if not details["active"]:
+            continue
+        row.update(details)
         score = score_item(row, query, alias_map.get(row["id"], []))
-        if query and score <= 10:
+        if query and score < 40:
             continue
         row["score"] = round(score, 2)
         row["quantity_text"] = quantity_to_text(row["quantity"])
         row["threshold_text"] = quantity_to_text(row["threshold"])
-        row["low_stock"] = bool(row["threshold"] and row["quantity"] < row["threshold"])
+        from .ledger import number
+
+        row["low_stock"] = bool(
+            row["threshold"]
+            and number(row["available_quantity"]) < number(row["threshold"])
+        )
+        if low_stock and not row["low_stock"]:
+            continue
         row["aliases"] = alias_map.get(row["id"], [])
         ranked.append(row)
     if query:
@@ -118,7 +162,115 @@ def search_items(
         ranked.sort(
             key=lambda item: (item["low_stock"], item["updated_at"]), reverse=True
         )
-    return ranked[:limit]
+    limited = ranked[:limit]
+    attach_latest_transactions(conn, limited)
+    return limited
+
+
+def transaction_candidates(
+    conn: sqlite3.Connection, item_query: str, limit: int = 8
+) -> list[dict[str, Any]]:
+    """Prefer exact item names while retaining multi-location rows."""
+    candidates = search_items(conn, item_query, limit=limit)
+    specifications = set(
+        re.findall(r"\d+(?:\.\d+)?(?:ml|mm|cm|kg|g|l)", normalize_text(item_query))
+    )
+    if specifications:
+        candidates = [
+            item
+            for item in candidates
+            if specifications.issubset(
+                set(
+                    re.findall(
+                        r"\d+(?:\.\d+)?(?:ml|mm|cm|kg|g|l)",
+                        normalize_text(
+                            str(item["item_name"]) + " " + str(item.get("spec") or "")
+                        ),
+                    )
+                )
+            )
+        ]
+    query = normalize_text(item_query)
+    if not query:
+        return candidates
+
+    exact_name = [
+        item for item in candidates if normalize_text(item.get("item_name")) == query
+    ]
+    if exact_name:
+        return exact_name
+
+    exact_alias = [
+        item
+        for item in candidates
+        if any(normalize_text(alias) == query for alias in item.get("aliases") or [])
+    ]
+    if exact_alias:
+        return exact_alias
+
+    return candidates
+
+
+def attach_latest_transactions(
+    conn: sqlite3.Connection, items: list[dict[str, Any]]
+) -> None:
+    for item in items:
+        recent = conn.execute(
+            "SELECT * FROM stock_events WHERE item_id=? ORDER BY id DESC LIMIT 1",
+            (item["id"],),
+        ).fetchone()
+        if recent:
+            from .ledger import text
+
+            latest = dict(recent)
+            snapshot = json.loads(latest["snapshot"])
+            latest.update(snapshot)
+            latest.update(
+                {
+                    "delta_quantity": json.loads(latest["changes"]).get("ready", "0"),
+                    "undone_by": latest["reversed_by"],
+                    "source_type": "ledger",
+                    "can_undo": not latest["reversed_by"]
+                    and latest["action"]
+                    in (
+                        "inbound",
+                        "consume",
+                        "borrow",
+                        "threshold",
+                        "count",
+                        "adjust",
+                        "state",
+                    ),
+                    "version": item["version"],
+                }
+            )
+            latest["action_label"] = ACTION_LABELS.get(
+                latest["action"], latest["action"]
+            )
+            latest["delta_quantity_text"] = text(latest["delta_quantity"])
+            latest["quantity_after_text"] = text(latest.get("quantity_after", 0))
+            item["latest_transaction"] = latest
+            continue
+        txn = conn.execute(
+            """
+            SELECT id, action, delta_quantity, quantity_after, unit, note,
+                   source_type, undone_by, created_at
+            FROM inventory_transactions
+            WHERE item_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (item["id"],),
+        ).fetchone()
+        if not txn:
+            item["latest_transaction"] = None
+            continue
+        latest = row_to_dict(txn) or {}
+        latest["action_label"] = ACTION_LABELS.get(latest["action"], latest["action"])
+        latest["delta_quantity_text"] = quantity_to_text(latest["delta_quantity"])
+        latest["quantity_after_text"] = quantity_to_text(latest["quantity_after"])
+        latest["can_undo"] = False
+        item["latest_transaction"] = latest
 
 
 def load_alias_map(conn: sqlite3.Connection) -> dict[int, list[str]]:
@@ -165,18 +317,134 @@ class QuantityMatch:
     span: tuple[int, int] | None
 
 
+CLAUSE_SPLIT_RE = re.compile(r"[，,；;。.!?！？\n\r]+")
+CONSUME_ALL_WORDS = [
+    "用光",
+    "用完",
+    "用尽",
+    "耗尽",
+    "全部用掉",
+    "全用掉",
+    "全部用完",
+    "全用完",
+]
+
+
+def parse_local_operations(conn: sqlite3.Connection, text: str) -> list[dict[str, Any]]:
+    clauses = [
+        segment.strip() for segment in CLAUSE_SPLIT_RE.split(text) if segment.strip()
+    ]
+    if not clauses and text.strip():
+        clauses = [text.strip()]
+    operations: list[dict[str, Any]] = []
+    previous_item_query: str | None = None
+    for idx, clause in enumerate(clauses):
+        operation = parse_local_clause(conn, clause, idx, previous_item_query)
+        if not operation:
+            continue
+        operations.append(operation)
+        if operation.get("item_query"):
+            previous_item_query = str(operation["item_query"])
+    if not operations and text.strip():
+        operation = parse_local_clause(conn, text.strip(), 0, None)
+        if operation:
+            operations.append(operation)
+    return operations
+
+
+def parse_local_clause(
+    conn: sqlite3.Connection,
+    clause: str,
+    index: int,
+    previous_item_query: str | None,
+) -> dict[str, Any] | None:
+    quantity_match = extract_quantity(clause)
+    action = infer_action(clause)
+    item_query = clean_item_query(clause, quantity_match.span)
+    if not item_query and previous_item_query:
+        item_query = previous_item_query
+    if (
+        item_query
+        and previous_item_query
+        and item_query in {"盒子", "盒", "箱", "袋", "包", "套", "瓶", "支", "个"}
+    ):
+        item_query = f"{previous_item_query} {item_query}"
+
+    quantity_value = quantity_match.value
+    threshold_value = quantity_value if action == "threshold" else None
+    unit_value = quantity_match.unit
+    candidates = transaction_candidates(conn, item_query or clause, limit=8)
+    quantity_mode = None
+    if (
+        action == "consume"
+        and is_consume_all_phrase(clause)
+        and (quantity_value is None or quantity_value <= 0)
+    ):
+        quantity_mode = "all_available"
+        if candidates:
+            quantity_value = float(candidates[0].get("quantity") or 0)
+            unit_value = unit_value or candidates[0].get("unit")
+    needs_review = action == "needs_review" or not candidates
+    if quantity_value is None and action not in {"borrow", "return", "threshold"}:
+        needs_review = True
+    if action in {"borrow", "return"} and quantity_value is None:
+        needs_review = True
+    if action == "threshold" and threshold_value is None:
+        needs_review = True
+    if action == "needs_review" and not item_query and quantity_value is None:
+        return None
+
+    return {
+        "id": f"op-{index}",
+        "raw_text": clause,
+        "action": action,
+        "action_label": ACTION_LABELS.get(action, action),
+        "quantity": quantity_value,
+        "unit": unit_value,
+        "threshold": threshold_value,
+        "item_query": item_query or clause,
+        "candidates": candidates,
+        "needs_review": needs_review,
+        "message": build_preview_message(action, quantity_value, candidates),
+        "confidence": None,
+        "quantity_mode": quantity_mode,
+    }
+
+
 def parse_transaction_preview(conn: sqlite3.Connection, text: str) -> dict[str, Any]:
+    from .genai import AI_REQUIRED, AIUnavailable
+
+    if AI_REQUIRED and not model_is_enabled():
+        raise AIUnavailable("AI 凭据尚未配置，输入已保留，请联系管理员")
     model_result = None
     model_name = None
+    model_error = None
     engine = "heuristic"
     if model_is_enabled():
         try:
             model_result = parse_inventory_message(text)
-        except Exception:
+        except Exception as exc:
+            model_error = str(exc)[:160]
             model_result = None
+            if AI_REQUIRED:
+                raise AIUnavailable(
+                    "校内 AI 暂时不可用，输入已保留，请重试或使用明确的库存操作表单"
+                ) from exc
         if model_result:
             model_name = str(model_result.get("model") or "")
             engine = "deepseek-pro"
+
+    local_operations = parse_local_operations(conn, text)
+    local_split_used = False
+    if not model_result:
+        return {
+            "operations": local_operations,
+            "engine": engine,
+            "model_name": None,
+            "model_enabled": model_is_enabled(),
+            "model_error": model_error,
+            "local_split_used": len(local_operations) > 1,
+        }
 
     operations_data = []
     if (
@@ -195,6 +463,9 @@ def parse_transaction_preview(conn: sqlite3.Connection, text: str) -> dict[str, 
         action = normalize_action(
             op.get("action") if "action" in op else infer_action(text)
         )
+        intent_review = requires_intent_review(text)
+        if intent_review:
+            action = "needs_review"
         raw_item_query = (
             clean_cell(op.get("item_query")) or clean_cell(op.get("item_name")) or text
         )
@@ -214,14 +485,54 @@ def parse_transaction_preview(conn: sqlite3.Connection, text: str) -> dict[str, 
         if not unit_value and not op:
             unit_value = local_quantity_match.unit
 
-        candidates = search_items(conn, item_query or text, limit=8)
+        candidates = transaction_candidates(conn, item_query or text, limit=8)
+        if len(operations_data) == 1:
+            specifications = set(
+                re.findall(r"\d+(?:\.\d+)?(?:ml|mm|cm|kg|g|l)", normalize_text(text))
+            )
+            if specifications:
+                candidates = [
+                    item
+                    for item in candidates
+                    if specifications.issubset(
+                        set(
+                            re.findall(
+                                r"\d+(?:\.\d+)?(?:ml|mm|cm|kg|g|l)",
+                                normalize_text(
+                                    str(item["item_name"])
+                                    + " "
+                                    + str(item.get("spec") or "")
+                                ),
+                            )
+                        )
+                    )
+                ]
+        quantity_mode = None
+        op_text = " ".join(
+            clean_cell(part) or ""
+            for part in [
+                op.get("item_query"),
+                op.get("item_name"),
+                op.get("note"),
+                text,
+            ]
+        )
+        if (
+            action == "consume"
+            and is_consume_all_phrase(op_text)
+            and (quantity_value is None or quantity_value <= 0)
+        ):
+            quantity_mode = "all_available"
+            if candidates:
+                quantity_value = float(candidates[0].get("quantity") or 0)
+                unit_value = unit_value or candidates[0].get("unit")
         needs_review = bool(op.get("needs_review")) if op else False
         if action == "needs_review" or not candidates:
             needs_review = True
         if quantity_value is None and action not in {"borrow", "return", "threshold"}:
             needs_review = True
         if action in {"borrow", "return"} and quantity_value is None:
-            quantity_value = 0.0
+            needs_review = True
         if action == "threshold" and threshold_value is not None:
             quantity_value = threshold_value
 
@@ -241,19 +552,32 @@ def parse_transaction_preview(conn: sqlite3.Connection, text: str) -> dict[str, 
                 "needs_review": needs_review,
                 "message": build_preview_message(action, quantity_value, candidates),
                 "confidence": op.get("confidence") if op else None,
+                "quantity_mode": quantity_mode,
             }
         )
+
+    if len(local_operations) > 1 and len(operations) <= 1:
+        operations = local_operations
+        local_split_used = True
+    elif not operations:
+        operations = local_operations or []
 
     return {
         "operations": operations,
         "engine": engine,
         "model_name": model_name or None,
         "model_enabled": model_is_enabled(),
+        "model_error": model_error,
+        "local_split_used": local_split_used,
     }
 
 
 def infer_action(text: str) -> str:
     compact = normalize_text(text)
+    if requires_intent_review(text):
+        return "needs_review"
+    if "不放回" in compact:
+        return "consume"
     if any(word in compact for word in ["预警", "阈值", "最低库存", "安全库存"]):
         return "threshold"
     if any(word in compact for word in ["修正为", "改成", "调整为", "校正为", "改为"]):
@@ -262,7 +586,7 @@ def infer_action(text: str) -> str:
         return "return"
     if any(
         word in compact
-        for word in ["入库", "买了", "采购", "补充", "新增", "到货", "增加"]
+        for word in ["入库", "买了", "采购", "补充", "新增", "到货", "增加", "添置"]
     ):
         return "inbound"
     if any(
@@ -271,7 +595,13 @@ def infer_action(text: str) -> str:
             "不放回",
             "消耗",
             "用了",
+            "用掉",
+            "用完",
+            "用光",
+            "用尽",
+            "耗尽",
             "使用了",
+            "领用",
             "报废",
             "破损",
             "碎了",
@@ -289,13 +619,30 @@ def infer_action(text: str) -> str:
     return "needs_review"
 
 
+def requires_intent_review(text: str) -> bool:
+    return bool(
+        re.search(
+            r"准备|计划|打算|如果|假如|预计|明天|下周|将要|需要买|要买|尚未|还没|未到货|(?:没有|没|未)(?:用|消耗|借|归还|采购)|不是|改口",
+            text,
+        )
+    )
+
+
+def is_consume_all_phrase(text: str) -> bool:
+    compact = normalize_text(text)
+    return any(word in compact for word in CONSUME_ALL_WORDS)
+
+
 def normalize_action(value: Any) -> str:
     action = normalize_text(value)
     mapping = {
         "入库": "inbound",
+        "新增": "inbound",
         "inbound": "inbound",
         "consume": "consume",
         "消耗": "consume",
+        "用掉": "consume",
+        "用完": "consume",
         "borrow": "borrow",
         "借出": "borrow",
         "return": "return",
@@ -332,7 +679,7 @@ def extract_quantity(text: str) -> QuantityMatch:
     numeric_matches: list[QuantityMatch] = []
     for match in re.finditer(r"\d+(?:\.\d+)?", text):
         after = text[match.end() : match.end() + 8].strip().lower()
-        if after.startswith(SPEC_UNITS) or after.startswith("m "):
+        if after.startswith((*SPEC_UNITS, "m ")):
             continue
         unit_match = re.match(rf"\s*({unit_pattern})", text[match.end() :])
         unit = unit_match.group(1) if unit_match else None
@@ -372,12 +719,26 @@ def clean_item_query(text: str, quantity_span: tuple[int, int] | None) -> str:
         "买了",
         "采购",
         "补充",
+        "补充了",
         "新增",
+        "新增了",
         "到货",
         "增加",
+        "增加了",
         "不放回",
         "消耗",
+        "消耗了",
         "用了",
+        "用掉",
+        "用掉了",
+        "用光",
+        "用光了",
+        "用完",
+        "用完了",
+        "用尽",
+        "用尽了",
+        "耗尽",
+        "耗尽了",
         "使用了",
         "报废",
         "破损",
@@ -389,17 +750,23 @@ def clean_item_query(text: str, quantity_span: tuple[int, int] | None) -> str:
         "借给",
         "暂借",
         "归还",
+        "归还了",
         "还回",
         "放回",
+        "放回了",
         "修正为",
+        "修正了",
         "调整为",
         "校正为",
         "改成",
+        "改成了",
         "改为",
         "预警",
         "阈值",
         "最低库存",
         "安全库存",
+        "的",
+        "了",
     ]
     for word in remove_words:
         working = working.replace(word, " ")
@@ -412,7 +779,7 @@ def build_preview_message(
 ) -> str:
     if action == "needs_review":
         return "没有识别到明确的库存动作。"
-    if quantity is None and action not in {"borrow", "return"}:
+    if quantity is None:
         return "没有识别到明确的数量。"
     if not candidates:
         return "没有找到匹配耗材。"
@@ -427,124 +794,78 @@ def apply_transaction(
     note: str | None = None,
     actor: str | None = None,
     unit: str | None = None,
+    source_type: str = "manual",
+    commit: bool = True,
+    **business: Any,
 ) -> dict[str, Any]:
-    item = conn.execute(
-        "SELECT * FROM inventory_items WHERE id = ?", (item_id,)
-    ).fetchone()
-    if not item:
-        raise ValueError("耗材不存在")
-    before = float(item["quantity"])
-    quantity = float(quantity or 0)
-    if action == "threshold":
-        after = before
-        delta = 0.0
-        conn.execute(
-            "UPDATE inventory_items SET threshold = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (quantity, item_id),
+    from . import ledger
+
+    owns = not conn.in_transaction
+    if owns:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        item = ledger.ensure_balance(conn, item_id)
+        result = ledger.operate(
+            conn,
+            {
+                "item_id": item_id,
+                "action": action,
+                "quantity": quantity,
+                "unit": unit,
+                "note": note,
+                "version": item["version"],
+                **business,
+            },
+            actor or "script",
         )
-    elif action == "adjust":
-        after = quantity
-        delta = after - before
-        conn.execute(
-            "UPDATE inventory_items SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (after, item_id),
+        result.update(
+            {
+                "quantity_before": float(item["ready"]),
+                "delta_quantity": float(result["item"]["quantity"])
+                - float(item["ready"]),
+                "threshold_before": item["threshold"],
+                "threshold_after": result["item"]["threshold"],
+            }
         )
-    elif action == "inbound":
-        delta = quantity
-        after = before + delta
-        conn.execute(
-            "UPDATE inventory_items SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (after, item_id),
-        )
-    elif action == "consume":
-        delta = -quantity
-        after = before + delta
-        if after < -1e-9:
-            raise ValueError("库存数量不足")
-        conn.execute(
-            "UPDATE inventory_items SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (after, item_id),
-        )
-    elif action in {"borrow", "return"}:
-        delta = 0.0
-        after = before
-        conn.execute(
-            "UPDATE inventory_items SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (item_id,),
-        )
-    else:
-        raise ValueError("不支持的库存动作")
-    txn_id = conn.execute(
-        """
-        INSERT INTO inventory_transactions(
-            item_id, action, delta_quantity, quantity_before, quantity_after,
-            unit, note, actor, source_type
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual')
-        """,
-        (
-            item_id,
-            action,
-            delta,
-            before,
-            after,
-            unit or item["unit"],
-            note,
-            actor or "user",
-        ),
-    ).lastrowid
-    conn.commit()
-    return get_transaction(conn, int(txn_id))
+        if commit:
+            conn.commit()
+        return result
+    except Exception:
+        if owns:
+            conn.rollback()
+        raise
 
 
 def undo_transaction(
     conn: sqlite3.Connection, txn_id: int, actor: str | None = None
 ) -> dict[str, Any]:
-    txn = conn.execute(
-        "SELECT * FROM inventory_transactions WHERE id = ?", (txn_id,)
-    ).fetchone()
-    if not txn:
-        raise ValueError("操作记录不存在")
-    if txn["source_type"] == "import":
-        raise ValueError("初始导入记录不能撤销")
-    if txn["undone_by"]:
-        raise ValueError("该记录已经撤销")
-    item = conn.execute(
-        "SELECT * FROM inventory_items WHERE id = ?", (txn["item_id"],)
-    ).fetchone()
-    if not item:
-        raise ValueError("耗材不存在")
-    before = float(item["quantity"])
-    after = float(txn["quantity_before"])
-    conn.execute(
-        "UPDATE inventory_items SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (after, txn["item_id"]),
-    )
-    reverse_id = conn.execute(
-        """
-        INSERT INTO inventory_transactions(
-            item_id, action, delta_quantity, quantity_before, quantity_after,
-            unit, note, actor, source_type, source_ref
+    from . import ledger
+
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        old = conn.execute(
+            "SELECT item_id FROM stock_events WHERE id=?", (txn_id,)
+        ).fetchone()
+        if not old:
+            raise ValueError("历史导入记录不能撤销")
+        result = ledger.undo(
+            conn,
+            txn_id,
+            actor or "script",
+            ledger.ensure_balance(conn, old["item_id"])["version"],
         )
-        VALUES (?, 'undo', ?, ?, ?, ?, ?, ?, 'manual', ?)
-        """,
-        (
-            txn["item_id"],
-            after - before,
-            before,
-            after,
-            txn["unit"],
-            f"撤销操作 #{txn_id}",
-            actor or "user",
-            str(txn_id),
-        ),
-    ).lastrowid
-    conn.execute(
-        "UPDATE inventory_transactions SET undone_by = ? WHERE id = ?",
-        (reverse_id, txn_id),
-    )
-    conn.commit()
-    return get_transaction(conn, int(reverse_id))
+        result.update(
+            {
+                "quantity_after": result["item"]["quantity"],
+                "threshold_after": result["item"]["threshold"],
+            }
+        )
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def get_transaction(conn: sqlite3.Connection, txn_id: int) -> dict[str, Any]:
@@ -588,10 +909,10 @@ def list_transactions(
 
 
 def list_alerts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    rows = search_items(conn, low_stock=True, limit=500)
+    rows = search_items(conn, low_stock=True, limit=1_000_000)
     for row in rows:
         row["missing_quantity"] = max(
-            float(row["threshold"] or 0) - float(row["quantity"] or 0), 0.0
+            float(row["threshold"] or 0) - float(row["available_quantity"]), 0.0
         )
         row["missing_quantity_text"] = quantity_to_text(row["missing_quantity"])
     return rows
@@ -605,62 +926,183 @@ def update_threshold(
     )
 
 
-def parse_prepare_file(conn: sqlite3.Connection, path: Path) -> dict[str, Any]:
-    df = read_inventory_sheet(path).dropna(how="all")
-    df.columns = [str(col).strip() for col in df.columns]
-    name_col = resolve_column(
-        df.columns, ["耗材名称", "产品名", "名称", "物品", "耗材", "item", "product"]
-    )
-    quantity_col = resolve_column(
-        df.columns, ["需求数量", "所需数量", "数量", "用量", "需要数量", "qty"]
-    )
-    unit_col = resolve_column(df.columns, ["数量单位", "单位", "unit"])
-    spec_col = resolve_column(df.columns, ["规格型号", "规格", "型号", "spec"])
-    if not name_col or not quantity_col:
-        raise ValueError("实验准备清单需要包含名称和数量列")
-    rows: list[dict[str, Any]] = []
-    for index, record in df.iterrows():
-        name = clean_cell(record.get(name_col))
-        if not name:
-            continue
-        required = parse_float(record.get(quantity_col)) or 0.0
-        unit = clean_cell(record.get(unit_col)) if unit_col else None
-        spec = clean_cell(record.get(spec_col)) if spec_col else None
-        query = " ".join(part for part in [name, spec] if part)
-        candidates = search_items(conn, query, limit=12)
-        matched = choose_prepare_matches(query, candidates)
-        available = sum(float(item["quantity"] or 0) for item in matched)
-        missing = max(required - available, 0.0)
-        locations = [
+def list_locations(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    from decimal import Decimal
+
+    from .ledger import number, text
+
+    grouped = {}
+    for item in search_items(conn, limit=1_000_000):
+        key = (item["lab"] or "", item["location_code"] or "")
+        row = grouped.setdefault(
+            key,
             {
-                "item_id": item["id"],
-                "item_name": item["item_name"],
-                "lab": item["lab"],
-                "location_code": item["location_code"],
-                "quantity": item["quantity"],
-                "unit": item["unit"],
-                "spec": item["spec"],
-            }
-            for item in matched[:5]
-        ]
-        package = infer_package_suggestion(missing, unit, matched)
-        rows.append(
-            {
-                "row_number": int(index) + 2,
-                "name": name,
-                "spec": spec,
-                "required_quantity": normalize_quantity(required),
-                "unit": unit,
-                "available_quantity": normalize_quantity(available),
-                "missing_quantity": normalize_quantity(missing),
-                "locations": locations,
-                "purchase_quantity": package["purchase_quantity"],
-                "purchase_unit": package["purchase_unit"],
-                "match_count": len(matched),
-                "status": "足够" if missing <= 1e-9 else "需要采购",
-            }
+                "lab": key[0],
+                "location_code": key[1],
+                "item_count": 0,
+                "total_quantity": Decimal(0),
+                "zero_count": 0,
+                "quantity_by_unit": {},
+            },
         )
-    return {"rows": rows, "row_count": len(rows)}
+        row["item_count"] += 1
+        row["total_quantity"] += number(item["ready_quantity"])
+        row["zero_count"] += number(item["ready_quantity"]) == 0
+        unit = item["unit"] or ""
+        row["quantity_by_unit"][unit] = number(
+            row["quantity_by_unit"].get(unit, 0)
+        ) + number(item["ready_quantity"])
+    result = []
+    for key, row in sorted(grouped.items()):
+        row["total_quantity"] = float(row["total_quantity"])
+        row["quantity_by_unit"] = {
+            unit: text(value) for unit, value in row["quantity_by_unit"].items()
+        }
+        row["label"] = " · ".join(part for part in key if part) or "未填写位置"
+        result.append(row)
+    return result
+
+
+def preview_location(
+    conn: sqlite3.Connection, lab: str | None, location_code: str | None
+) -> dict[str, Any]:
+    lab_value = clean_cell(lab) or ""
+    location_value = clean_cell(location_code) or ""
+    rows = rows_to_dicts(
+        conn.execute(
+            """
+            SELECT id, category, lab, location_code, item_name, spec, brand,
+                   quantity, unit, threshold, remark
+            FROM inventory_items
+            WHERE COALESCE(lab, '') = ? AND COALESCE(location_code, '') = ?
+            ORDER BY item_name, spec, id
+            """,
+            (lab_value, location_value),
+        )
+    )
+    for row in rows:
+        from .ledger import view
+
+        row.update(view(conn, row["id"]))
+        row["quantity_text"] = quantity_to_text(row["quantity"])
+        row["threshold_text"] = quantity_to_text(row["threshold"])
+    rows = [row for row in rows if row["active"]]
+    return {
+        "lab": lab_value,
+        "location_code": location_value,
+        "rows": rows,
+        "row_count": len(rows),
+        "zero_count": sum(float(row["quantity"] or 0) == 0 for row in rows),
+        "total_quantity": normalize_quantity(
+            sum(float(row["quantity"] or 0) for row in rows)
+        ),
+    }
+
+
+def move_location(
+    conn: sqlite3.Connection,
+    source_lab: str | None,
+    source_location: str | None,
+    target_lab: str | None,
+    target_location: str | None,
+) -> dict[str, Any]:
+    raise ValueError("请使用带请求编号及库存版本的位置转移接口")
+
+
+def delete_location(
+    conn: sqlite3.Connection, lab: str | None, location_code: str | None
+) -> dict[str, Any]:
+    raise ValueError("请先转移数量，再通过停用接口保留历史记录")
+
+
+def resolve_upload_column(columns: list[str] | pd.Index, key: str) -> str | None:
+    return resolve_column(columns, UPLOAD_COLUMNS[key])
+
+
+def map_upload_row(
+    row: dict[str, Any],
+    columns: list[str] | pd.Index,
+    default_category: str | None,
+) -> dict[str, Any] | None:
+    name_col = resolve_upload_column(columns, "name")
+    quantity_col = resolve_upload_column(columns, "quantity")
+    if not name_col or not quantity_col:
+        raise ValueError("批量上传需要包含耗材名称和数量列")
+    item_name = clean_cell(row.get(name_col))
+    if not item_name:
+        return None
+    from .ledger import number, text
+
+    raw_quantity = clean_cell(row.get(quantity_col))
+    quantity = number(raw_quantity) if raw_quantity is not None else None
+    if quantity is None or quantity < 0:
+        raise ValueError(f"耗材“{item_name}”的数量无效")
+
+    def cell(key: str) -> str | None:
+        column = resolve_upload_column(columns, key)
+        return clean_cell(row.get(column)) if column else None
+
+    threshold_col = resolve_upload_column(columns, "threshold")
+    mapped = {
+        "category": cell("category") or clean_cell(default_category) or "未分类",
+        "lab": cell("lab"),
+        "location_code": cell("location"),
+        "item_name": item_name,
+        "normalized_name": normalize_text(item_name),
+        "spec": cell("spec"),
+        "brand": cell("brand"),
+        "quantity": text(quantity),
+        "unit": cell("unit"),
+        "threshold": text(number(clean_cell(row.get(threshold_col))))
+        if threshold_col and clean_cell(row.get(threshold_col)) is not None
+        else None,
+        "remark": cell("remark"),
+        "raw": {
+            str(key): clean_cell(value)
+            for key, value in row.items()
+            if clean_cell(value) is not None
+        },
+    }
+    mapped["item_key"] = stable_key(
+        [
+            mapped["category"],
+            mapped["lab"],
+            mapped["location_code"],
+            mapped["item_name"],
+            mapped["spec"],
+            mapped["brand"],
+            mapped["unit"],
+        ]
+    )
+    return mapped
+
+
+def import_uploaded_inventory(
+    conn: sqlite3.Connection,
+    path: Path,
+    filename: str,
+    mode: str,
+    default_category: str | None = None,
+) -> dict[str, Any]:
+    from .workflows import preview_import
+
+    return preview_import(conn, path, filename, mode, default_category or "")
+
+
+def parse_prepare_file(
+    conn: sqlite3.Connection, path: Path, default_course: str | None = None
+) -> dict[str, Any]:
+    from .workflows import preparation
+
+    return preparation(conn, path, default_course or "")
+
+
+def consume_prepare_rows(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    actor: str | None = None,
+) -> dict[str, Any]:
+    raise ValueError("请使用服务器保存的清单预览编号及请求编号确认操作")
 
 
 def resolve_column(columns: list[str] | pd.Index, names: list[str]) -> str | None:
@@ -711,7 +1153,7 @@ def infer_package_suggestion(
                 per_package = float(match.group(1))
                 if per_package > 0:
                     return {
-                        "purchase_quantity": int(math.ceil(missing / per_package)),
+                        "purchase_quantity": math.ceil(missing / per_package),
                         "purchase_unit": match.group(2),
                     }
     return {"purchase_quantity": normalize_quantity(missing), "purchase_unit": unit}
@@ -721,7 +1163,7 @@ def export_inventory_workbook(conn: sqlite3.Connection) -> bytes:
     items = rows_to_dicts(
         conn.execute(
             """
-            SELECT category, lab, item_name, spec, brand, location_code, quantity, unit, threshold, remark, source_count
+            SELECT id, category, lab, item_name, spec, brand, location_code, quantity, unit, threshold, remark, source_count
             FROM inventory_items
             ORDER BY category, lab, item_name, location_code
             """
@@ -742,9 +1184,22 @@ def export_inventory_workbook(conn: sqlite3.Connection) -> bytes:
         "库存预警",
         "备注",
         "来源行数",
+        "总拥有量",
+        "借出数量",
+        "待清洗数量",
+        "维修数量",
+        "待核对数量",
+        "预留数量",
+        "可分配数量",
+        "待核对说明",
     ]
     sheet.append(headers)
     for item in items:
+        from .ledger import view
+
+        item.update(view(conn, item["id"]))
+        if not item["active"]:
+            continue
         sheet.append(
             [
                 item["category"],
@@ -758,6 +1213,14 @@ def export_inventory_workbook(conn: sqlite3.Connection) -> bytes:
                 item["threshold"],
                 item["remark"],
                 item["source_count"],
+                item["owned_quantity"],
+                item["borrowed_quantity"],
+                item["cleaning"],
+                item["repair"],
+                item["quarantine"],
+                item["reserved_quantity"],
+                item["available_quantity"],
+                item["review_reason"],
             ]
         )
     return workbook_to_bytes(workbook)
@@ -804,14 +1267,17 @@ def export_prepare_workbook(rows: list[dict[str, Any]]) -> bytes:
 
 
 def workbook_to_bytes(workbook: Workbook) -> bytes:
+    for sheet in workbook:
+        for row in sheet:
+            for cell in row:
+                if cell.data_type == "f":
+                    cell.data_type = "s"
     buffer = io.BytesIO()
     workbook.save(buffer)
     return buffer.getvalue()
 
 
 def save_upload_to_temp(contents: bytes, suffix: str) -> Path:
-    handle = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    handle.write(contents)
-    handle.flush()
-    handle.close()
-    return Path(handle.name)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
+        handle.write(contents)
+        return Path(handle.name)

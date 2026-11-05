@@ -1,0 +1,12 @@
+[Unit]
+Description=Verified lab inventory backup
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/opt/lab-management/current/.venv/bin/python /opt/lab-management/current/scripts/backup_database.py
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/backups/lab-management
+ReadWritePaths=/var/lib/lab-management

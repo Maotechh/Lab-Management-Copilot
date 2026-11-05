@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
+import sqlite3
+import threading
+import time
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -18,6 +24,82 @@ from .settings import (
     GENAI_TIMEOUT,
 )
 
+AI_REQUIRED = os.environ.get("GENAI_REQUIRED", "1") != "0"
+HEALTH_LOCK = threading.Lock()
+LAST_HEALTH_CHECK = 0.0
+LOGGER = logging.getLogger(__name__)
+
+
+class AIUnavailable(RuntimeError):
+    pass
+
+
+def record_health(state: str, detail: str) -> None:
+    from .database import connect
+
+    try:
+        with connect() as conn:
+            conn.execute(
+                "INSERT INTO service_health(name,status,detail) VALUES ('ai',?,?) ON CONFLICT(name) DO UPDATE SET status=excluded.status,detail=excluded.detail,checked_at=CURRENT_TIMESTAMP",
+                (state, detail),
+            )
+    except sqlite3.Error:
+        LOGGER.warning("Unable to persist AI health status")
+
+
+def status() -> dict[str, Any]:
+    from .database import connect
+
+    result = {
+        "configured": model_is_enabled(),
+        "required": AI_REQUIRED,
+        "model": GENAI_MODEL,
+        "status": "unknown",
+        "checked_at": None,
+    }
+    try:
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM service_health WHERE name='ai'"
+            ).fetchone()
+        if row:
+            result.update(dict(row))
+            checked = datetime.fromisoformat(row["checked_at"]).replace(tzinfo=UTC)
+            if (datetime.now(UTC) - checked).total_seconds() > 600:
+                result["status"] = "stale"
+    except (sqlite3.Error, ValueError):
+        LOGGER.warning("Unable to read AI health status")
+    if not result["configured"]:
+        result["status"] = "unconfigured"
+    return result
+
+
+def check_health() -> dict[str, Any]:
+    global LAST_HEALTH_CHECK
+    with HEALTH_LOCK:
+        if time.monotonic() - LAST_HEALTH_CHECK < 60:
+            return status()
+        result = _check_health()
+        LAST_HEALTH_CHECK = time.monotonic()
+        return result
+
+
+def _check_health() -> dict[str, Any]:
+    if not model_is_enabled():
+        record_health("unconfigured", "AI 凭据尚未配置")
+    else:
+        try:
+            parsed = parse_inventory_message("100mL烧杯入库1个")
+            if not parsed or not any(
+                op.get("action") == "inbound"
+                and str(op.get("quantity")) in ("1", "1.0")
+                for op in parsed["operations"]
+            ):
+                raise AIUnavailable("模型没有返回可用操作")
+        except (AIUnavailable, httpx.HTTPError, ValueError):
+            record_health("unavailable", "校内模型请求未成功，正在等待下次检查")
+    return status()
+
 
 def model_is_enabled() -> bool:
     return bool(GENAI_API_KEY.strip())
@@ -27,17 +109,63 @@ def parse_inventory_message(text: str) -> dict[str, Any] | None:
     if not model_is_enabled():
         return None
     endpoint, payload = build_request(text)
-    with httpx.Client(timeout=GENAI_TIMEOUT) as client:
-        response = client.post(endpoint, json=payload, headers=build_headers())
-        response.raise_for_status()
-        data = response.json()
-    raw_text = extract_text(data)
-    if not raw_text:
-        return None
-    parsed = parse_model_json(raw_text)
-    if parsed is not None:
-        parsed.setdefault("model", extract_model(data) or GENAI_MODEL)
-    return parsed
+    models = list(
+        dict.fromkeys(
+            [
+                GENAI_MODEL,
+                *[
+                    model.strip()
+                    for model in os.environ.get("GENAI_FALLBACK_MODELS", "").split(",")
+                    if model.strip()
+                ],
+            ]
+        )
+    )[:3]
+    for model in models:
+        for attempt in range(3):
+            try:
+                payload["model"] = model
+                with httpx.Client(timeout=min(GENAI_TIMEOUT, 12)) as client:
+                    response = client.post(
+                        endpoint, json=payload, headers=build_headers()
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                parsed = parse_model_json(extract_text(data) or "")
+                if (
+                    not parsed
+                    or not isinstance(parsed.get("operations"), list)
+                    or not parsed["operations"]
+                ):
+                    raise AIUnavailable("模型返回格式无效")
+                if len(parsed["operations"]) > 200 or any(
+                    not isinstance(op, dict)
+                    or op.get("action")
+                    not in (
+                        "inbound",
+                        "consume",
+                        "borrow",
+                        "return",
+                        "adjust",
+                        "threshold",
+                        "needs_review",
+                    )
+                    for op in parsed["operations"]
+                ):
+                    raise AIUnavailable("模型返回操作无效")
+                parsed.setdefault("model", extract_model(data) or model)
+                record_health("available", str(parsed["model"]))
+                return parsed
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in (401, 403):
+                    record_health("unavailable", "AI 凭据或访问权限需要检查")
+                    raise AIUnavailable("AI 凭据或访问权限需要检查") from exc
+            except (httpx.HTTPError, ValueError, AIUnavailable):
+                pass
+            if attempt < 2:
+                time.sleep(0.4 * (attempt + 1))
+    record_health("unavailable", "校内模型请求在有限重试后未成功")
+    raise AIUnavailable("校内 AI 暂时不可用，请稍后重试")
 
 
 def build_request(text: str) -> tuple[str, dict[str, Any]]:
@@ -94,19 +222,26 @@ SYSTEM_PROMPT = """
 }
 
 规则：
-1. 说“入库、补充、买了、采购、增加”时，action 用 inbound。
-2. 说“用了、消耗、出库、报废、碎了、破损、不放回”时，action 用 consume。
+1. 明确表示已经到货或入库时，action 用 inbound。“准备采购、计划购买、预计到货”用 needs_review，不能增加库存。
+2. 说“用了、消耗、出库、报废、碎了、破损、不放回、用光、用完、用尽、耗尽”时，action 用 consume。
 3. 说“借出、借用、暂借”时，action 用 borrow。
 4. 说“归还、还回、放回”时，action 用 return。
 5. 说“预警、阈值、少于、低于”时，action 用 threshold。
 6. 说“修正、改成、调整为、校正为”时，action 用 adjust。
 7. 如果耗材名称不明确或数量不明确，needs_review 设为 true。
 8. 不要编造内容。item_query 只保留适合检索的简短关键词。
+9. 如果输入里有多条库存动作，请按原顺序分别输出多条 operations，不要合并成一条。
+10. 如果用户说“用光了、用完了、用尽了、耗尽了”但没有给出数字，quantity 保持 null，由库存系统按当前库存自动填写。
+11. 否定、条件、未来计划或更正指令用 needs_review。“不放回”属于 consume，不能解析为 return。保留名称中的容量与型号，不得将不同规格合并。
 """.strip()
 
 
 def build_prompt(text: str) -> str:
-    return f"请解析下面这条库存操作输入，并按要求输出 JSON：\n{text}\n"
+    return (
+        "请解析下面这条库存操作输入，并按要求输出 JSON。"
+        "如果输入里有多条库存动作，请分别输出多条 operations，顺序与原文一致。\n"
+        f"{text}\n"
+    )
 
 
 def extract_text(payload: Any) -> str | None:
@@ -139,7 +274,7 @@ def parse_model_json(text: str) -> dict[str, Any] | None:
     stripped = text.strip()
     if not stripped:
         return None
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.S)
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.DOTALL)
     if fenced:
         stripped = fenced.group(1)
     try:

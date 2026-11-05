@@ -358,17 +358,20 @@ def insert_import_transaction(
         """
         INSERT INTO inventory_transactions(
             item_id, action, delta_quantity, quantity_before, quantity_after,
-            unit, note, actor, source_type, source_ref
+            threshold_before, threshold_after, unit, note, actor, source_type, source_ref
         )
-        VALUES (?, 'import', ?, ?, ?, ?, ?, 'system', 'import', ?)
+        VALUES (?, 'import', ?, ?, ?, ?, ?, ?, ?, ?, 'import', ?)
         """,
         (
             item_id,
             mapped["quantity"],
             quantity_before,
             quantity_after,
+            None,
+            None,
             mapped["unit"],
             f"初始导入：{mapped['source_file']} 第 {mapped['source_row_number']} 行",
+            "system",
             f"{mapped['source_file']}:{mapped['source_row_number']}",
         ),
     )

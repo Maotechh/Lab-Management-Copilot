@@ -1,73 +1,129 @@
-# ruff: noqa: E402
 from __future__ import annotations
 
-import tempfile
-from pathlib import Path
-import sys
 import os
+import sys
+import tempfile
+import uuid
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
+sys.path.insert(0, str(ROOT))
 os.environ["GENAI_API_KEY"] = ""
+os.environ["GENAI_REQUIRED"] = "0"
+os.environ["CONSUMABLE_AUTO_SEED"] = "0"
 
 from openpyxl import Workbook
 
+from consumable_assistant import ledger as stock
+from consumable_assistant import workflows as flow
 from consumable_assistant.database import connect, init_db
 from consumable_assistant.importer import import_all_sources
+from consumable_assistant.server import dispatch
 from consumable_assistant.services import (
-    apply_transaction,
     get_stats,
-    parse_prepare_file,
     parse_transaction_preview,
     search_items,
 )
 
 
-def make_prepare_file(path: Path) -> None:
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "清单"
-    sheet.append(["耗材名称", "需求数量", "数量单位"])
-    sheet.append(["100mL烧杯", 5, "个"])
-    sheet.append(["0.6mL离心管", 100, "个"])
-    workbook.save(path)
+def execute(conn, kind, data):
+    return stock.write(
+        conn,
+        uuid.uuid4().hex,
+        "验证教师",
+        "smoke-device",
+        {"kind": kind, "data": data},
+        lambda: dispatch(conn, kind, data, "验证教师"),
+    )
 
 
-def main() -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        db_path = Path(tmp) / "test.db"
-        with connect(db_path) as conn:
-            init_db(conn)
-            summary = import_all_sources(conn)
-            stats = get_stats(conn)
-            assert summary["total_imported_rows"] >= 1000, summary
-            assert stats["item_count"] >= 890, stats
+def main():
+    with (
+        tempfile.TemporaryDirectory() as directory,
+        connect(Path(directory) / "test.db") as conn,
+    ):
+        init_db(conn)
+        summary = import_all_sources(conn)
+        stock.initialize_balances(conn)
+        assert summary["total_imported_rows"] >= 1000
+        stats = get_stats(conn)
+        assert stats["item_count"] >= 890
+        assert search_items(conn, "100mL烧杯")
+        for message, action in [
+            ("100mL烧杯入库2个", "inbound"),
+            ("100mL烧杯用了2个不放回", "consume"),
+            ("准备采购10个100mL烧杯", "needs_review"),
+            ("没有用掉2个烧杯", "needs_review"),
+        ]:
+            parsed = parse_transaction_preview(conn, message)
+            assert parsed["operations"][0]["action"] == action, parsed
+        before = {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "inventory_items",
+                "inventory_transactions",
+                "source_rows",
+            )
+        }
+        path = Path(directory) / "inventory.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["类别", "耗材名称", "规格", "数量", "单位", "实验室", "位置"])
+        sheet.append(["测试", "验证烧杯", "100mL", 100, "个", "测试室", "TEST-A"])
+        workbook.save(path)
+        preview = flow.preview_import(conn, path, path.name, "add")
+        assert (
+            conn.execute("SELECT COUNT(*) FROM inventory_items").fetchone()[0]
+            == before["inventory_items"]
+        )
+        execute(conn, "import", {"preview_id": preview["preview_id"]})
+        item = search_items(conn, "验证烧杯")[0]
+        assert item["ready"] == "100"
 
-            search_rows = search_items(conn, "100mL烧杯", limit=10)
-            assert search_rows, "search returned no rows"
+        def operation(action, quantity, **extra):
+            return execute(
+                conn,
+                "stock",
+                {
+                    "item_id": item["id"],
+                    "version": stock.view(conn, item["id"])["version"],
+                    "action": action,
+                    "quantity": str(quantity),
+                    **extra,
+                },
+            )
 
-            preview_res = parse_transaction_preview(conn, "100mL烧杯入库 2 个")
-            ops = preview_res["operations"]
-            assert len(ops) == 1, preview_res
-            preview = ops[0]
-            assert preview["action"] == "inbound", preview
-            assert preview["quantity"] == 2, preview
-            assert preview["candidates"], preview
-
-            item_id = int(preview["candidates"][0]["id"])
-            before = float(preview["candidates"][0]["quantity"])
-            txn = apply_transaction(conn, item_id, "inbound", 2, note="smoke test")
-            assert float(txn["quantity_after"]) == before + 2, txn
-
-            prepare_path = Path(tmp) / "prepare.xlsx"
-            make_prepare_file(prepare_path)
-            prepare = parse_prepare_file(conn, prepare_path)
-            assert prepare["row_count"] == 2, prepare
-            assert all("missing_quantity" in row for row in prepare["rows"]), prepare
-
-        print("smoke test passed")
+        loan = operation(
+            "borrow",
+            20,
+            borrower="教师",
+            purpose="实验",
+            destination="教室",
+            due_at="2026-12-01T12:00:00+08:00",
+        )["loan_id"]
+        operation("return", 18, loan_id=loan, return_state="cleaning")
+        operation("return", 2, loan_id=loan, return_state="damaged")
+        assert stock.view(conn, item["id"])["owned_quantity"] == "98"
+        operation("state", 18, from_state="cleaning", to_state="ready")
+        consumed = operation("consume", 3)
+        operation("inbound", 5)
+        execute(
+            conn,
+            "undo",
+            {
+                "event_id": consumed["id"],
+                "version": stock.view(conn, item["id"])["version"],
+            },
+        )
+        assert stock.view(conn, item["id"])["ready"] == "103"
+        assert (
+            conn.execute("SELECT COUNT(*) FROM inventory_transactions").fetchone()[0]
+            == before["inventory_transactions"]
+        )
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        print(
+            "Smoke test passed: original imports, intent, upload preview, loan lifecycle, inverse undo and history preservation"
+        )
 
 
 if __name__ == "__main__":

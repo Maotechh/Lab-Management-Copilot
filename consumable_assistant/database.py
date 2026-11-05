@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .settings import DB_PATH, ensure_data_dir
 
@@ -10,7 +11,7 @@ from .settings import DB_PATH, ensure_data_dir
 def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
     ensure_data_dir()
     path = Path(db_path) if db_path else DB_PATH
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
@@ -74,6 +75,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             delta_quantity REAL NOT NULL DEFAULT 0,
             quantity_before REAL NOT NULL,
             quantity_after REAL NOT NULL,
+            threshold_before REAL,
+            threshold_after REAL,
             unit TEXT,
             note TEXT,
             actor TEXT,
@@ -101,13 +104,28 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_transactions_item ON inventory_transactions(item_id, created_at DESC);
         """
     )
+    ensure_column(conn, "inventory_transactions", "threshold_before", "REAL")
+    ensure_column(conn, "inventory_transactions", "threshold_after", "REAL")
     conn.commit()
+    from .migrations import migrate
+
+    migrate(conn)
+
+
+def ensure_column(
+    conn: sqlite3.Connection, table_name: str, column_name: str, column_type: str
+) -> None:
+    columns = {
+        row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})")
+    }
+    if column_name not in columns:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
-    return {key: row[key] for key in row.keys()}
+    return dict(row)
 
 
 def rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:

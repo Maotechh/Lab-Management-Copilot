@@ -1,0 +1,25 @@
+[Unit]
+Description=Lab inventory notifications and AI health checks
+After=network-online.target consumable-assistant.service
+Requires=consumable-assistant.service
+
+[Service]
+Type=simple
+User=lab-management
+Group=lab-management
+WorkingDirectory=/opt/lab-management/current
+Environment=HOME=/var/lib/lab-management
+Environment=CONSUMABLE_DB_PATH=/var/lib/lab-management/consumables.db
+EnvironmentFile=-/etc/lab-management/environment
+ExecStart=/opt/lab-management/current/.venv/bin/python -m consumable_assistant.notifications
+Restart=always
+RestartSec=10
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/lab-management
+
+[Install]
+WantedBy=multi-user.target

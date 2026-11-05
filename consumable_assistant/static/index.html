@@ -5,9 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>耗材智能管理助手</title>
     <link rel="icon" href="data:," />
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="manifest" href="/static/manifest.webmanifest" />
+    <meta name="theme-color" content="#2563eb" />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
@@ -27,12 +26,17 @@
           <button class="tab active" data-tab="search"><i data-lucide="search" class="icon-sm"></i>库存查询</button>
           <button class="tab" data-tab="chat"><i data-lucide="message-square" class="icon-sm"></i>聊天改数</button>
           <button class="tab" data-tab="alerts"><i data-lucide="alert-triangle" class="icon-sm"></i>库存预警</button>
-          <button class="tab" data-tab="prepare"><i data-lucide="clipboard-list" class="icon-sm"></i>实验清单</button>
+          <button class="tab" data-tab="prepare"><i data-lucide="scan-search" class="icon-sm"></i>批量查询</button>
           <button class="tab" data-tab="admin"><i data-lucide="database" class="icon-sm"></i>数据管理</button>
+          <button class="tab" data-tab="loans"><i data-lucide="handshake" class="icon-sm"></i>借用与归还</button>
+          <button class="tab" data-tab="lessons"><i data-lucide="calendar-days" class="icon-sm"></i>实验安排</button>
+          <button class="tab" data-tab="purchases"><i data-lucide="shopping-cart" class="icon-sm"></i>采购跟踪</button>
+          <button class="tab" data-tab="maintenance"><i data-lucide="clipboard-check" class="icon-sm"></i>清点与维护</button>
+          <button class="tab" data-tab="history"><i data-lucide="history" class="icon-sm"></i>操作历史</button>
         </nav>
-        <div class="sidebar-card">
-          <span class="badge">deepseek-pro</span>
-          <p>文本解析通过校内 GenAI 接口。</p>
+        <div class="ai-health">
+          <span class="badge" id="aiStatus">AI 状态待检查</span>
+          <button id="aiCheckBtn" class="secondary" title="检查 AI 连接"><i data-lucide="refresh-cw" class="icon-sm"></i>检查 AI</button>
         </div>
         <div class="sidebar-card">
           <span class="small-label">快捷动作</span>
@@ -50,11 +54,15 @@
             <p id="statusLine">正在读取数据</p>
           </div>
           <div class="header-actions">
-            <button id="requestNotifyBtn" class="secondary"><i data-lucide="bell" class="icon-sm"></i>允许通知</button>
+            <label class="operator-field">操作人<input id="operatorName" autocomplete="name" placeholder="姓名" aria-describedby="actorNote" /></label>
+            <small id="actorNote">自行登记，未经身份核验</small>
+            <button id="requestNotifyBtn" class="secondary" title="允许浏览器通知" aria-label="允许浏览器通知"><i data-lucide="bell" class="icon-sm"></i>允许通知</button>
           </div>
         </header>
 
         <main class="app-shell">
+          <div id="pendingRequest" class="notice" role="status" hidden></div>
+          <div id="pageError" role="alert" class="notice danger" hidden></div>
           <section class="metrics" id="metrics"></section>
 
           <section class="tab-panel active" id="tab-search">
@@ -70,7 +78,9 @@
                 <label class="inline-check"><input id="lowStockFilter" type="checkbox" />只看预警</label>
                 <button id="searchBtn"><i data-lucide="search" class="icon-sm"></i>查询</button>
               </div>
-              <div class="table-wrap">
+              <div id="searchSummary" class="summary-strip muted">输入耗材名称、规格或位置开始查询。</div>
+              <div class="form-grid"><label>分配开始时间（上海时间）<input id="searchStart" type="datetime-local" /></label><label>分配结束时间（上海时间）<input id="searchEnd" type="datetime-local" /></label></div>
+              <div class="table-wrap responsive-cards">
                 <table>
                   <thead>
                     <tr>
@@ -95,6 +105,12 @@
               <div class="surface">
                 <label class="field-label" for="chatText">库存变更</label>
                 <textarea id="chatText" rows="5" placeholder="例如：100mL烧杯用了 2 个不放回"></textarea>
+                <div class="quick-prompts" aria-label="常用库存变更示例">
+                  <button class="secondary" data-prompt="100mL烧杯入库 2 个">入库示例</button>
+                  <button class="secondary" data-prompt="100mL烧杯用了 2 个不放回">消耗示例</button>
+                  <button class="secondary" data-prompt="100mL烧杯借出 1 个">借出示例</button>
+                  <button class="secondary" data-prompt="100mL烧杯预警设置为 10 个">预警示例</button>
+                </div>
                 <div class="toolbar compact">
                   <button id="previewBtn"><i data-lucide="wand-2" class="icon-sm"></i>识别</button>
                   <button id="commitBtn" class="primary" disabled><i data-lucide="check" class="icon-sm"></i>提交变更</button>
@@ -103,7 +119,7 @@
               </div>
               <div class="surface">
                 <h2>最近操作</h2>
-                <div class="table-wrap short">
+                <div class="table-wrap short responsive-cards">
                   <table>
                     <thead>
                       <tr>
@@ -112,6 +128,7 @@
                         <th>耗材</th>
                         <th>数量</th>
                         <th>结果</th>
+                        <th>操作</th>
                       </tr>
                     </thead>
                     <tbody id="transactionRows"></tbody>
@@ -123,7 +140,7 @@
 
           <section class="tab-panel" id="tab-alerts">
             <div class="surface">
-              <div class="table-wrap">
+              <div class="table-wrap responsive-cards">
                 <table>
                   <thead>
                     <tr>
@@ -146,17 +163,32 @@
           <section class="tab-panel" id="tab-prepare">
             <div class="surface">
               <div class="toolbar">
+                <label class="field-label compact-field" for="courseName">课程
+                  <input id="courseName" type="text" placeholder="例如：普通化学实验" />
+                </label>
                 <input id="prepareFile" type="file" accept=".xlsx,.xls" />
-                <button id="prepareBtn"><i data-lucide="file-spreadsheet" class="icon-sm"></i>解析清单</button>
+                <button id="prepareBtn"><i data-lucide="file-spreadsheet" class="icon-sm"></i>分析批量清单</button>
+                <button id="consumePrepareBtn" class="primary" disabled><i data-lucide="package-minus" class="icon-sm"></i>扣减已选库存</button>
                 <button id="exportPrepareBtn" class="secondary" disabled><i data-lucide="download" class="icon-sm"></i>导出结果</button>
+                <label class="inline-check"><input id="prepareMissingOnly" type="checkbox" />只看需要采购</label>
               </div>
-              <div class="table-wrap">
+              <div class="toolbar compact prepare-filters">
+                <label class="field-label compact-field" for="prepareGroupFilter">实验范围
+                  <select id="prepareGroupFilter"><option value="">全部课程实验</option></select>
+                </label>
+                <label class="inline-check"><input id="prepareSelectEnough" type="checkbox" />选中库存足够的条目</label>
+              </div>
+              <div id="prepareSummary" class="summary-strip muted">上传课程实验清单后显示各实验的库存数量和需要采购的条目。</div>
+              <div class="table-wrap responsive-cards">
                 <table>
                   <thead>
                     <tr>
+                      <th>选择</th>
+                      <th>课程/实验</th>
                       <th>耗材</th>
                       <th>规格</th>
                       <th>需求</th>
+                      <th>使用方式</th>
                       <th>可用</th>
                       <th>还需采购</th>
                       <th>建议采购</th>
@@ -171,19 +203,68 @@
           </section>
 
           <section class="tab-panel" id="tab-admin">
-            <div class="surface">
+            <div class="two-column admin-grid">
+              <div class="surface">
+                <h2>批量上传库存</h2>
+                <p class="muted small-text">表格至少需要“耗材名称”和“数量”，建议同时填写类别、实验室、位置、规格型号、数量单位和库存预警。</p>
+                <div class="toolbar upload-form">
+                  <input id="batchUploadFile" type="file" accept=".xlsx,.xls" />
+                  <select id="batchUploadMode" aria-label="批量上传方式">
+                    <option value="add">新增并累加数量</option>
+                    <option value="overwrite">覆盖当前数量</option>
+                  </select>
+                  <select id="batchUploadCategory" aria-label="默认类别">
+                    <option value="">表格没有类别时使用默认类别</option>
+                    <option value="普通化学">普通化学</option>
+                    <option value="有机化学">有机化学</option>
+                    <option value="物理化学">物理化学</option>
+                  </select>
+                  <button id="batchUploadBtn" class="primary"><i data-lucide="upload" class="icon-sm"></i>上传库存表</button>
+                </div>
+                <div class="toolbar"><label class="inline-check"><input id="allowDuplicateImport" type="checkbox" />确认再次登记相同表格</label><label>登记原因<input id="importNote" /></label><button id="confirmImportBtn" disabled><i data-lucide="check" class="icon-sm"></i>确认导入</button></div>
+                <pre id="batchUploadLog"></pre>
+              </div>
+              <div class="surface">
+                <h2>位置批量操作</h2>
+                <div class="toolbar location-form">
+                  <select id="sourceLocationSelect" aria-label="原位置"><option value="">选择原位置</option></select>
+                  <button id="previewLocationBtn"><i data-lucide="scan" class="icon-sm"></i>查看位置</button>
+                  <input id="targetLabInput" type="text" placeholder="目标实验室" />
+                  <input id="targetLocationInput" type="text" placeholder="目标位置" />
+                  <button id="moveLocationBtn" class="primary" disabled><i data-lucide="arrow-right-left" class="icon-sm"></i>批量转移</button>
+                  <input id="locationNote" placeholder="位置操作原因" aria-label="位置操作原因" />
+                  <button id="deleteLocationBtn" class="danger-button" disabled><i data-lucide="archive" class="icon-sm"></i>停用位置</button>
+                </div>
+                <div id="locationSummary" class="summary-strip muted">选择原位置后查看其中的耗材。</div>
+                <div class="table-wrap short responsive-cards">
+                  <table>
+                    <thead>
+                      <tr><th>耗材</th><th>规格</th><th>数量</th><th>预警</th></tr>
+                    </thead>
+                    <tbody id="locationRows"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+            <div class="surface admin-seed-surface">
               <div class="toolbar">
-                <button id="seedBtn"><i data-lucide="database-zap" class="icon-sm"></i>导入附件数据</button>
+                <button id="seedBtn" disabled title="已有库存请使用上传预览"><i data-lucide="database" class="icon-sm"></i>初始数据已导入</button>
               </div>
               <pre id="adminLog"></pre>
             </div>
           </section>
+          <section class="tab-panel" id="tab-loans"></section>
+          <section class="tab-panel" id="tab-lessons"></section>
+          <section class="tab-panel" id="tab-purchases"></section>
+          <section class="tab-panel" id="tab-maintenance"></section>
+          <section class="tab-panel" id="tab-history"></section>
         </main>
       </section>
     </div>
 
     <div id="toast" role="status" aria-live="polite"></div>
-    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="/static/lucide.min.js"></script>
     <script src="/static/app.js"></script>
+    <script src="/static/operations.js"></script>
   </body>
 </html>

@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly lab inventory backup
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
