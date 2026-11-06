@@ -915,10 +915,14 @@ def list_transactions(
 
 
 def list_alerts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    from decimal import Decimal
+
+    from .ledger import number, text
+
     rows = search_items(conn, low_stock=True, limit=1_000_000)
     for row in rows:
-        row["missing_quantity"] = max(
-            float(row["threshold"] or 0) - float(row["available_quantity"]), 0.0
+        row["missing_quantity"] = text(
+            max(number(row["threshold"] or 0) - number(row["available_quantity"]), Decimal(0))
         )
         row["missing_quantity_text"] = quantity_to_text(row["missing_quantity"])
     return rows
@@ -1002,7 +1006,7 @@ def preview_location(
         "location_code": location_value,
         "rows": rows,
         "row_count": len(rows),
-        "zero_count": sum(float(row["quantity"] or 0) == 0 for row in rows),
+        "zero_count": sum(number(row["quantity"] or 0) == 0 for row in rows),
         "total_quantity": text(
             sum((number(row["quantity"]) for row in rows), Decimal(0))
         ),

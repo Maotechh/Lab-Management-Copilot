@@ -296,6 +296,174 @@ def test_preparation_requires_explicit_usage(db, tmp_path):
     )
 
 
+def test_chat_query_result_can_create_and_confirm_a_bound_write(db, monkeypatch):
+    from consumable_assistant import chat
+    from consumable_assistant.server import dispatch
+
+    item = make_item(db)
+    conversation = chat.new_conversation(db, "chat-workflow")
+    plans = iter(
+        [
+            {
+                "reply": "我先查询当前耗材。",
+                "calls": [{"name": "inventory_search", "arguments": {"query": "玻璃烧杯"}}],
+            },
+            {
+                "reply": "已找到匹配物品。",
+                "calls": [
+                    {
+                        "name": "business_preview",
+                        "arguments": {
+                            "kind": "stock",
+                            "payload": {"item_id": item, "action": "consume", "quantity": "2", "unit": "个"},
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    monkeypatch.setattr(chat, "infer_action", lambda _: "needs_review")
+    monkeypatch.setattr(chat, "request_json", lambda *args, **kwargs: next(plans))
+    response = chat.process_message(
+        db,
+        conversation["conversation_id"],
+        chat.ChatMessageRequest(message_id=uuid.uuid4().hex, text="请处理刚才查到的烧杯"),
+        "Teacher",
+        "chat-workflow",
+        dispatch,
+        lambda *args: [],
+    )
+    assert response["status"] == "pending_confirmation"
+    assert response["plan_hash"] == db.execute(
+        "SELECT plan_hash FROM chat_tasks WHERE id=?", (response["task_id"],)
+    ).fetchone()[0]
+    assert response["preview"]["operation"]["details"]["quantity"] == "2"
+    assert stock.view(db, item)["ready"] == "100"
+    task = db.execute("SELECT * FROM chat_tasks WHERE id=?", (response["task_id"],)).fetchone()
+    with pytest.raises(stock.Conflict):
+        chat.confirm_task(
+            db, task, "Teacher", "chat-workflow", uuid.uuid4().hex, dispatch,
+            expected_plan_hash="0" * 64,
+        )
+    assert db.execute("SELECT status FROM chat_tasks WHERE id=?", (response["task_id"],)).fetchone()[0] == "pending_confirmation"
+    result = chat.confirm_task(
+        db, task, "Teacher", "chat-workflow", uuid.uuid4().hex, dispatch,
+        expected_plan_hash=response["plan_hash"],
+    )
+    assert result["quantity_after"] == 98.0
+    assert stock.view(db, item)["ready"] == "98"
+
+
+def test_chat_tool_rounds_reuse_prior_query_results(db, monkeypatch):
+    from consumable_assistant import chat
+
+    make_item(db)
+    conversation = chat.new_conversation(db, "chat-query")
+    plans = iter(
+        [
+            {"reply": "查询中。", "calls": [{"name": "inventory_search", "arguments": {"query": "烧杯"}}]},
+            {"reply": "再次核对。", "calls": [{"name": "inventory_search", "arguments": {"query": "烧杯"}}]},
+            {"reply": "结果已核对。", "calls": []},
+        ]
+    )
+    monkeypatch.setattr(chat, "infer_action", lambda _: None)
+    monkeypatch.setattr(chat, "request_json", lambda *args, **kwargs: next(plans))
+    result = chat.process_message(
+        db,
+        conversation["conversation_id"],
+        chat.ChatMessageRequest(message_id=uuid.uuid4().hex, text="查找烧杯"),
+        "Teacher",
+        "chat-query",
+        lambda *args: {},
+        lambda *args: [],
+    )
+    assert result["reply"] == "结果已核对。"
+    assert db.execute("SELECT COUNT(*) FROM chat_tool_calls").fetchone()[0] == 1
+
+
+def test_chat_preparation_attachment_is_committed_with_its_tool_record(db, monkeypatch, tmp_path):
+    from consumable_assistant import chat
+
+    make_item(db)
+    path = tmp_path / "preparation.xlsx"
+    sheet(
+        path,
+        ["耗材名称", "规格", "需求数量", "单位", "使用方式"],
+        [["玻璃烧杯", "100mL", 3, "个", "消耗"]],
+    )
+    conversation = chat.new_conversation(db, "chat-file")
+    attachment_id = uuid.uuid4().hex
+    db.execute(
+        "INSERT INTO chat_attachments(id,conversation_id,filename,content_type,size,sha256,path) VALUES (?,?,?,?,?,?,?)",
+        (attachment_id, conversation["conversation_id"], path.name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", path.stat().st_size, "test", str(path)),
+    )
+    db.commit()
+    plans = iter(
+        [
+            {"reply": "我核對清單。", "calls": [{"name": "prepare_attachment", "arguments": {"attachment_id": attachment_id}}]},
+            {"reply": "已完成清單核對。", "calls": []},
+        ]
+    )
+    monkeypatch.setattr(chat, "infer_action", lambda _: None)
+    monkeypatch.setattr(chat, "request_json", lambda *args, **kwargs: next(plans))
+    response = chat.process_message(
+        db,
+        conversation["conversation_id"],
+        chat.ChatMessageRequest(message_id=uuid.uuid4().hex, text="請核對這份清單", attachments=[attachment_id]),
+        "Teacher",
+        "chat-file",
+        lambda *args: {},
+        lambda *args: [],
+    )
+    assert response["tool_results"][0]["result"]["type"] == "preparation"
+    assert response["tool_results"][0]["result"]["row_count"] == 1
+    assert db.execute("SELECT COUNT(*) FROM upload_previews WHERE mode='prepare'").fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM chat_tool_calls WHERE name='prepare_attachment'").fetchone()[0] == 1
+
+
+def test_chat_business_contract_rejects_missing_loan_and_purchase_fields():
+    from consumable_assistant.chat_contracts import validate_payload
+
+    with pytest.raises(ValueError):
+        validate_payload(
+            "stock", {"item_id": 1, "action": "borrow", "quantity": "2"}
+        )
+    with pytest.raises(ValueError):
+        validate_payload(
+            "purchase", {"item_id": 1, "action": "order", "quantity": "2"}
+        )
+    assert validate_payload(
+        "stock",
+        {
+            "item_id": 1,
+            "action": "borrow",
+            "quantity": "2",
+            "borrower": "Teacher",
+            "purpose": "Lab class",
+            "destination": "Room 1",
+            "due_at": "2026-12-01T12:00:00+08:00",
+            "version": 99,
+        },
+    )["quantity"] == "2"
+
+
+def test_search_alert_and_history_quantities_keep_decimal_text(db, monkeypatch):
+    from consumable_assistant import server
+    from consumable_assistant.services import list_alerts
+
+    item = make_item(db, quantity="0.3")
+    operation(db, item, "threshold", "0.5")
+    assert list_alerts(db)[0]["missing_quantity"] == "0.2"
+    path = Path(db.execute("PRAGMA database_list").fetchone()[2])
+    monkeypatch.setattr(server, "connect", lambda: connect(path))
+    with TestClient(server.app) as client:
+        result = client.get("/api/items/search?q=烧杯").json()
+        assert result["quantity_by_unit"]["个"] == "0.3"
+    operation(db, item, "consume", "0.1")
+    history = server.history_rows(db, {})
+    assert next(row for row in history if row["action"] == "consume")["delta_quantity"] == "-0.1"
+
+
 def test_upload_preview_duplicate_and_history(db, tmp_path):
     path = tmp_path / "upload.xlsx"
     sheet(
@@ -842,6 +1010,7 @@ def test_chat_conversation_preview_confirm_is_idempotent(db, monkeypatch):
             f"/api/chat/tasks/{task['task_id']}/prepare",
             headers=auth,
             json={
+                "plan_hash": task["plan_hash"],
                 "operations": [
                     {
                         "item_id": item,
@@ -860,14 +1029,14 @@ def test_chat_conversation_preview_confirm_is_idempotent(db, monkeypatch):
         confirmed = client.post(
             f"/api/chat/tasks/{task['task_id']}/confirm",
             headers=auth,
-            json={"request_id": confirmation},
+            json={"request_id": confirmation, "plan_hash": selected.json()["plan_hash"]},
         )
         assert confirmed.status_code == 200, confirmed.text
         assert stock.view(db, item)["ready"] == "98"
         repeated_confirmation = client.post(
             f"/api/chat/tasks/{task['task_id']}/confirm",
             headers=auth,
-            json={"request_id": uuid.uuid4().hex},
+            json={"request_id": uuid.uuid4().hex, "plan_hash": selected.json()["plan_hash"]},
         )
         assert repeated_confirmation.json() == confirmed.json()
         assert stock.view(db, item)["ready"] == "98"

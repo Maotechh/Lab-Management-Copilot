@@ -15,6 +15,7 @@ const state = {
   chatTaskId: null,
   chatPhase: null,
   chatPreview: null,
+  chatPlanHash: null,
   chatConfirmRequestId: null,
 };
 
@@ -42,7 +43,14 @@ async function api(path, options = {}) {
   const previewOnly = ['/api/transactions/preview','/api/prepare/preview','/api/prepare/export','/api/import/preview','/api/import/upload','/api/locations/preview','/api/ai/check'].includes(path);
   const writing = options.method && options.method !== 'GET' && !previewOnly;
   let requestId;
-  const finishPending=()=>{if(JSON.parse(localStorage.getItem('lab-pending')||'null')?.id===requestId){localStorage.removeItem('lab-pending');window.renderPending?.();}};
+  const finishPending=()=>{
+    if(JSON.parse(localStorage.getItem('lab-pending')||'null')?.id===requestId){
+      localStorage.removeItem('lab-pending');
+      const confirmTaskId=path.match(/^\/api\/chat\/tasks\/([^/]+)\/confirm$/)?.[1];
+      if(confirmTaskId){localStorage.removeItem(`lab-chat-confirm-${confirmTaskId}`);if(state.chatTaskId===confirmTaskId)state.chatConfirmRequestId=null;}
+      window.renderPending?.();
+    }
+  };
   if (writing) {
     let actor = $('#operatorName')?.value.trim() || localStorage.getItem('lab-actor') || '';
     if (!actor) { $('#operatorName')?.focus(); throw new Error('请先填写操作人姓名'); }
@@ -76,7 +84,7 @@ async function api(path, options = {}) {
     } catch {
       message = await response.text();
     }
-    throw new Error(message);
+    const error=new Error(message);error.status=response.status;throw error;
   }
   const contentType = response.headers.get("content-type") || "";
   const result=contentType.includes('application/json')?await response.json():response;
@@ -99,7 +107,7 @@ async function chatApi(path, options = {}) {
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
     try { message = (await response.json()).detail || message; } catch {}
-    throw new Error(message);
+    const error = new Error(message); error.status = response.status; throw error;
   }
   const result = await response.json();
   return result;
@@ -126,7 +134,8 @@ async function ensureChatConversationOnce() {
       renderChatMessages(existing.messages || []);
       restoreChatTask(existing.tasks || []);
       return;
-    } catch {
+    } catch (error) {
+      if (![400,403,404].includes(error.status)) throw error;
       localStorage.removeItem('lab-chat-conversation');
       localStorage.removeItem('lab-chat-token');
     }
@@ -143,14 +152,19 @@ async function loadChat() {
   await ensureChatConversation();
   const config = await api('/api/config');
   const banner = $('#profileBanner');
-  banner.hidden = !config.simulated;
-  if (config.simulated) banner.textContent = '当前为模拟数据环境。库存数量和位置不能作为实际实验室库存使用。';
+  const notices = [];
+  if (config.simulated) notices.push('当前为模拟数据环境。');
+  if (!config.inventory_confirmed) notices.push('库存资料尚未由教师确认，请核对实物后再用于教学操作。');
+  if (!config.notifications_configured) notices.push('手机后台通知尚未配置，低库存情况请在系统页面中查看。');
+  banner.hidden = notices.length === 0;
+  banner.textContent = notices.join(' ');
 }
 
 function restoreChatTask(tasks) {
   const active = tasks.find(task => ['awaiting_details','pending_confirmation'].includes(task.status));
   if (!active) {
     state.chatTaskId = null; state.chatPhase = null; state.chatPreview = null;
+    state.chatPlanHash = null;
     state.preview = null;
     $('#previewBox').innerHTML = ''; $('#commitBtn').disabled = true;
     $('#commitBtn').innerHTML = '<i data-lucide="check" class="icon-sm"></i>生成确认预览';
@@ -158,8 +172,10 @@ function restoreChatTask(tasks) {
     return;
   }
   state.chatTaskId = active.id;
+  state.chatConfirmRequestId = localStorage.getItem(`lab-chat-confirm-${active.id}`) || null;
   state.chatPhase = active.status === 'awaiting_details' ? 'details' : 'confirm';
   state.chatPreview = active.preview;
+  state.chatPlanHash = active.plan_hash;
   if (state.chatPhase === 'details' && active.preview?.operations) {
     state.preview = active.preview;
     state.selectedItemIds = {};
@@ -223,8 +239,23 @@ function businessPreviewHtml(preview) {
   const changeTable = rows.length
     ? tableHtml(['耗材','位置','当前可用','执行后可用','当前总量','执行后总量'],rows.map(row=>[escapeHtml(row.item_name),escapeHtml(`${row.lab || ''} ${row.location_code || ''}`),escapeHtml(row.before?.available_quantity || ''),escapeHtml(row.after?.available_quantity || ''),escapeHtml(row.before?.owned_quantity || ''),escapeHtml(row.after?.owned_quantity || '')]))
     : '';
-  const business = preview?.business_result ? `<details><summary>操作项目</summary><pre>${escapeHtml(JSON.stringify(preview.business_result,null,2))}</pre></details>` : '';
-  return `<section class="chat-result chat-confirm-preview"><h2>待确认操作</h2>${changeTable}${business}<p class="muted">计划在确认时重新检查数据版本。</p></section>`;
+  const operation = preview?.operation ? renderBusinessOperation(preview.operation, rows) : '';
+  const business = preview?.business_result ? `<details><summary>业务记录预览</summary><pre>${escapeHtml(JSON.stringify(preview.business_result,null,2))}</pre></details>` : '';
+  return `<section class="chat-result chat-confirm-preview"><h2>待确认操作</h2>${changeTable}${operation}${business}<p class="muted">确认时会重新检查库存版本。</p></section>`;
+}
+
+function renderBusinessOperation(operation, changes) {
+  const labels = {stock:'库存变更',bulk:'批量库存变更',purchase:'采购操作',schedule:'实验安排',execute_schedule:'执行实验安排',cancel_schedule:'取消实验安排',template:'实验模板',count:'库存清点',state:'物品状态',metadata:'物品资料',create_item:'新增耗材',transfer:'位置转移',archive_location:'停用位置',location_details:'位置资料',alert:'提醒设置',import:'表格导入',prepare:'准备清单执行',prepare_remap:'清单匹配',undo:'撤销库存记录'};
+  const names = {item_id:'耗材编号',item_name:'耗材名称',spec:'规格',lab:'实验室',location_code:'位置',quantity:'数量',unit:'单位',action:'操作',owner:'负责人',expected_at:'预计到货时间',order_id:'采购记录',schedule_id:'实验安排',template_id:'实验模板',name:'名称',course:'课程',venue:'地点',starts_at:'开始时间',ends_at:'结束时间',people:'人数',group_size:'每组人数',borrower:'借用人',purpose:'用途',destination:'存放地点',due_at:'预计归还时间',loan_id:'借用记录',return_state:'归还状态',from_state:'当前状态',to_state:'目标状态',note:'原因',threshold:'预警数量',target_lab:'目标实验室',target_location:'目标位置',state:'库存状态',description:'位置说明',preview_id:'表格预览编号',selected_rows:'清单行号',allow_duplicate:'允许重复导入',event_id:'库存记录',row_number:'清单行号',lines:'耗材项目',operations:'操作项目',per_person:'每人数量',per_group:'每组数量',fixed:'固定数量',spare:'备用数量'};
+  const values = {inbound:'入库',consume:'消耗',borrow:'借出',return:'归还',adjust:'修正',count:'清点',threshold:'设置预警',order:'下单',receive:'登记到货',cancel:'取消',ready:'可用',cleaning:'待清洗',repair:'维修中',quarantine:'待核对',damaged:'破损',lost:'遗失'};
+  const display = value => typeof value === 'string' && values[value] ? values[value] : escapeHtml(value);
+  const fields = Object.entries(operation.details || {}).filter(([key,value]) => !['version','item_versions'].includes(key) && value != null);
+  const valuesFor = (key,value) => Array.isArray(value)
+    ? `<div class="chat-operation-list"><strong>${escapeHtml(names[key] || key)}</strong>${value.map(item=>`<div>${Object.entries(item || {}).filter(([name,val])=>val!=null&&name!=='version').map(([name,val])=>`<span>${escapeHtml(names[name] || name)}：${display(val)}</span>`).join('，')}</div>`).join('')}</div>`
+    : `<div><dt>${escapeHtml(names[key] || key)}</dt><dd>${display(value)}</dd></div>`;
+  const itemName = fields.find(([key])=>key==='item_id')?.[1];
+  const related = changes.find(item=>String(item.item_id)===String(itemName))?.item_name;
+  return `<details class="chat-operation-details" open><summary>${escapeHtml(labels[operation.kind] || '操作内容')}</summary>${related?`<p>${escapeHtml(related)}</p>`:''}<dl>${fields.filter(([key])=>key!=='item_id').map(([key,value])=>valuesFor(key,value)).join('')}</dl></details>`;
 }
 
 function renderBusinessPreview(preview) {
@@ -244,8 +275,12 @@ function renderChatTaskActions() {
 async function cancelChatTask() {
   if (!state.chatTaskId) return;
   try {
-    await chatApi(`/api/chat/tasks/${state.chatTaskId}/cancel`, {method:'POST'});
-    state.chatTaskId = null; state.chatPhase = null; state.chatPreview = null; state.preview = null;
+    await chatApi(`/api/chat/tasks/${state.chatTaskId}/cancel`, {
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({plan_hash:state.chatPlanHash}),
+    });
+    localStorage.removeItem(`lab-chat-confirm-${state.chatTaskId}`);
+    state.chatTaskId = null; state.chatPhase = null; state.chatPreview = null; state.chatPlanHash = null; state.preview = null;
     $('#previewBox').innerHTML = ''; $('#commitBtn').disabled = true;
     $('#commitBtn').innerHTML = '<i data-lucide="check" class="icon-sm"></i>生成确认预览';
     renderChatTaskActions();
@@ -269,7 +304,7 @@ async function sendChatMessage() {
       throw new Error('有一条聊天请求尚未确认结果，请恢复原请求后再发送新消息');
     }
     const messageId = pendingMessage?.message_id || newRequestId();
-    pendingMessage ||= {message_id:messageId,text,file_meta:fileMeta,attachments:[]};
+    pendingMessage ||= {message_id:messageId,text,file_meta:fileMeta,attachments:[],task_id:state.chatTaskId,plan_hash:state.chatPlanHash};
     localStorage.setItem('lab-chat-pending',JSON.stringify(pendingMessage));
     let attachments = pendingMessage.attachments || [];
     if (file && !attachments.length) {
@@ -287,7 +322,7 @@ async function sendChatMessage() {
     localStorage.setItem('lab-chat-pending',JSON.stringify(pendingMessage));
     const result = await chatApi(`/api/chat/conversations/${state.chatConversationId}/messages`,{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({message_id:messageId,text,attachments}),
+      body:JSON.stringify({message_id:messageId,text,attachments,task_id:pendingMessage.task_id,plan_hash:pendingMessage.plan_hash}),
     });
     if(result.status==='ai_unavailable'){
       pendingMessage={...pendingMessage,signature};
@@ -301,6 +336,7 @@ async function sendChatMessage() {
     state.chatTaskId = result.task_id || null;
     state.chatPhase = result.status === 'awaiting_details' ? 'details' : result.status === 'pending_confirmation' ? 'confirm' : null;
     state.chatPreview = result.preview || null;
+    state.chatPlanHash = result.plan_hash || null;
     renderChatTaskActions();
     if (state.chatPhase === 'details') {
       state.preview = result.preview;
@@ -316,9 +352,9 @@ async function sendChatMessage() {
       $('#previewBox').innerHTML = ''; $('#commitBtn').disabled = true;
     }
     await loadChat();
-    restoreChatTask(result.task_id ? [{id:result.task_id,status:result.status,preview:result.preview}] : []);
+    restoreChatTask(result.task_id ? [{id:result.task_id,status:result.status,preview:result.preview,plan_hash:result.plan_hash}] : []);
     await refreshAll();
-  } catch (error) { showError(error); }
+  } catch (error) { if (error.status && error.status < 500) localStorage.removeItem('lab-chat-pending'); showError(error); }
   finally { $('#previewBtn').disabled = false; }
 }
 
@@ -619,6 +655,34 @@ function actionOption(value, label, active) {
 }
 
 async function commitTransaction() {
+  if (state.chatTaskId && state.chatPhase === 'confirm') {
+    const confirmationKey = `lab-chat-confirm-${state.chatTaskId}`;
+    const requestId = state.chatConfirmRequestId || localStorage.getItem(confirmationKey) || newRequestId();
+    state.chatConfirmRequestId = requestId;
+    localStorage.setItem(confirmationKey, requestId);
+    try {
+      $('#commitBtn').disabled = true;
+      await api(`/api/chat/tasks/${state.chatTaskId}/confirm`, {
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({request_id:requestId,plan_hash:state.chatPlanHash}),
+      });
+      state.chatTaskId = null; state.chatPhase = null; state.chatPreview = null; state.chatPlanHash = null;
+      state.chatConfirmRequestId = null; state.preview = null;
+      localStorage.removeItem('lab-chat-draft'); $('#chatText').value = '';
+      $('#previewBox').innerHTML = ''; $('#commitBtn').disabled = true;
+      $('#commitBtn').innerHTML = '<i data-lucide="check" class="icon-sm"></i>生成确认预览';
+      renderChatTaskActions();
+      await Promise.all([loadChat(),refreshAll()]);
+      toast('已完成确认的操作');
+      return;
+    } catch (error) {
+      if (error.status && error.status < 500) {
+        localStorage.removeItem(confirmationKey);
+        state.chatConfirmRequestId = null;
+      }
+      showError(error); $('#commitBtn').disabled = false; return;
+    }
+  }
   if (!state.preview || !state.preview.operations) return;
   
   const payloadOperations = [];
@@ -688,9 +752,9 @@ async function commitTransaction() {
       $('#commitBtn').disabled = true;
       const result = await chatApi(`/api/chat/tasks/${state.chatTaskId}/prepare`, {
         method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({operations:payloadOperations}),
+        body:JSON.stringify({operations:payloadOperations,plan_hash:state.chatPlanHash}),
       });
-      state.chatPhase = 'confirm'; state.chatPreview = result.preview;
+      state.chatPhase = 'confirm'; state.chatPreview = result.preview; state.chatPlanHash = result.plan_hash;
       renderBusinessPreview(result.preview);
       $('#commitBtn').disabled = false;
       $('#commitBtn').innerHTML = '<i data-lucide="check" class="icon-sm"></i>确认执行';
@@ -702,28 +766,7 @@ async function commitTransaction() {
       showError(error); $('#commitBtn').disabled = false; return;
     }
   }
-  if (state.chatTaskId && state.chatPhase === 'confirm') {
-    const requestId = state.chatConfirmRequestId || newRequestId();
-    state.chatConfirmRequestId = requestId;
-    try {
-      $('#commitBtn').disabled = true;
-      await api(`/api/chat/tasks/${state.chatTaskId}/confirm`, {
-        method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({request_id:requestId}),
-      });
-      state.chatTaskId = null; state.chatPhase = null; state.chatPreview = null;
-      state.chatConfirmRequestId = null; state.preview = null;
-      localStorage.removeItem('lab-chat-draft'); $('#chatText').value = '';
-      $('#previewBox').innerHTML = ''; $('#commitBtn').disabled = true;
-      $('#commitBtn').innerHTML = '<i data-lucide="check" class="icon-sm"></i>生成确认预览';
-      renderChatTaskActions();
-      await Promise.all([loadChat(),refreshAll()]);
-      toast('已完成确认的操作');
-      return;
-    } catch (error) {
-      showError(error); $('#commitBtn').disabled = false; return;
-    }
-  }
+
 
   try {
     $("#commitBtn").disabled = true;

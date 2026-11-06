@@ -206,7 +206,12 @@ def archive_location(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
 
 
 def preview_import(
-    conn: sqlite3.Connection, path: Path, filename: str, mode: str, category: str = ""
+    conn: sqlite3.Connection,
+    path: Path,
+    filename: str,
+    mode: str,
+    category: str = "",
+    commit: bool = True,
 ) -> dict:
     from .services import map_upload_row
 
@@ -237,6 +242,7 @@ def preview_import(
             mapped.update(
                 {
                     "row_number": int(index) + 2,
+                    "source_sheet": df.attrs.get("source_sheet", ""),
                     "duplicate_row": signature in seen,
                     "item_id": old["id"] if old else None,
                     "version": balance["version"] if balance else None,
@@ -278,7 +284,8 @@ def preview_import(
             json.dumps(errors, ensure_ascii=False),
         ),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return {
         "preview_id": token,
         "rows": rows,
@@ -303,7 +310,8 @@ def commit_import(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
         data.get("allow_duplicate") and str(data.get("note") or "").strip()
     ):
         raise stock.Conflict("该表格已导入，再次登记需要明确确认及填写原因")
-    rows = [row for row in json.loads(preview["rows"]) if not row["duplicate_row"]]
+    all_rows = json.loads(preview["rows"])
+    rows = [row for row in all_rows if not row["duplicate_row"]]
     if not rows:
         raise ValueError("没有可导入的记录")
     for row in rows:
@@ -339,19 +347,28 @@ def commit_import(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
                 },
                 actor,
             )
-        conn.execute(
-            "INSERT INTO source_rows(row_hash,source_file,source_row_number,item_name,normalized_name,quantity,unit,raw_json) VALUES (?,?,?,?,?,?,?,?)",
+    source_ids = {}
+    for row in all_rows:
+        identity = (row["item_key"], str(row["quantity"]), str(row.get("threshold")), json.dumps(row["raw"], ensure_ascii=False, sort_keys=True))
+        cursor = conn.execute(
+            "INSERT INTO source_rows(row_hash,source_file,source_sheet,source_row_number,category,lab,location_code,item_name,normalized_name,spec,brand,quantity,unit,threshold,remark,raw_json,duplicate_of) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 f"{preview['id']}:{row['row_number']}",
                 preview["filename"],
+                row.get("source_sheet"),
                 row["row_number"],
+                row.get("category"), row.get("lab"), row.get("location_code"),
                 row["item_name"],
                 row["normalized_name"],
+                row.get("spec"), row.get("brand"),
                 row["quantity"],
                 row["unit"],
+                row.get("threshold"), row.get("remark"),
                 json.dumps(row["raw"], ensure_ascii=False),
+                source_ids.get(identity) if row["duplicate_row"] else None,
             ),
         )
+        source_ids.setdefault(identity, cursor.lastrowid)
     conn.execute("UPDATE upload_previews SET committed=1 WHERE id=?", (preview["id"],))
     return {"ok": True, "imported_rows": len(rows)}
 
@@ -518,7 +535,9 @@ def remap_preparation(conn: sqlite3.Connection, data: dict) -> dict:
     return {"preview_id": token, "rows": rows}
 
 
-def preparation(conn: sqlite3.Connection, path: Path, course: str = "") -> dict:
+def preparation(
+    conn: sqlite3.Connection, path: Path, course: str = "", commit: bool = True
+) -> dict:
     from .services import resolve_column
 
     df = read_inventory_sheet(path).dropna(how="all")
@@ -569,7 +588,8 @@ def preparation(conn: sqlite3.Connection, path: Path, course: str = "") -> dict:
         "INSERT INTO upload_previews(id,file_hash,content_hash,filename,mode,rows,errors) VALUES (?,'','',?,'prepare',?,'[]')",
         (token, path.name, json.dumps(rows, ensure_ascii=False)),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     groups = [
         {"course": a, "experiment": b}
         for a, b in sorted({(row["course"], row["experiment"]) for row in rows})

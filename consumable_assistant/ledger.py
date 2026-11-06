@@ -455,6 +455,7 @@ def operate(
         "loan_id": related,
         "action": action,
         "quantity_after": float(ensure_balance(conn, item_id)["ready"]),
+        "quantity_after_text": text(ensure_balance(conn, item_id)["ready"]),
         "item": view(conn, item_id),
     }
 

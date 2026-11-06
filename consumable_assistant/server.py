@@ -9,6 +9,7 @@ import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import unquote, urlsplit
@@ -63,10 +64,16 @@ app = FastAPI(title="耗材智能管理助手", version="0.2.0", lifespan=lifesp
 
 class ChatPrepareRequest(BaseModel):
     operations: list[dict] = Field(min_length=1, max_length=200)
+    plan_hash: str = Field(min_length=64, max_length=64)
+
+
+class ChatCancelRequest(BaseModel):
+    plan_hash: str = Field(min_length=64, max_length=64)
 
 
 class ChatConfirmRequest(BaseModel):
     request_id: str = Field(min_length=8, max_length=100)
+    plan_hash: str = Field(min_length=64, max_length=64)
 
 
 @app.middleware("http")
@@ -107,10 +114,16 @@ def index():
 
 @app.get("/api/config")
 def app_config():
+    notifications_configured = all(
+        os.environ.get(key)
+        for key in ("VAPID_PRIVATE_KEY", "VAPID_PUBLIC_KEY", "VAPID_SUBJECT")
+    ) and os.environ.get("PUBLIC_BASE_URL", "").startswith("https://")
     return {
         "profile": CONSUMABLE_PROFILE,
         "simulated": CONSUMABLE_PROFILE == "simulation",
         "write_access": True,
+        "inventory_confirmed": os.environ.get("CONSUMABLE_INVENTORY_CONFIRMED", "0") == "1",
+        "notifications_configured": bool(notifications_configured),
     }
 
 
@@ -230,6 +243,7 @@ def prepare_chat_task(
             payload.operations,
             actor_name(request),
             dispatch,
+            expected_plan_hash=payload.plan_hash,
         )
         conn.commit()
         return result
@@ -281,6 +295,7 @@ def confirm_chat_task(
             request.headers.get("x-device-id", ""),
             payload.request_id,
             dispatch_chat,
+            expected_plan_hash=payload.plan_hash,
         )
         message_id = f"confirm-{payload.request_id}"
         conn.execute(
@@ -302,28 +317,20 @@ def confirm_chat_task(
 
 
 @app.post("/api/chat/tasks/{task_id}/cancel")
-def cancel_chat_task(task_id: str, request: Request):
+def cancel_chat_task(task_id: str, payload: ChatCancelRequest, request: Request):
     with connect() as conn:
         task = conn.execute("SELECT * FROM chat_tasks WHERE id=?", (task_id,)).fetchone()
         if not task:
             raise ValueError("聊天计划不存在")
         chat_authorize(conn, task["conversation_id"], request)
-        if task["status"] not in ("awaiting_details", "pending_confirmation"):
-            raise ValueError("此计划已经变更，不能取消")
-        conn.execute(
-            "UPDATE chat_tasks SET status='cancelled',updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (task_id,),
-        )
-        chat_session._record_task_event(
+        result = chat_session.cancel_task(
             conn,
             task_id,
-            task["status"],
-            "cancelled",
-            "cancelled_by_user",
             request.headers.get("x-request-id"),
+            expected_plan_hash=payload.plan_hash,
         )
         conn.commit()
-        return {"status": "cancelled", "task_id": task_id}
+        return result
 
 
 @app.get("/sw.js")
@@ -384,12 +391,12 @@ def search(
         units = {}
         for row in rows:
             unit = row.get("unit") or ""
-            units[unit] = units.get(unit, 0) + float(row["available_quantity"])
+            units[unit] = units.get(unit, Decimal(0)) + stock.number(row["available_quantity"])
         return {
             "rows": rows,
             "row_count": len(rows),
             "location_count": len({(row["lab"], row["location_code"]) for row in rows}),
-            "quantity_by_unit": units,
+            "quantity_by_unit": {unit: stock.text(value) for unit, value in units.items()},
         }
 
 
@@ -827,7 +834,7 @@ def history_rows(conn: sqlite3.Connection, query: dict) -> list[dict]:
         snapshot = json.loads(entry.pop("snapshot"))
         changes = json.loads(entry["changes"])
         entry.update(snapshot)
-        entry["delta_quantity"] = float(stock.number(changes.get("ready", 0)))
+        entry["delta_quantity"] = stock.text(changes.get("ready", 0))
         entry["action_label"] = ACTION_LABELS.get(entry["action"], entry["action"])
         entry["can_undo"] = not entry["reversed_by"] and entry["action"] in (
             "inbound",

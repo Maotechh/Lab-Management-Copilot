@@ -164,6 +164,15 @@ def backfill_duplicate_source_rows(
             ).fetchone()
             if same_source:
                 continue
+            legacy_source = conn.execute(
+                "SELECT id FROM source_rows WHERE row_hash=? AND source_file=? "
+                "AND source_row_number=? ORDER BY id LIMIT 1",
+                (mapped["row_hash"], mapped["source_file"], mapped["source_row_number"]),
+            ).fetchone()
+            if legacy_source:
+                conn.execute("UPDATE source_rows SET source_sheet=? WHERE id=?",
+                             (source_sheet, legacy_source["id"]))
+                continue
             conn.execute(
                 "INSERT INTO source_rows(row_hash,source_file,source_sheet,source_row_number,"
                 "category,lab,location_code,item_name,normalized_name,spec,brand,quantity,unit,"

@@ -6,13 +6,16 @@ import secrets
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import ledger as stock
 from . import workflows as flow
+from .chat_contracts import prompt_contracts, validate_payload
 from .genai import AIUnavailable, request_json
 from .services import (
     infer_action,
@@ -41,13 +44,16 @@ CHAT_SYSTEM = """
 - export_inventory：arguments 可含 query、lab、category。返回导出链接。
 
 日期使用上海时区并带时区偏移。预计到货不代表已经到货。准备计划不等于已经消耗。借用和归还必须关联明确记录。物品规格不确定时先追问。
-""".strip()
+查询之后，依据工具结果继续决定是否需要下一次查询或业务预览。缺少必要资料时询问用户。业务预览只能称为待确认，不能称为已经完成。对于前一项任务的更正和补充，保留未修改的资料并重新查询实际数据，生成新的预览。
+""".strip() + prompt_contracts()
 
 
 class ChatMessageRequest(BaseModel):
     message_id: str = Field(min_length=8, max_length=100)
     text: str = Field(default="", max_length=MAX_MESSAGE_LENGTH)
     attachments: list[str] = Field(default_factory=list, max_length=8)
+    task_id: str | None = Field(default=None, max_length=100)
+    plan_hash: str | None = Field(default=None, max_length=64)
 
 
 class ChatToolCall(BaseModel):
@@ -72,6 +78,7 @@ class ToolArguments(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: str | None = Field(default=None, max_length=300)
+    q: str | None = Field(default=None, max_length=300)
     category: str | None = Field(default=None, max_length=100)
     lab: str | None = Field(default=None, max_length=50)
     limit: int | None = Field(default=None, ge=1, le=2000)
@@ -137,6 +144,7 @@ def conversation_view(conn, conversation_id: str) -> dict:
             "preview": json.loads(row["preview_json"]),
             "result": json.loads(row["result_json"] or "null"),
             "expires_at": row["expires_at"],
+            "plan_hash": row["plan_hash"],
         }
         for row in conn.execute(
             "SELECT * FROM chat_tasks WHERE conversation_id=? ORDER BY created_at DESC LIMIT 8",
@@ -160,7 +168,8 @@ def process_message(
     attachments = _attachments(conn, conversation_id, request.attachments)
     request_hash = hashlib.sha256(
         json_text(
-            {"text": request.text.strip(), "attachments": request.attachments}
+            {"text": request.text.strip(), "attachments": request.attachments,
+             "task_id": request.task_id, "plan_hash": request.plan_hash}
         ).encode("utf-8")
     ).hexdigest()
     label = request.text.strip()
@@ -278,7 +287,10 @@ def _process_claimed_message(
             return cached
     if not request.text.strip() and not request.attachments:
         raise ValueError("請輸入內容或附加 Excel 文件")
-    attachments = _attachments(conn, conversation_id, request.attachments)
+    attachments = [dict(row) for row in conn.execute(
+        "SELECT * FROM chat_attachments WHERE conversation_id=? ORDER BY created_at DESC LIMIT 32",
+        (conversation_id,),
+    )]
     existing_user = conn.execute(
         "SELECT id FROM chat_messages WHERE conversation_id=? AND request_id=? AND role='user'",
         (conversation_id, request.message_id),
@@ -299,10 +311,18 @@ def _process_claimed_message(
         conn.commit()
 
     pending = conn.execute(
-        "SELECT * FROM chat_tasks WHERE conversation_id=? AND status='pending_confirmation' ORDER BY created_at DESC LIMIT 1",
+        "SELECT * FROM chat_tasks WHERE conversation_id=? AND status IN ('awaiting_details','pending_confirmation') ORDER BY created_at DESC LIMIT 1",
         (conversation_id,),
     ).fetchone()
     if pending and _is_confirm(request.text):
+        if (pending["status"] != "pending_confirmation" or request.task_id != pending["id"]
+                or request.plan_hash != pending["plan_hash"]):
+            response = {"reply": "请先查看当前计划的确认预览，再使用确认执行按钮。", "status": pending["status"],
+                        "task_id": pending["id"], "preview": json.loads(pending["preview_json"]),
+                        "plan_hash": pending["plan_hash"], "expires_at": pending["expires_at"]}
+            _assistant_message(conn, conversation_id, request.message_id, response)
+            conn.commit()
+            return response
         result = confirm_task(
             conn,
             pending,
@@ -310,6 +330,7 @@ def _process_claimed_message(
             device_id,
             request.message_id,
             dispatch_fn,
+            expected_plan_hash=request.plan_hash,
         )
         response = {
             "reply": "已完成確認的操作。以下結果來自實際業務記錄。",
@@ -321,18 +342,7 @@ def _process_claimed_message(
         conn.commit()
         return response
     if pending and _is_cancel(request.text):
-        conn.execute(
-            "UPDATE chat_tasks SET status='cancelled',updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (pending["id"],),
-        )
-        _record_task_event(
-            conn,
-            pending["id"],
-            pending["status"],
-            "cancelled",
-            "cancelled_by_message",
-            request.message_id,
-        )
+        cancel_task(conn, pending["id"], request.message_id)
         response = {"reply": "已取消待确认计划，没有修改库存。", "status": "cancelled"}
         _assistant_message(conn, conversation_id, request.message_id, response)
         conn.commit()
@@ -358,7 +368,7 @@ def _process_claimed_message(
     conn.commit()
 
     inferred = infer_action(request.text)
-    if inferred in {
+    if not pending and not attachments and inferred in {
         "inbound",
         "consume",
         "borrow",
@@ -404,6 +414,7 @@ def _process_claimed_message(
                     for item in attachments
                 ],
                 "tool_results": tool_results,
+                "current_time": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
             }
         )
         raw = request_json(
@@ -453,59 +464,66 @@ def _process_claimed_message(
             response_text = "这条消息包含多项库存写入。请先完成一项，或说明需要合并为一份清单预览。"
             break
         elif write_calls:
-            try:
-                response = _business_task(
+            response = _cached_tool_result(
+                conn, user_message_id, "business_preview", write_calls[0].arguments
+            )
+            if response is None:
+                try:
+                    response = _business_task(
+                        conn,
+                        conversation_id,
+                        user_message_id,
+                        request.message_id,
+                        write_calls[0].arguments,
+                        attachments,
+                        dispatch_fn,
+                        actor,
+                    )
+                except (ValueError, ValidationError, KeyError, TypeError) as exc:
+                    response = {"reply": str(exc), "status": "needs_details"}
+                _record_tool_call(
                     conn,
                     conversation_id,
                     user_message_id,
-                    request.message_id,
+                    "business_preview",
                     write_calls[0].arguments,
-                    attachments,
-                    dispatch_fn,
-                    actor,
+                    response,
+                    provider,
                 )
-            except (ValueError, ValidationError) as exc:
-                response = {"reply": str(exc), "status": "needs_details"}
             _assistant_message(conn, conversation_id, request.message_id, response)
-            _record_tool_call(
-                conn,
-                conversation_id,
-                user_message_id,
-                "business_preview",
-                write_calls[0].arguments,
-                response,
-                provider,
-            )
             conn.commit()
             return response
         else:
             calls_to_run = read_calls
         for call in calls_to_run:
-            try:
-                result = _run_read_tool(
+            result = _cached_tool_result(conn, user_message_id, call.name, call.arguments)
+            if result is None:
+                try:
+                    result = _run_read_tool(
+                        conn,
+                        conversation_id,
+                        call.name,
+                        call.arguments,
+                        attachments,
+                        history_fn,
+                    )
+                except (ValueError, ValidationError, KeyError, TypeError) as exc:
+                    result = {"error": str(exc)}
+                _record_tool_call(
                     conn,
                     conversation_id,
+                    user_message_id,
                     call.name,
                     call.arguments,
-                    attachments,
-                    history_fn,
+                    result,
+                    provider,
                 )
-            except (ValueError, ValidationError) as exc:
-                result = {"error": str(exc)}
-            _record_tool_call(
-                conn,
-                conversation_id,
-                user_message_id,
-                call.name,
-                call.arguments,
-                result,
-                provider,
-            )
             tool_results.append({"tool": call.name, "result": result})
-        if write_calls and read_calls:
-            continue
+        conn.commit()
         response_text = plan.reply
-        break
+        # Query results must be available to the next model round before it can
+        # choose records, ask for missing fields or prepare a write.
+        continue
     if not response_text:
         response_text = "已查询当前校内记录。请根据下面的查询结果补充需要处理的事项。"
     response = {
@@ -590,6 +608,13 @@ def _run_read_tool(
         needle = str(args.get("query") or "").casefold()
         if kind == "alerts":
             data = list_alerts(conn)
+            for item in data:
+                alert = conn.execute(
+                    "SELECT event_id,acknowledged,snooze_until FROM alert_states WHERE item_id=?",
+                    (item["id"],),
+                ).fetchone()
+                if alert:
+                    item.update(dict(alert))
             return {"type": "alerts", "rows": data[:limit]}
         if kind not in tables:
             raise ValueError("请选择借还、实验安排、采购、模板、清点或预警记录")
@@ -597,7 +622,7 @@ def _run_read_tool(
         rows = [dict(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT 1000")]
         output = []
         for row in rows:
-            if table in ("templates", "schedules") and row.get("lines"):
+            if kind in ("templates", "schedules") and row.get("lines"):
                 row["lines"] = json.loads(row["lines"])
             if item_field:
                 item = stock.view(conn, int(row[item_field]))
@@ -623,20 +648,27 @@ def _run_read_tool(
             if args.get(key)
         }
         query["limit"] = min(max(int(args.get("limit") or 40), 1), 100)
+        if args.get("query") and not query.get("q"):
+            query["q"] = args["query"]
         return {"type": "history", "rows": history_fn(conn, query)}
     if name in {"prepare_attachment", "inventory_import_preview"}:
         attachment = _find_attachment(attachments, str(args.get("attachment_id") or ""))
         if not attachment:
             raise ValueError("请先在此对话附加 Excel 文件")
-        path = attachment["path"]
+        path = Path(attachment["path"])
         if name == "prepare_attachment":
-            result = flow.preparation(path, str(args.get("course") or ""))
+            result = flow.preparation(conn, path, str(args.get("course") or ""), commit=False)
             return {"type": "preparation", **result}
         mode = str(args.get("mode") or "add")
         if mode not in ("add", "overwrite"):
             raise ValueError("导入方式必须是新增累加或覆盖")
         result = flow.preview_import(
-            conn, path, attachment["filename"], mode, str(args.get("category") or "")
+            conn,
+            path,
+            attachment["filename"],
+            mode,
+            str(args.get("category") or ""),
+            commit=False,
         )
         return {"type": "inventory_import", **result}
     if name == "export_inventory":
@@ -705,6 +737,7 @@ def _business_task(
     if kind in {"count", "state"}:
         payload = {**payload, "action": kind}
         kind = "stock"
+    payload = validate_payload(kind, payload)
     _validate_record_references(conn, conversation_id, kind, payload)
     payload = _fill_versions(conn, kind, payload)
     if kind == "location_details":
@@ -733,13 +766,14 @@ def _business_task(
             expires,
         ),
     )
-    _record_task_event(conn, task_id, None, "awaiting_details", "created", request_id)
+    _record_task_event(conn, task_id, None, "pending_confirmation", "created", request_id)
     return {
         "reply": "已按当前数据生成预览。请核对物品、位置、数量和状态，再确认执行。",
         "status": "pending_confirmation",
         "task_id": task_id,
         "preview": summary,
         "expires_at": expires,
+        "plan_hash": digest,
     }
 
 
@@ -750,14 +784,23 @@ def prepare_transaction_task(
     operations: list[dict],
     actor: str,
     dispatch_fn,
+    expected_plan_hash: str | None = None,
 ) -> dict:
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
     task = conn.execute(
         "SELECT * FROM chat_tasks WHERE id=? AND conversation_id=?",
         (task_id, conversation_id),
     ).fetchone()
     if not task or task["status"] != "awaiting_details":
         raise ValueError("此库存预览已失效，请重新输入操作")
+    if expected_plan_hash is not None and expected_plan_hash != task["plan_hash"]:
+        raise stock.Conflict("候选物品已经变化，请刷新对话后重新选择")
     current = json.loads(task["preview_json"])
+    if hashlib.sha256(json_text(current).encode()).hexdigest() != task["plan_hash"]:
+        raise stock.Conflict("库存候选预览已经变化，请重新输入操作")
+    if datetime.fromisoformat(task["expires_at"]) <= datetime.now(UTC):
+        raise ValueError("此库存预览已过期，请重新输入操作")
     prepared = []
     cursor = 0
     for original in current["operations"]:
@@ -827,7 +870,7 @@ def prepare_transaction_task(
         "pending_confirmation",
         "prepared",
     )
-    return {"task_id": task_id, "status": "pending_confirmation", "preview": summary, "expires_at": expires}
+    return {"task_id": task_id, "status": "pending_confirmation", "preview": summary, "expires_at": expires, "plan_hash": digest}
 
 
 def _transaction_task(
@@ -868,6 +911,7 @@ def _transaction_task(
         "task_id": task_id,
         "preview": preview,
         "expires_at": expires,
+        "plan_hash": hashlib.sha256(json_text(preview).encode()).hexdigest(),
     }
     conn.execute(
         "INSERT INTO chat_tasks(id,conversation_id,message_id,status,kind,plan_json,plan_hash,preview_json,expires_at) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -878,7 +922,7 @@ def _transaction_task(
             "awaiting_details",
             "transaction",
             json_text({"text": text, "attachments": [item["id"] for item in attachments]}),
-            "",
+            response["plan_hash"],
             json_text(preview),
             expires,
         ),
@@ -931,7 +975,7 @@ def _preview_dispatch(conn, kind: str, payload: dict, actor: str, dispatch_fn) -
                 "version": old["version"],
             }
         )
-    return {"changes": changes, "business_result": _safe_result(result)}
+    return {"changes": changes, "business_result": _safe_result(result), "operation": {"kind": kind, "details": payload}}
 
 
 def _state_summary(item: dict) -> dict:
@@ -1088,6 +1132,7 @@ def _validate_record_references(conn, conversation_id: str, kind: str, payload: 
         "loan_id": {"workflow_query"},
         "order_id": {"workflow_query"},
         "schedule_id": {"workflow_query"},
+        "template_id": {"workflow_query"},
         "event_id": {"history_search", "workflow_query"},
         "preview_id": {"prepare_attachment", "inventory_import_preview"},
     }
@@ -1101,6 +1146,13 @@ def _validate_record_references(conn, conversation_id: str, kind: str, payload: 
         except (TypeError, json.JSONDecodeError):
             continue
         _collect_refs(result, call["name"], surfaced)
+    for row in conn.execute(
+        "SELECT preview_json FROM chat_tasks WHERE conversation_id=? AND kind='transaction'",
+        (conversation_id,),
+    ):
+        for operation in json.loads(row["preview_json"]).get("operations", []):
+            for candidate in operation.get("candidates", []):
+                surfaced["item_id"].add(str(candidate["id"]))
     def visit(value):
         if isinstance(value, dict):
             for key, item in value.items():
@@ -1123,10 +1175,11 @@ def _collect_refs(value: Any, tool_name: str, surfaced: dict[str, set[str]]) -> 
                     surfaced["item_id"].add(str(row["id"]))
         if tool_name == "workflow_query":
             kind = value.get("type")
-            key = {"loans": "loan_id", "purchases": "order_id", "schedules": "schedule_id", "alerts": "event_id"}.get(kind)
+            key = {"loans": "loan_id", "purchases": "order_id", "schedules": "schedule_id", "templates": "template_id", "alerts": "event_id"}.get(kind)
             for row in value.get("rows", []):
-                if key and row.get("id") is not None:
-                    surfaced[key].add(str(row["id"]))
+                record_id = row.get("event_id") if kind == "alerts" else row.get("id")
+                if key and record_id is not None:
+                    surfaced[key].add(str(record_id))
                 if row.get("item_id") is not None:
                     surfaced["item_id"].add(str(row["item_id"]))
                 if isinstance(row.get("item"), dict) and row["item"].get("item_id") is not None:
@@ -1162,49 +1215,36 @@ def confirm_task(
     device_id: str,
     request_id: str,
     dispatch_fn,
+    expected_plan_hash: str | None = None,
 ) -> dict:
     if not actor.strip():
         raise ValueError("請先登記操作人姓名，姓名尚未經身份核驗")
     if not device_id:
         raise ValueError("設備編號無效")
-    if task["status"] != "pending_confirmation":
-        if task["status"] == "completed" and task["result_json"]:
-            return json.loads(task["result_json"])
-        raise ValueError("此計劃已經變更，請重新預覽")
-    if datetime.fromisoformat(task["expires_at"]) < datetime.now(UTC):
-        conn.execute(
-            "UPDATE chat_tasks SET status='expired',updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (task["id"],),
-        )
-        _record_task_event(
-            conn,
-            task["id"],
-            task["status"],
-            "expired",
-            "preview_expired",
-            request_id,
-        )
-        conn.commit()
-        raise ValueError("預覽已超過三十分鐘，請重新查詢並生成計劃")
-    plan = json.loads(task["plan_json"])
-    digest = hashlib.sha256(json_text(plan).encode()).hexdigest()
-    if digest != task["plan_hash"]:
-        raise ValueError("待確認內容校驗失敗，請重新預覽")
     conn.execute("BEGIN IMMEDIATE")
+    dispatch_started = False
     try:
         live = conn.execute("SELECT * FROM chat_tasks WHERE id=?", (task["id"],)).fetchone()
         if not live:
             raise ValueError("聊天计划不存在")
+        if expected_plan_hash is not None and expected_plan_hash != live["plan_hash"]:
+            raise stock.Conflict("当前计划与所查看的预览不同，请重新查看后确认")
         if live["status"] == "completed" and live["result_json"]:
             result = json.loads(live["result_json"])
             conn.rollback()
             return result
         if live["status"] != "pending_confirmation":
             raise stock.Conflict("此计划已经变化，请重新预览")
+        if datetime.fromisoformat(live["expires_at"]) <= datetime.now(UTC):
+            conn.execute("UPDATE chat_tasks SET status='expired',updated_at=CURRENT_TIMESTAMP WHERE id=?", (live["id"],))
+            _record_task_event(conn, live["id"], live["status"], "expired", "preview_expired", request_id)
+            conn.commit()
+            raise ValueError("预览已超过三十分钟，请重新查询并生成计划")
         live_plan = json.loads(live["plan_json"])
         live_digest = hashlib.sha256(json_text(live_plan).encode()).hexdigest()
         if live_digest != live["plan_hash"]:
             raise stock.Conflict("待确认内容已经变化，请重新预览")
+        dispatch_started = True
         result = stock.write_in_transaction(
             conn,
             request_id,
@@ -1229,23 +1269,42 @@ def confirm_task(
         return result
     except stock.Conflict:
         conn.rollback()
-        conn.execute(
+        if dispatch_started:
+            conn.execute(
             "UPDATE chat_tasks SET status='expired',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending_confirmation'",
             (task["id"],),
-        )
-        _record_task_event(
+            )
+            _record_task_event(
             conn,
             task["id"],
             "pending_confirmation",
             "expired",
             "stale_plan",
             request_id,
-        )
-        conn.commit()
+            )
+            conn.commit()
         raise
     except Exception:
         conn.rollback()
         raise
+
+
+def cancel_task(
+    conn,
+    task_id: str,
+    request_id: str | None = None,
+    expected_plan_hash: str | None = None,
+) -> dict:
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    task = conn.execute("SELECT * FROM chat_tasks WHERE id=?", (task_id,)).fetchone()
+    if not task or task["status"] not in ("awaiting_details", "pending_confirmation"):
+        raise stock.Conflict("此计划已经变化，不能取消")
+    if expected_plan_hash is not None and expected_plan_hash != task["plan_hash"]:
+        raise stock.Conflict("当前计划与此页面显示的内容不同，请刷新对话后再取消")
+    conn.execute("UPDATE chat_tasks SET status='cancelled',updated_at=CURRENT_TIMESTAMP WHERE id=?", (task_id,))
+    _record_task_event(conn, task_id, task["status"], "cancelled", "cancelled_by_user", request_id)
+    return {"status": "cancelled", "task_id": task_id}
 
 
 def _assistant_message(conn, conversation_id: str, request_id: str, response: dict) -> None:
@@ -1274,6 +1333,18 @@ def _record_tool_call(
         "INSERT INTO chat_tool_calls(conversation_id,message_id,name,arguments_json,result_json,provider) VALUES (?,?,?,?,?,?)",
         (conversation_id, message_id, name, json_text(arguments), json_text(result), provider),
     )
+
+
+def _cached_tool_result(conn, message_id: int, name: str, arguments: dict) -> dict | None:
+    rows = conn.execute(
+        "SELECT arguments_json,result_json FROM chat_tool_calls "
+        "WHERE message_id=? AND name=? ORDER BY id DESC",
+        (message_id, name),
+    )
+    for row in rows:
+        if json.loads(row["arguments_json"]) == arguments:
+            return json.loads(row["result_json"])
+    return None
 
 
 def _is_confirm(text: str) -> bool:
