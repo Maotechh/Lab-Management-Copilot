@@ -13,29 +13,57 @@ from consumable_assistant.ledger import initialize_balances
 
 def migrate(path: Path) -> dict:
     with connect(path) as conn:
-        before = {
-            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            for table in ("inventory_items", "inventory_transactions", "source_rows")
-        }
+        def snapshot(table: str) -> dict:
+            columns = [
+                row["name"]
+                for row in conn.execute(f"PRAGMA table_info({table})")
+            ]
+            digest = hashlib.sha256()
+            query = f"SELECT {','.join(columns)} FROM {table} ORDER BY id"
+            count = 0
+            for row in conn.execute(query):
+                count += 1
+                digest.update(
+                    json.dumps(
+                        tuple(row), sort_keys=True, ensure_ascii=False, default=str
+                    ).encode()
+                )
+            return {"columns": columns, "count": count, "hash": digest.hexdigest()}
 
-        def digest(table):
+        tables = ("inventory_items", "inventory_transactions", "source_rows")
+        before = {table: snapshot(table) for table in tables}
+
+        def digest(table, columns):
             value = hashlib.sha256()
-            for row in conn.execute(f"SELECT * FROM {table} ORDER BY id"):
+            query = f"SELECT {','.join(columns)} FROM {table} ORDER BY id"
+            for row in conn.execute(query):
                 value.update(
-                    json.dumps(dict(row), sort_keys=True, ensure_ascii=False).encode()
+                    json.dumps(
+                        tuple(row), sort_keys=True, ensure_ascii=False, default=str
+                    ).encode()
                 )
             return value.hexdigest()
 
-        original_hashes = {table: digest(table) for table in before}
         init_db(conn)
         initialize_balances(conn)
-        after = {
-            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            for table in before
+        after = {table: snapshot(table) for table in tables}
+        original_hashes = {
+            table: before[table]["hash"] for table in tables
+        }
+        preserved = {
+            table: {
+                "columns": before[table]["columns"],
+                "count": before[table]["count"],
+                "hash": digest(table, before[table]["columns"]),
+            }
+            for table in tables
         }
         if (
-            before != after
-            or original_hashes != {table: digest(table) for table in before}
+            any(
+                preserved[table]["count"] != before[table]["count"]
+                or preserved[table]["hash"] != before[table]["hash"]
+                for table in tables
+            )
             or conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok"
         ):
             raise RuntimeError("Migration preservation check failed")
@@ -55,6 +83,7 @@ def migrate(path: Path) -> dict:
             "before": before,
             "after": after,
             "original_hashes": original_hashes,
+            "preserved": preserved,
             "needs_review": review,
             "item_differences": differences,
             "integrity": "ok",

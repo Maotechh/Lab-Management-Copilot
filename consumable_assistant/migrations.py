@@ -281,11 +281,6 @@ def migrate_runtime(conn: sqlite3.Connection) -> None:
             conn.execute("DROP TABLE source_rows")
             conn.execute("ALTER TABLE source_rows_v4 RENAME TO source_rows")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_source_rows_hash ON source_rows(row_hash)")
-        conn.execute(
-            "UPDATE source_rows SET source_sheet='实验室耗材数据' "
-            "WHERE source_file='普通化学实验室耗材（不单列规格、带库存预警）.xlsx' "
-            "AND COALESCE(source_sheet,'') IN ('','Sheet1')"
-        )
         active_tasks = conn.execute(
             "SELECT id,conversation_id FROM chat_tasks "
             "WHERE status IN ('awaiting_details','pending_confirmation','executing') "

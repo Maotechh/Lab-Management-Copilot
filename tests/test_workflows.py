@@ -547,6 +547,138 @@ def test_migration_preserves_invalid_original(db):
     )
 
 
+def test_migration_preserves_legacy_rows_when_schema_grows(tmp_path):
+    """A v1 database keeps original values while v4 adds source-row fields."""
+    import json
+    import sqlite3
+
+    from scripts.migrate_database import migrate
+
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE schema_migrations(
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                report TEXT
+            );
+            INSERT INTO schema_migrations(version, report) VALUES (1, '{}');
+            CREATE TABLE inventory_items(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_key TEXT NOT NULL UNIQUE,
+                category TEXT,
+                lab TEXT,
+                location_code TEXT,
+                item_name TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                spec TEXT,
+                brand TEXT,
+                unit TEXT,
+                quantity REAL NOT NULL DEFAULT 0,
+                threshold REAL NOT NULL DEFAULT 0,
+                remark TEXT,
+                source_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE inventory_transactions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                delta_quantity REAL NOT NULL DEFAULT 0,
+                quantity_before REAL NOT NULL,
+                quantity_after REAL NOT NULL,
+                threshold_before REAL,
+                threshold_after REAL,
+                unit TEXT,
+                note TEXT,
+                actor TEXT,
+                source_type TEXT NOT NULL DEFAULT 'manual',
+                source_ref TEXT,
+                undone_by INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE loans(id INTEGER PRIMARY KEY, item_id INTEGER NOT NULL);
+            CREATE TABLE reservations(id INTEGER PRIMARY KEY, item_id INTEGER NOT NULL);
+            CREATE TABLE purchase_orders(id INTEGER PRIMARY KEY, item_id INTEGER NOT NULL);
+            CREATE TABLE stock_balances(
+                item_id INTEGER PRIMARY KEY,
+                ready TEXT NOT NULL,
+                cleaning TEXT NOT NULL DEFAULT '0',
+                repair TEXT NOT NULL DEFAULT '0',
+                quarantine TEXT NOT NULL DEFAULT '0',
+                version INTEGER NOT NULL DEFAULT 1,
+                review_reason TEXT,
+                original_quantity TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                usage_type TEXT NOT NULL DEFAULT 'unclassified',
+                conversions TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE source_rows(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                row_hash TEXT NOT NULL,
+                source_file TEXT NOT NULL,
+                source_sheet TEXT,
+                source_row_number INTEGER,
+                category TEXT,
+                lab TEXT,
+                location_code TEXT,
+                item_name TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                spec TEXT,
+                brand TEXT,
+                quantity REAL NOT NULL DEFAULT 0,
+                unit TEXT,
+                threshold REAL,
+                remark TEXT,
+                raw_json TEXT NOT NULL,
+                imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO inventory_items(
+                item_key,item_name,normalized_name,quantity,threshold
+            ) VALUES ('legacy-key','旧耗材','旧耗材',7,2);
+            INSERT INTO inventory_transactions(
+                item_id,action,quantity_before,quantity_after,unit,actor
+            ) VALUES (1,'inbound',0,7,'个','教师');
+            """,
+        )
+        conn.execute(
+            """INSERT INTO source_rows(
+                row_hash,source_file,source_sheet,source_row_number,item_name,
+                normalized_name,quantity,unit,raw_json
+            ) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                "legacy-hash",
+                "legacy.xlsx",
+                "Sheet1",
+                2,
+                "旧耗材",
+                "旧耗材",
+                7,
+                "个",
+                json.dumps({"source_sheet": "Sheet1"}),
+            ),
+        )
+        conn.commit()
+
+    report = migrate(path)
+
+    with sqlite3.connect(path) as conn:
+        source = conn.execute(
+            "SELECT source_sheet,raw_json,duplicate_of FROM source_rows"
+        ).fetchone()
+        assert source == (
+            "Sheet1",
+            json.dumps({"source_sheet": "Sheet1"}),
+            None,
+        )
+        assert conn.execute("SELECT quantity FROM inventory_items").fetchone()[0] == 7
+        assert conn.execute("SELECT COUNT(*) FROM inventory_transactions").fetchone()[0] == 1
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    assert report["preserved"]["source_rows"]["count"] == 1
+    assert report["preserved"]["source_rows"]["columns"][-1] == "imported_at"
+
+
 def test_location_totals_exclude_invalid_legacy_quantity(db):
     from consumable_assistant.services import list_locations, preview_location
 
