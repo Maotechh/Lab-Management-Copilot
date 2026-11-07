@@ -2006,3 +2006,117 @@ def test_nonstock_plan_refreshes_changed_records_without_execution(db, kind):
         assert db.execute('SELECT name FROM lesson_templates WHERE id=?', (template,)).fetchone()[0] == '另一教师修改'
     else:
         assert db.execute("SELECT description FROM location_details WHERE lab='实验室' AND location_code='A1'").fetchone()[0] == '另一教师修改'
+
+
+def queued_preview(db):
+    from consumable_assistant import chat, chat_runtime
+    from consumable_assistant.server import dispatch, history_rows
+
+    item = make_item(db)
+    conversation = chat.new_conversation(db, 'desktop')['conversation_id']
+    request = chat.ChatMessageRequest(message_id=uuid.uuid4().hex, text='预览消耗两个烧杯')
+    queued = chat_runtime.enqueue(db, conversation, request, '发起教师', 'desktop')
+    run = chat_runtime.claim(db, queued['run_id'])
+    chat_runtime.execute_tool(db, run['id'], run['callback_token'], 'inventory_search',
+                              {'query': '玻璃烧杯'}, dispatch, history_rows)
+    preview = chat_runtime.execute_tool(db, run['id'], run['callback_token'], 'business_preview',
+                                        {'kind': 'stock', 'payload': {'item_id': item, 'action': 'consume', 'quantity': '2'}}, dispatch, history_rows)
+    assert preview['status'] == 'pending_confirmation'
+    return item, conversation, request, run, preview
+
+
+def test_cancelling_a_running_preview_revokes_tools_and_confirmation(db):
+    from consumable_assistant import chat, chat_runtime
+    from consumable_assistant.server import dispatch, history_rows
+
+    item, _, _, run, preview = queued_preview(db)
+    chat_runtime.cancel_run(db, run['id'])
+    with pytest.raises(stock.Conflict, match='取消'):
+        chat_runtime.execute_tool(db, run['id'], run['callback_token'], 'inventory_search', {}, dispatch, history_rows)
+    task = db.execute('SELECT * FROM chat_tasks WHERE id=?', (preview['task_id'],)).fetchone()
+    with pytest.raises(stock.Conflict):
+        chat.confirm_task(db, task, '确认教师', 'phone', uuid.uuid4().hex, dispatch, expected_plan_hash=preview['plan_hash'])
+    response = chat_runtime.finish(db, run, preview)
+    assert response['status'] == 'cancelled'
+    assert stock.view(db, item)['ready'] == '100'
+    assert db.execute('SELECT callback_hash FROM chat_runs WHERE id=?', (run['id'],)).fetchone()[0] is None
+
+
+def test_restart_preserves_queue_and_expires_interrupted_preview_without_replay(db):
+    from consumable_assistant import chat, chat_runtime
+
+    item, conversation, request, run, preview = queued_preview(db)
+    next_request = chat.ChatMessageRequest(message_id=uuid.uuid4().hex, text='查询当前库存')
+    queued = chat_runtime.enqueue(db, conversation, next_request, '另一教师', 'phone')
+    chat_runtime.recover(db)
+    assert db.execute('SELECT status FROM chat_runs WHERE id=?', (run['id'],)).fetchone()[0] == 'failed'
+    assert db.execute('SELECT status FROM chat_tasks WHERE id=?', (preview['task_id'],)).fetchone()[0] == 'expired'
+    assert chat_runtime.enqueue(db, conversation, request, '发起教师', 'desktop')['run_id'] == run['id']
+    assert chat_runtime.claim(db, queued['run_id'])['message_id'] == queued['message_id']
+    assert stock.view(db, item)['ready'] == '100'
+    assert db.execute('SELECT COUNT(*) FROM stock_events').fetchone()[0] == 0
+
+
+def test_two_simultaneous_confirmers_execute_one_business_change(db):
+    import concurrent.futures
+
+    from consumable_assistant import chat
+    from consumable_assistant.server import dispatch
+
+    item, _, _, _, preview = queued_preview(db)
+    path = Path(db.execute('PRAGMA database_list').fetchone()[2])
+    barrier = threading.Barrier(2)
+
+    def confirm(device):
+        with connect(path) as conn:
+            task = conn.execute('SELECT * FROM chat_tasks WHERE id=?', (preview['task_id'],)).fetchone()
+            barrier.wait(timeout=5)
+            return chat.confirm_task(conn, task, device, device, uuid.uuid4().hex, dispatch,
+                                     expected_plan_hash=preview['plan_hash'])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = list(pool.map(confirm, ('phone-a', 'phone-b')))
+    assert first == second
+    assert stock.view(db, item)['ready'] == '98'
+    assert db.execute("SELECT COUNT(*) FROM stock_events WHERE action='consume'").fetchone()[0] == 1
+
+
+def test_expired_preview_cannot_execute_after_reconnection(db):
+    from consumable_assistant import chat
+    from consumable_assistant.server import dispatch
+
+    item, _, _, _, preview = queued_preview(db)
+    db.execute("UPDATE chat_tasks SET expires_at='2000-01-01T00:00:00+00:00' WHERE id=?", (preview['task_id'],))
+    db.commit()
+    task = db.execute('SELECT * FROM chat_tasks WHERE id=?', (preview['task_id'],)).fetchone()
+    with pytest.raises(ValueError, match='三十分钟'):
+        chat.confirm_task(db, task, '教师', 'phone', uuid.uuid4().hex, dispatch, expected_plan_hash=preview['plan_hash'])
+    assert stock.view(db, item)['ready'] == '100'
+
+
+def test_shared_event_stream_resumes_after_the_last_delivered_event(db, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from consumable_assistant import chat, chat_runtime, server
+
+    conversation = chat.new_conversation(db, 'desktop')['conversation_id']
+    ids = [chat_runtime.event(db, conversation, 'message', {'number': number}) for number in range(3)]
+    db.commit()
+    path = Path(db.execute('PRAGMA database_list').fetchone()[2])
+    monkeypatch.setattr(server, 'connect', lambda: connect(path))
+
+    async def connected():
+        return False
+
+    async def read_one():
+        request = SimpleNamespace(headers={'x-device-id': 'another-phone', 'last-event-id': str(ids[1])}, is_disconnected=connected)
+        response = await server.chat_events(conversation, request, after=ids[0])
+        try:
+            return await anext(response.body_iterator)
+        finally:
+            await response.body_iterator.aclose()
+
+    event = asyncio.run(read_one())
+    assert event.startswith(f'id: {ids[2]}\nevent: message\n')
+    assert '"number":2' in event
