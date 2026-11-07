@@ -48,6 +48,9 @@ chmod -R g+rX "$release_dir"
 chmod 0755 "$release_dir" "$release_dir/runtime" "$release_dir/.venv" "$release_dir/.venv/bin"
 # The two isolated users can read code, never the application's state or settings.
 chmod -R o+rX "$release_dir/consumable_assistant" "$release_dir/scripts" "$release_dir/runtime" "$release_dir/.venv"
+# Root may invoke the installer from /root, which the analysis account cannot
+# traverse. Podman's process must inherit an accessible working directory.
+cd "$release_dir"
 
 rollback() {
     local result=$?
