@@ -161,7 +161,6 @@ for unit in consumable-assistant.service consumable-notifications.service consum
     sed "s/@ANALYSIS_UID@/$analysis_uid/g" "$release_dir/deploy/$unit" > "/etc/systemd/system/$unit"
     chmod 0644 "/etc/systemd/system/$unit"
 done
-systemd-analyze verify /etc/systemd/system/consumable-{assistant,notifications,dsh,analysis,backup}.service /etc/systemd/system/consumable-backup.timer
 [[ -f /etc/nginx/snippets/lab-management-auth.conf ]] || install -m 0644 /dev/null /etc/nginx/snippets/lab-management-auth.conf
 install -d -m 0755 /var/www/lab-management-trust
 install -m 0644 /etc/lab-management-tls/lab-root-ca.crt /var/www/lab-management-trust/lab-root-ca.crt
@@ -177,6 +176,9 @@ if command -v ufw >/dev/null && LC_ALL=C ufw status | grep -q '^Status: active';
 fi
 ln -sfn "$release_dir" "$app_root/current.next"
 mv -Tf "$app_root/current.next" "$app_root/current"
+# ExecStart paths use current, so validate after selecting the candidate. The
+# rollback trap restores the previous selection and units if validation fails.
+systemd-analyze verify /etc/systemd/system/consumable-{assistant,notifications,dsh,analysis,backup}.service /etc/systemd/system/consumable-backup.timer
 systemctl daemon-reload
 systemctl enable consumable-assistant consumable-notifications consumable-dsh consumable-analysis consumable-backup.timer nginx
 systemctl restart consumable-analysis consumable-dsh
