@@ -287,6 +287,9 @@ function renderToolResult(entry) {
   const data = entry.result || {};
   if (data.error) return `<div class="chat-result error">${escapeHtml(data.error)}</div>`;
   const rows = data.rows || [];
+  if (data.type === 'inventory_summary') {
+    return `<div class="chat-result"><strong>库存统计</strong><p>匹配耗材记录 ${escapeHtml(data.item_count)} 条，实验室 ${escapeHtml(data.lab_count)} 个，位置 ${escapeHtml(data.location_count)} 个，低于预警阈值 ${escapeHtml(data.low_stock_count)} 条。</p>${tableHtml(['单位','记录数','总拥有','可用','借出','预留','待清洗','维修','待核对'],(data.units || []).map(row=>[escapeHtml(row.unit || '未填写'),escapeHtml(row.item_count),...['owned_quantity','available_quantity','borrowed_quantity','reserved_quantity','cleaning','repair','quarantine'].map(key=>escapeHtml(row[key]))]))}<p class="muted">数量按单位分别统计，借出和预留已计入可用数量计算。</p></div>`;
+  }
   if (data.type === 'inventory' || data.type === 'alerts') {
     return `<div class="chat-result"><strong>${data.type === 'alerts' ? '库存预警' : '物品位置与库存'}</strong>${tableHtml(['耗材','规格','实验室','位置','可用','总拥有'], rows.slice(0,30).map(row=>[escapeHtml(row.item_name),escapeHtml(row.spec || '未填写'),escapeHtml(row.lab),escapeHtml(row.location_code),formatQuantity(row.available_quantity,row.unit),formatQuantity(row.owned_quantity,row.unit)]))}</div>`;
   }

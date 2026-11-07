@@ -27,7 +27,7 @@ inventory_search 的 query 使用教师给出的完整耗材名称，规格可�
 操作必须保持教师原意：新增入库使用 stock/inbound；修改备注使用 metadata/remark；阈值使用 stock/threshold；清点使用 stock/count；不能用 adjust 代替备注或入库。preparation 本身自动生成不足数量的采购草案，不要再添加重复 purchase 步骤。没有明确要求的其他业务操作不能加入计划。purchase/order 用于直接登记一笔已订购物品；purchase/place 仅用于将已查询到 order_id 的现有采购草案改为已订购，不能在没有草案编号时使用 place。位置转移保留已查询的实验室名称，明确指定目标柜子编号作为 target_location；目标实验室或柜子含义不明确时追问，不创建猜测的位置。
 每个工具参数使用 arguments 对象。缺少规格、位置、单位、用途、时间或人员时先查询或追问，不自行选择其他规格或猜测包装换算。
 工具说明：
-- inventory_search：query，可选 lab、category、limit、starts_at、ends_at。返回真实物品、位置、状态和可用数量。
+- inventory_search：query，可选 lab、category、limit、starts_at、ends_at。返回真实物品、位置、状态和可用数量。询问记录总数、位置总数或数量合计时使用 summary=true，服务器统计全部匹配记录并按单位分别计算，不受明细条数限制。统计全部库存时 query 留空，不把“库存”“全部”等描述作为耗材名称搜索。
 - workflow_query：kind 为 loans、schedules、preparations、purchases、templates、counts 或 alerts，可选 query、overdue_only、limit。
 - history_search：可选 q、actor、action、from_date、to_date、limit。
 - read_attachment：attachment_id，读取表格及来源。图片由当前消息输入，模糊字段需要教师核对。
@@ -59,6 +59,7 @@ class ToolArguments(BaseModel):
     category: str | None = Field(default=None, max_length=100)
     lab: str | None = Field(default=None, max_length=50)
     limit: int | None = Field(default=None, ge=1, le=2000)
+    summary: bool = False
     starts_at: str | None = Field(default=None, max_length=40)
     ends_at: str | None = Field(default=None, max_length=40)
     kind: str | None = Field(default=None, max_length=50)
@@ -169,6 +170,30 @@ def _recent_history(conn, conversation_id: str) -> list[dict]:
     ]
 
 
+def _inventory_summary(rows: list[dict]) -> dict:
+    from decimal import Decimal
+
+    fields = ("owned_quantity", "ready_quantity", "available_quantity",
+              "borrowed_quantity", "reserved_quantity", "cleaning", "repair", "quarantine")
+    units = {}
+    for row in rows:
+        unit = row.get("unit") or ""
+        group = units.setdefault(unit, {"item_count": 0, **dict.fromkeys(fields, Decimal(0))})
+        group["item_count"] += 1
+        for field in fields:
+            group[field] += stock.number(row.get(field) or "0")
+    return {
+        "type": "inventory_summary",
+        "item_count": len(rows),
+        "lab_count": len({row["lab"] for row in rows}),
+        "location_count": len({(row["lab"], row["location_code"]) for row in rows}),
+        "low_stock_count": sum(bool(row["low_stock"]) for row in rows),
+        "units": [{"unit": unit, "item_count": group["item_count"],
+                   **{field: format(group[field].normalize(), "f") for field in fields}}
+                  for unit, group in sorted(units.items())],
+    }
+
+
 def _run_read_tool(
     conn,
     conversation_id: str,
@@ -184,6 +209,11 @@ def _run_read_tool(
         limit = min(max(int(args.get("limit") or 30), 1), 100)
         starts_at = args.get("starts_at")
         ends_at = args.get("ends_at")
+        if args.get("summary"):
+            return _inventory_summary(search_items(
+                conn, query, category, lab, limit=1_000_000,
+                starts_at=starts_at, ends_at=ends_at,
+            ))
         rows = search_items(
             conn, query, category, lab, limit=limit,
             starts_at=starts_at, ends_at=ends_at,

@@ -118,6 +118,61 @@ def test_exact_inventory_identity_excludes_similar_names_and_keeps_locations(db)
     assert len(search_items(db, "烧杯")) == 3
 
 
+def test_inventory_summary_counts_all_records_and_preserves_units_without_writes(db):
+    from consumable_assistant.chat import _run_read_tool
+
+    for index in range(105):
+        make_item(db, name="铜粉", quantity="0.1", unit="克", location=f"P{index:03d}")
+    beaker = make_item(db, quantity=10)
+    db.execute("UPDATE inventory_items SET lab=?,threshold=6 WHERE id=?", ("第二实验室", beaker))
+    retired = make_item(db, name="已停用材料", quantity=999, unit="克")
+    db.execute("UPDATE stock_balances SET active=0 WHERE item_id=?", (retired,))
+    db.execute("UPDATE inventory_items SET category='金属' WHERE item_name='铜粉'")
+    db.commit()
+    loan = operation(db, beaker, "borrow", 3, borrower="测试教师", purpose="统计验证",
+                     destination="测试教室", due_at="2030-12-01T12:00:00+08:00")["loan_id"]
+    operation(db, beaker, "return", 1, loan_id=loan, return_state="cleaning")
+    write(db, "schedule", schedule_payload(db, beaker,
+          "2030-12-02T09:00:00+08:00", "2030-12-02T12:00:00+08:00", quantity=2))
+    before = list(db.iterdump())
+
+    def summary(**arguments):
+        return _run_read_tool(db, "unused", "inventory_search",
+                              {"summary": True, "limit": 1, **arguments}, [], None)
+
+    result = summary()
+    assert result["type"] == "inventory_summary"
+    assert (result["item_count"], result["lab_count"], result["location_count"],
+            result["low_stock_count"]) == (106, 2, 106, 1)
+    units = {row["unit"]: row for row in result["units"]}
+    assert units["克"]["item_count"] == 105
+    assert units["克"]["owned_quantity"] == "10.5"
+    assert units["克"]["available_quantity"] == "10.5"
+    assert {key: units["个"][key] for key in
+            ("owned_quantity", "ready_quantity", "available_quantity",
+             "borrowed_quantity", "reserved_quantity", "cleaning")} == {
+        "owned_quantity": "10", "ready_quantity": "7", "available_quantity": "5",
+        "borrowed_quantity": "2", "reserved_quantity": "2", "cleaning": "1",
+    }
+    filtered = summary(query="铜粉", lab="实验室", category="金属")
+    assert filtered["item_count"] == 105
+    assert filtered["units"] == [units["克"]]
+    outside = summary(lab="第二实验室", starts_at="2030-12-03T09:00:00+08:00",
+                      ends_at="2030-12-03T12:00:00+08:00")
+    assert outside["units"][0]["available_quantity"] == "7"
+    assert summary(lab="不存在的实验室")["item_count"] == 0
+    assert list(db.iterdump()) == before
+
+
+def test_inventory_summary_aggregate_can_exceed_single_item_quantity_limit(db):
+    from consumable_assistant.chat import _run_read_tool
+
+    make_item(db, quantity="1000000000000", location="A1")
+    make_item(db, quantity="1000000000000", location="A2")
+    result = _run_read_tool(db, "unused", "inventory_search", {"summary": True}, [], None)
+    assert result["units"][0]["owned_quantity"] == "2000000000000"
+
+
 def test_inventory_query_reports_actual_lab_names_without_guessing(db):
     from consumable_assistant.chat import _run_read_tool
 
