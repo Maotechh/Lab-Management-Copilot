@@ -47,7 +47,7 @@ def build(source: Path, destination: Path, node_prefix: Path) -> None:
         lock = tree / 'pnpm-lock.yaml'
         original_lock_hash = hashlib.sha256(lock.read_bytes()).hexdigest()
         run(['pnpm', 'install', '--frozen-lockfile'], tree)
-        run(['pnpm', 'run', 'build:artifacts'], tree)
+        run(['env', f'DSH_CLIENT_COMMIT_HASH={commit}', 'pnpm', 'run', 'build:artifacts'], tree)
         # A dependency-only deployment importer adds no model capabilities.
         # Its registry resolutions must remain exactly those in the source lock.
         run(['node', '--input-type=module', '-e',
