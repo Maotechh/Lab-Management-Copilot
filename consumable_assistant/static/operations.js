@@ -48,7 +48,7 @@ function initWorkflows() {
     if(kind==='metadata'){
       const conversions={...item.unit_conversions};
       if(value('conversionUnit')){if(value('conversionFactor'))conversions[value('conversionUnit')]=value('conversionFactor');else delete conversions[value('conversionUnit')];}
-      return perform(kind,{...base(item),item_name:value('maintenanceName'),spec:value('maintenanceSpec'),brand:value('maintenanceBrand'),category:value('maintenanceCategory'),lab:value('maintenanceLab'),location_code:value('maintenanceLocation'),usage_type:value('maintenanceUsage'),conversions});
+      return perform(kind,{item_id:item.id,version:item.version,item_name:value('maintenanceName'),spec:value('maintenanceSpec'),brand:value('maintenanceBrand'),category:value('maintenanceCategory'),lab:value('maintenanceLab'),location_code:value('maintenanceLocation'),usage_type:value('maintenanceUsage'),conversions});
     }
     if(kind==='transfer')return perform(kind,{...data,target_lab:value('maintenanceLab'),target_location:value('maintenanceLocation'),state:value('maintenanceFrom')});
     return perform('stock',{...data,action:kind,...(kind==='state'?{from_state:value('maintenanceFrom'),to_state:value('maintenanceTo')}:{})});
