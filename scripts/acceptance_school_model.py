@@ -221,36 +221,41 @@ def main():
     cases = []
     for _ in range(args.repeat):
         cases.extend(fixtures(database))
-    original = digest(database)
     args.report.parent.mkdir(parents=True, exist_ok=True)
     process, base = start_isolated_server(database, len(cases))
     results = []
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-            pending = {pool.submit(preview, base, case): case for case in cases}
-            for future in concurrent.futures.as_completed(pending):
-                case = future.result()
-                try:
-                    case['plan_correct'] = check_plan(case)
-                except (KeyError, IndexError, TypeError, ValueError):
-                    case['plan_correct'] = False
-                results.append(case)
-                args.report.write_text(json.dumps({'results': results}, ensure_ascii=False, indent=2))
-                print(json.dumps({key: case[key] for key in ('operation','quantity','plan_correct','run_id')}), flush=True)
-        assert digest(database) == original, 'Unconfirmed business data changed'
-        with httpx.Client(base_url=base, trust_env=False, timeout=20) as client:
-            for case in results:
-                if not case['plan_correct']:
-                    continue
-                task = case['response']
-                payload = {'request_id': uuid.uuid4().hex, 'plan_hash': task['plan_hash']}
-                headers = {'X-Actor': 'Acceptance-confirmer', 'X-Device-ID': 'acceptance-phone'}
-                route = '/api/chat/tasks/' + task['task_id'] + '/confirm'
-                response = client.post(route, headers=headers, json=payload)
-                case['confirmed'] = response.status_code == 200
-                if case['confirmed']:
-                    assert client.post(route, headers=headers, json=payload).json() == response.json()
-                    verify_quantity(database, case)
+        # Confirm each small batch after checking the complete business digest.
+        # This preserves the thirty-minute plan expiry during a long model run.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool, httpx.Client(
+            base_url=base, trust_env=False, timeout=20,
+        ) as client:
+            for offset in range(0, len(cases), 3):
+                original = digest(database)
+                pending = [pool.submit(preview, base, case) for case in cases[offset:offset + 3]]
+                batch = []
+                for future in concurrent.futures.as_completed(pending):
+                    case = future.result()
+                    try:
+                        case['plan_correct'] = check_plan(case)
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        case['plan_correct'] = False
+                    batch.append(case)
+                assert digest(database) == original, 'Unconfirmed business data changed'
+                for case in batch:
+                    if case['plan_correct']:
+                        task = case['response']
+                        payload = {'request_id': uuid.uuid4().hex, 'plan_hash': task['plan_hash']}
+                        headers = {'X-Actor': 'Acceptance-confirmer', 'X-Device-ID': 'acceptance-phone'}
+                        route = '/api/chat/tasks/' + task['task_id'] + '/confirm'
+                        response = client.post(route, headers=headers, json=payload)
+                        case['confirmed'] = response.status_code == 200
+                        if case['confirmed']:
+                            assert client.post(route, headers=headers, json=payload).json() == response.json()
+                            verify_quantity(database, case)
+                    results.append(case)
+                    args.report.write_text(json.dumps({'results': results}, ensure_ascii=False, indent=2))
+                    print(json.dumps({key: case[key] for key in ('operation','quantity','plan_correct','run_id')}), flush=True)
         passed = sum(case['plan_correct'] and case.get('confirmed', False) for case in results)
         combinations = {(case['operation'], case['quantity']) for case in results}
         repeated_scenarios_passed = all(
