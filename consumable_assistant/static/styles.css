@@ -985,6 +985,7 @@ pre {
   .responsive-cards .inline-edit .number-input {
     flex: 1;
     width: auto;
+    min-width: 0;
   }
 
   .table-wrap.short {
