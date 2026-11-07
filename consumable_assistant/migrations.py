@@ -85,6 +85,10 @@ def migrate(conn: sqlite3.Connection) -> None:
         migrate_history(conn)
         migrate_chat(conn)
         migrate_runtime(conn)
+        migrate_lab(conn)
+        migrate_shared_runtime(conn)
+        migrate_exports(conn)
+        migrate_preparation_history(conn)
         return
     database = conn.execute("PRAGMA database_list").fetchone()[2]
     if database:
@@ -112,6 +116,10 @@ def migrate(conn: sqlite3.Connection) -> None:
         migrate_history(conn)
         migrate_chat(conn)
         migrate_runtime(conn)
+        migrate_lab(conn)
+        migrate_shared_runtime(conn)
+        migrate_exports(conn)
+        migrate_preparation_history(conn)
     except Exception:
         conn.rollback()
         raise
@@ -331,3 +339,96 @@ def _ensure_column(
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})")}
     if column_name not in columns:
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+
+
+def migrate_lab(conn: sqlite3.Connection) -> None:
+    if conn.execute("SELECT 1 FROM schema_migrations WHERE version=5").fetchone():
+        return
+    database = conn.execute("PRAGMA database_list").fetchone()[2]
+    if database:
+        backup = Path(database).with_suffix(".before-v5.db")
+        if not backup.exists():
+            with sqlite3.connect(backup) as destination:
+                conn.backup(destination)
+            backup.chmod(0o600)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for table, column, definition in (
+            ("chat_messages", "actor", "TEXT NOT NULL DEFAULT ''"),
+            ("chat_messages", "device_id", "TEXT NOT NULL DEFAULT ''"),
+            ("chat_tasks", "initiator", "TEXT NOT NULL DEFAULT ''"),
+            ("chat_tasks", "confirmer", "TEXT NOT NULL DEFAULT ''"),
+            ("chat_tasks", "confirm_device", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            _ensure_column(conn, table, column, definition)
+        conn.execute("CREATE TABLE preparations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, course TEXT NOT NULL, venue TEXT NOT NULL, starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, people INTEGER NOT NULL, group_size INTEGER NOT NULL, lines TEXT NOT NULL, schedule_id INTEGER REFERENCES schedules(id), actor TEXT NOT NULL, status TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+        conn.execute("CREATE TABLE preparation_schedules (preparation_id INTEGER NOT NULL REFERENCES preparations(id), schedule_id INTEGER NOT NULL REFERENCES schedules(id), PRIMARY KEY(preparation_id,schedule_id))")
+        conn.execute("CREATE TABLE chat_runs (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES chat_conversations(id), message_id INTEGER NOT NULL UNIQUE REFERENCES chat_messages(id), status TEXT NOT NULL, request_json TEXT NOT NULL, actor TEXT NOT NULL, device_id TEXT NOT NULL, error TEXT, started_at TEXT, completed_at TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+        conn.execute("CREATE TABLE chat_events (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL REFERENCES chat_conversations(id), kind TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+        conn.execute("CREATE INDEX idx_chat_events_conversation ON chat_events(conversation_id,id)")
+        conn.execute("CREATE TABLE analysis_jobs (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES chat_conversations(id), status TEXT NOT NULL, result_json TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+        conn.execute("UPDATE chat_tasks SET status='expired',updated_at=CURRENT_TIMESTAMP WHERE status IN ('awaiting_details','pending_confirmation','executing')")
+        conn.execute("UPDATE chat_conversations SET active_message_id=NULL,active_until=NULL")
+        conn.execute("INSERT INTO schema_migrations(version,report) VALUES (5,?)", (json.dumps({"shared_conversations": True, "dsh_runs": True, "preparations": True, "old_plans_require_preview": True}),))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def migrate_shared_runtime(conn: sqlite3.Connection) -> None:
+    """Extend persistent runs without changing inventory or prior history."""
+    if conn.execute("SELECT 1 FROM schema_migrations WHERE version=6").fetchone():
+        return
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for table, column, definition in (
+            ("chat_runs", "callback_hash", "TEXT"),
+            ("chat_runs", "tool_calls", "INTEGER NOT NULL DEFAULT 0"),
+            ("chat_runs", "result_json", "TEXT"),
+            ("chat_runs", "cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
+            ("chat_tool_calls", "run_id", "TEXT REFERENCES chat_runs(id)"),
+        ):
+            _ensure_column(conn, table, column, definition)
+        conn.execute("CREATE INDEX idx_chat_runs_queue ON chat_runs(status,message_id)")
+        conn.execute("CREATE UNIQUE INDEX idx_chat_runs_active ON chat_runs(conversation_id) WHERE status='running'")
+        conn.execute("INSERT INTO schema_migrations(version,report) VALUES (6,?)", (json.dumps({"durable_queue": True, "callback_capabilities": True}),))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def migrate_exports(conn: sqlite3.Connection) -> None:
+    if conn.execute("SELECT 1 FROM schema_migrations WHERE version=7").fetchone():
+        return
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("CREATE TABLE exported_files (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES chat_conversations(id), task_id TEXT REFERENCES chat_tasks(id), job_id TEXT REFERENCES analysis_jobs(id), filename TEXT NOT NULL, media_type TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL, path TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+        _ensure_column(conn, "analysis_jobs", "run_id", "TEXT REFERENCES chat_runs(id)")
+        _ensure_column(conn, "analysis_jobs", "arguments_hash", "TEXT")
+        conn.execute("CREATE UNIQUE INDEX idx_analysis_run_args ON analysis_jobs(run_id,arguments_hash)")
+        conn.execute("INSERT INTO schema_migrations(version,report) VALUES (7,?)", (json.dumps({"controlled_exports": True, "analysis_idempotency": True}),))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def migrate_preparation_history(conn: sqlite3.Connection) -> None:
+    if conn.execute("SELECT 1 FROM schema_migrations WHERE version=8").fetchone():
+        return
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_column(conn, "preparation_schedules", "retired", "INTEGER NOT NULL DEFAULT 0")
+        conn.execute("CREATE TABLE preparation_purchases (preparation_id INTEGER NOT NULL REFERENCES preparations(id), order_id INTEGER NOT NULL REFERENCES purchase_orders(id), PRIMARY KEY(preparation_id,order_id))")
+        conn.execute("CREATE TABLE preparation_revisions (id INTEGER PRIMARY KEY AUTOINCREMENT, preparation_id INTEGER NOT NULL REFERENCES preparations(id), version INTEGER NOT NULL, actor TEXT NOT NULL, note TEXT NOT NULL, snapshot TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        for row in conn.execute("SELECT id,lines FROM preparations").fetchall():
+            for line in json.loads(row["lines"]):
+                if line.get("purchase_draft_id"):
+                    conn.execute("INSERT OR IGNORE INTO preparation_purchases VALUES (?,?)", (row["id"], line["purchase_draft_id"]))
+        conn.execute("INSERT INTO schema_migrations(version,report) VALUES (8,?)", (json.dumps({"preparation_revision_history": True}),))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise

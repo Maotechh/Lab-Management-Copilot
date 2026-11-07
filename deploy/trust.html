@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>实验室耗材助手：证书安装</title>
+<style>body{max-width:42rem;margin:3rem auto;padding:0 1.2rem;font:17px/1.8 system-ui;color:#17252a}a{color:#006b62}li{margin:.8rem 0}code{overflow-wrap:anywhere}</style>
+<h1>实验室耗材助手</h1>
+<p>业务网站使用学校内网 HTTPS。第一次使用前，请安装实验室根证书，并与维护者交付的 SHA-256 指纹核对。</p>
+<p><a href="/lab-root-ca.crt">下载实验室根证书</a></p>
+<ol>
+<li>iPhone：在 Safari 下载证书，在“设置”中安装已下载的描述文件，再进入“通用 → 关于本机 → 证书信任设置”，为实验室根证书开启完全信任。</li>
+<li>Android：在系统设置中搜索“安装证书”，选择 CA 证书并安装下载的文件。不同厂商的设置名称可能不同。</li>
+<li>电脑：将证书安装到系统信任的根证书目录，然后重新访问网站。</li>
+</ol>
+<p>证书指纹：<code>@@CA_FINGERPRINT@@</code></p>
+<p><a href="https://10.15.21.115">进入耗材管理网站</a></p>
+<p>iPhone 的后台通知需要将网站添加到主屏幕，再从主屏幕图标进入并允许通知。所有设备均需连接校园网或学校 VPN。</p>
+</html>

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import io
 import json
+import logging
 import os
 import sqlite3
 import uuid
@@ -21,6 +23,7 @@ from openpyxl import Workbook
 from pydantic import BaseModel, Field
 
 from . import chat as chat_session
+from . import chat_runtime, dsh_client
 from . import ledger as stock
 from . import workflows as flow
 from .database import connect, init_db, inventory_is_empty
@@ -56,7 +59,50 @@ async def lifespan(_: FastAPI):
         for row in conn.execute("SELECT item_id FROM stock_balances").fetchall():
             stock.alerts_changed(conn, row["item_id"])
         conn.commit()
-    yield
+    with connect() as conn:
+        chat_runtime.recover(conn)
+    stopping = asyncio.Event()
+    worker = asyncio.create_task(chat_worker(stopping))
+    try:
+        yield
+    finally:
+        stopping.set()
+        await worker
+
+
+def process_queued_run(run: dict) -> None:
+    with connect() as conn:
+        try:
+            chat_runtime.process_run(conn, run, dispatch, history_rows)
+        except Exception:
+            conn.rollback()
+            logging.exception("DSH run failed: %s", run["id"])
+            chat_runtime.finish(conn, run, {"status": "failed", "reply": "本次运行发生错误，消息已保存。请查看任务后发送继续说明。"})
+
+
+async def chat_worker(stopping: asyncio.Event) -> None:
+    active: set[asyncio.Task] = set()
+    while not stopping.is_set():
+        active = {task for task in active if not task.done()}
+        if len(active) < 4:
+            with connect() as conn:
+                run = chat_runtime.claim(conn)
+            if run:
+                active.add(asyncio.create_task(asyncio.to_thread(process_queued_run, run)))
+                continue
+        try:
+            await asyncio.wait_for(stopping.wait(), timeout=0.2)
+        except TimeoutError:
+            pass
+    with connect() as conn:
+        ids = [row[0] for row in conn.execute("SELECT id FROM chat_runs WHERE status='running'")]
+        for run_id in ids:
+            chat_runtime.cancel_run(conn, run_id)
+            try:
+                await asyncio.to_thread(dsh_client.cancel_dsh, run_id)
+            except dsh_client.DSHUnavailable:
+                logging.warning("DSH cancellation remains pending: %s", run_id)
+    await asyncio.gather(*active, return_exceptions=True)
 
 
 app = FastAPI(title="耗材智能管理助手", version="0.2.0", lifespan=lifespan)
@@ -95,7 +141,7 @@ async def same_origin(request: Request, call_next):
 @app.exception_handler(ValueError)
 async def validation_error(request: Request, exc: ValueError):
     return JSONResponse(
-        {"detail": str(exc)},
+        {"detail": str(exc), **({"refreshed_plan": exc.response} if isinstance(exc, chat_session.PlanChanged) else {})},
         status_code=409 if isinstance(exc, stock.Conflict) else 400,
     )
 
@@ -145,10 +191,11 @@ def create_chat_conversation(request: Request):
 
 
 @app.get("/api/chat/conversations/{conversation_id}")
-def get_chat_conversation(conversation_id: str, request: Request):
+def get_chat_conversation(conversation_id: str, request: Request, before: int | None = None, limit: int = 100):
     with connect() as conn:
+        conn.execute("BEGIN")
         chat_authorize(conn, conversation_id, request)
-        return chat_session.conversation_view(conn, conversation_id)
+        return chat_session.conversation_view(conn, conversation_id, before, limit)
 
 
 @app.post("/api/chat/conversations/{conversation_id}/messages")
@@ -157,15 +204,97 @@ def send_chat_message(
 ):
     with connect() as conn:
         chat_authorize(conn, conversation_id, request)
-        return chat_session.process_message(
-            conn,
-            conversation_id,
-            payload,
-            actor_name(request),
-            request.headers.get("x-device-id", ""),
-            dispatch,
-            history_rows,
+        return chat_runtime.enqueue(conn, conversation_id, payload, actor_name(request), request.headers.get("x-device-id", ""))
+
+
+@app.get("/api/chat/conversations")
+def list_chat_conversations(before: int | None = None, limit: int = 100):
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT c.rowid AS cursor,c.id,c.version,c.updated_at,(SELECT content FROM chat_messages m WHERE m.conversation_id=c.id ORDER BY m.id LIMIT 1) AS title "
+            "FROM chat_conversations c WHERE (? IS NULL OR c.rowid<?) ORDER BY c.rowid DESC LIMIT ?", (before, before, min(max(limit, 1), 100)),
         )
+        values = [dict(row) for row in rows]
+        return {"conversations": values, "shared": True, "next_before": values[-1]["cursor"] if len(values) == min(max(limit, 1), 100) else None}
+
+
+@app.get("/api/chat/runs/{run_id}")
+def get_chat_run(run_id: str):
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM chat_runs WHERE id=?", (run_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "运行不存在")
+        return chat_runtime.run_view(row)
+
+
+@app.post("/api/chat/runs/{run_id}/cancel")
+async def cancel_chat_run(run_id: str):
+    with connect() as conn:
+        result = chat_runtime.cancel_run(conn, run_id)
+    if result["status"] == "cancelling":
+        try:
+            await asyncio.to_thread(dsh_client.cancel_dsh, run_id)
+        except dsh_client.DSHUnavailable:
+            result["notice"] = "取消请求已保存，后续工具调用已禁止。"
+    return result
+
+
+@app.get("/api/chat/conversations/{conversation_id}/events")
+async def chat_events(conversation_id: str, request: Request, after: int = 0):
+    try:
+        cursor = max(after, int(request.headers.get("last-event-id", "0")))
+    except ValueError as exc:
+        raise HTTPException(400, "事件编号无效") from exc
+    with connect() as conn:
+        chat_authorize(conn, conversation_id, request)
+
+    async def stream():
+        nonlocal cursor
+        while not await request.is_disconnected():
+            with connect() as conn:
+                rows = conn.execute("SELECT id,kind,payload FROM chat_events WHERE conversation_id=? AND id>? ORDER BY id LIMIT 100", (conversation_id, cursor)).fetchall()
+            for row in rows:
+                cursor = row["id"]
+                yield f"id: {cursor}\nevent: {row['kind']}\ndata: {row['payload']}\n\n"
+            if not rows:
+                yield ": keep-alive\n\n"
+            await asyncio.sleep(1)
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+class DSHCallbackRequest(BaseModel):
+    name: str = Field(max_length=100)
+    arguments: dict
+
+
+@app.post("/api/internal/dsh/{run_id}/tools")
+def dsh_tool_callback(run_id: str, payload: DSHCallbackRequest, request: Request):
+    if not request.client or request.client.host not in {"127.0.0.1", "::1"}:
+        raise HTTPException(403, "此接口仅允许本机对话服务访问")
+    token = request.headers.get("authorization", "").removeprefix("Bearer ")
+    with connect() as conn:
+        try:
+            return chat_runtime.execute_tool(conn, run_id, token, payload.name, payload.arguments, dispatch, history_rows)
+        except PermissionError as exc:
+            raise HTTPException(403, "运行凭据无效") from exc
+
+
+@app.post("/api/voice/transcribe")
+async def transcribe_voice(request: Request):
+    audio = bytearray()
+    async for chunk in request.stream():
+        audio.extend(chunk)
+        if len(audio) > 4 * 1024 * 1024:
+            raise HTTPException(413, "录音不能超过两分钟")
+    if not audio or bytes(audio[:4]) != b"RIFF":
+        raise HTTPException(400, "录音格式必须是 WAV")
+    try:
+        return await asyncio.to_thread(dsh_client.transcribe, bytes(audio))
+    except dsh_client.DSHUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    finally:
+        audio.clear()
+
 
 
 @app.post("/api/chat/conversations/{conversation_id}/attachments")
@@ -176,8 +305,8 @@ async def upload_chat_attachment(
         chat_authorize(conn, conversation_id, request)
         filename = Path(file.filename or "attachment").name
         suffix = Path(filename).suffix.lower()
-        if suffix not in {".xlsx", ".xls", ".png", ".jpg", ".jpeg", ".webp"}:
-            raise ValueError("聊天附件支持 Excel 表格和位置照片")
+        if suffix not in {".xlsx", ".xls", ".csv", ".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif"}:
+            raise ValueError("聊天附件支持 XLS、XLSX、CSV 表格和清单照片")
         content = await file.read(20 * 1024 * 1024 + 1)
         if not content or len(content) > 20 * 1024 * 1024:
             raise ValueError("附件不能为空，且大小不能超过 20 MB")
@@ -188,7 +317,10 @@ async def upload_chat_attachment(
         ).fetchone()
         if existing:
             return {**dict(existing), "reused": True}
-        if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+        if suffix in {".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif"}:
+            if suffix in {".heic", ".heif"}:
+                from pillow_heif import register_heif_opener
+                register_heif_opener()
             from PIL import Image
 
             try:
@@ -204,7 +336,7 @@ async def upload_chat_attachment(
         CHAT_UPLOAD_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
         destination = CHAT_UPLOAD_DIR / f"{attachment_id}{suffix}"
         destination.write_bytes(content)
-        content_type = file.content_type or "application/octet-stream"
+        content_type = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".heic": "image/heic", ".heif": "image/heif"}.get(suffix, "text/csv" if suffix == ".csv" else "application/vnd.ms-excel")
         conn.execute(
             "INSERT INTO chat_attachments(id,conversation_id,filename,content_type,size,sha256,path) VALUES (?,?,?,?,?,?,?)",
             (
@@ -260,59 +392,16 @@ def confirm_chat_task(
         chat_authorize(conn, task["conversation_id"], request)
         actor = actor_name(request)
 
-        def dispatch_chat(tx, kind, data, user):
-            photo_id = data.get("photo_attachment_id") if kind == "location_details" else None
-            target = None
-            if photo_id:
-                attachment = tx.execute(
-                    "SELECT * FROM chat_attachments WHERE id=? AND conversation_id=?",
-                    (photo_id, task["conversation_id"]),
-                ).fetchone()
-                if not attachment or not attachment["content_type"].startswith("image/"):
-                    raise ValueError("位置照片不属于当前对话")
-                PHOTO_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-                from PIL import Image
-
-                photo_name = f"chat-{attachment['id']}.jpg"
-                target = PHOTO_DIR / photo_name
-                created = not target.exists()
-                if created:
-                    with Image.open(attachment["path"]) as image:
-                        image.thumbnail((1600, 1600))
-                        image.convert("RGB").save(target, format="JPEG", quality=85)
-                data["photo_path"] = photo_name
-            try:
-                return dispatch(tx, kind, data, user)
-            except Exception:
-                if target and created and target.exists():
-                    target.unlink()
-                raise
-
         result = chat_session.confirm_task(
             conn,
             task,
             actor,
             request.headers.get("x-device-id", ""),
             payload.request_id,
-            dispatch_chat,
+            dispatch,
             expected_plan_hash=payload.plan_hash,
+            record_message=True,
         )
-        message_id = f"confirm-{payload.request_id}"
-        conn.execute(
-            "INSERT OR IGNORE INTO chat_messages(conversation_id,request_id,role,content,result_json) VALUES (?,?,?,?,?)",
-            (
-                task["conversation_id"],
-                message_id,
-                "assistant",
-                "已完成确认的操作。以下结果来自实际业务记录。",
-                json.dumps(
-                    {"reply": "已完成确认的操作。以下结果来自实际业务记录。", "status": "completed", "task_id": task_id, "result": result},
-                    ensure_ascii=False,
-                    default=str,
-                ),
-            ),
-        )
-        conn.commit()
         return {"status": "completed", "task_id": task_id, "result": result}
 
 
@@ -471,6 +560,25 @@ def transaction_preview(payload: dict):
 
 
 def dispatch(conn: sqlite3.Connection, kind: str, data: dict, actor: str) -> dict:
+    if kind == "mixed":
+        operations = data["operations"]
+        for step in operations:
+            current = chat_session._fill_versions(conn, step["kind"], step["payload"])
+            if current != step["payload"]:
+                raise stock.Conflict("计划所引用的记录已经变化，请重新预览")
+        results = []
+        for step in operations:
+            payload = chat_session._fill_versions(conn, step["kind"], step["payload"])
+            results.append(dispatch(conn, step["kind"], payload, actor))
+        return {"ok": True, "results": results}
+    if kind == "preparation":
+        from .preparations import create
+
+        return create(conn, data, actor)
+    if kind == "preparation_update":
+        from .preparations import update
+
+        return update(conn, data, actor)
     if kind == "bulk":
         operations = data.get("operations") or []
         if not operations or len(operations) > 200:
@@ -506,7 +614,10 @@ def dispatch(conn: sqlite3.Connection, kind: str, data: dict, actor: str) -> dic
     if kind == "prepare":
         return flow.consume_preparation(conn, data, actor)
     if kind == "prepare_remap":
-        return flow.remap_preparation(conn, data)
+        selections = data.get("selections")
+        if selections is None:
+            selections = {str(data["row_number"]): data["item_id"]}
+        return flow.remap_preparation(conn, {**data, "selections": selections})
     if kind == "purchase":
         return flow.purchase(conn, data, actor)
     if kind == "schedule":
@@ -583,8 +694,8 @@ def dispatch(conn: sqlite3.Connection, kind: str, data: dict, actor: str) -> dic
             (
                 lab,
                 location,
-                str(data.get("description") or ""),
-                data.get("photo_path"),
+                str(data.get("description", old["description"] if old else "") or ""),
+                "attachment:" + data["photo_attachment_id"] if data.get("photo_attachment_id") else data.get("photo_path"),
             ),
         )
         for item in conn.execute(
@@ -627,15 +738,49 @@ def dispatch(conn: sqlite3.Connection, kind: str, data: dict, actor: str) -> dic
     raise ValueError("未知操作")
 
 
+def form_preview(conn, kind: str, payload: dict, request: Request, conversation_id: str | None = None) -> dict:
+    request_id = request.headers.get("x-request-id", "")
+    if not 8 <= len(request_id) <= 100:
+        raise ValueError("请使用有效请求编号生成预览")
+    digest = hashlib.sha256(chat_session.json_text({"kind": kind, "payload": payload}).encode()).hexdigest()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        old = conn.execute("SELECT * FROM chat_messages WHERE request_id=? AND role='user' AND device_id=?", (request_id, request.headers.get("x-device-id", ""))).fetchone()
+        if old:
+            if old["request_hash"] != digest:
+                raise stock.Conflict("此请求编号已用于不同内容")
+            saved = conn.execute("SELECT result_json FROM chat_messages WHERE conversation_id=? AND request_id=? AND role='assistant'", (old["conversation_id"], request_id)).fetchone()
+            result = json.loads(saved[0])
+            task = conn.execute("SELECT * FROM chat_tasks WHERE id=?", (result.get("task_id"),)).fetchone()
+            if task and task["status"] != "pending_confirmation":
+                result = {**result, "status": task["status"], "result": json.loads(task["result_json"] or "null")}
+            conn.commit()
+            return result
+        conversation_id = conversation_id or request.headers.get("x-conversation-id")
+        if conversation_id:
+            chat_authorize(conn, conversation_id, request)
+        else:
+            conn.commit()
+            conversation_id = chat_session.new_conversation(conn, request.headers.get("x-device-id", ""))["conversation_id"]
+            conn.execute("BEGIN IMMEDIATE")
+        actor = actor_name(request)
+        chat_runtime.expire_plans(conn, conversation_id, request_id)
+        cursor = conn.execute("INSERT INTO chat_messages(conversation_id,request_id,role,content,request_hash,actor,device_id) VALUES (?,?,'user',?,?,?,?)", (conversation_id, request_id, "表单操作：" + kind, digest, actor, request.headers.get("x-device-id", "")))
+        attachments = [dict(row) for row in conn.execute("SELECT * FROM chat_attachments WHERE conversation_id=?", (conversation_id,))]
+        result = chat_session._business_task(conn, conversation_id, cursor.lastrowid, request_id, {"kind": kind, "payload": payload}, attachments, dispatch, actor, validate_references=False)
+        result["conversation_id"] = conversation_id
+        chat_session._assistant_message(conn, conversation_id, request_id, result)
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+
+
 @app.post("/api/actions/{kind}")
 def action(kind: str, payload: dict, request: Request):
     with connect() as conn:
-        return mutation(
-            request,
-            conn,
-            payload,
-            lambda: dispatch(conn, kind, payload, actor_name(request)),
-        )
+        return form_preview(conn, kind, payload, request)
 
 
 @app.get("/api/operations/{request_id}")
@@ -645,6 +790,10 @@ def operation_result(request_id: str, request: Request):
             "SELECT * FROM operation_requests WHERE request_id=? AND device_id=?",
             (request_id, request.headers.get("x-device-id", "")),
         ).fetchone()
+        if not row:
+            task = conn.execute("SELECT t.*,m.conversation_id FROM chat_messages m JOIN chat_tasks t ON t.message_id=m.id WHERE m.request_id=? AND m.role='user' AND m.device_id=?", (request_id, request.headers.get("x-device-id", ""))).fetchone()
+            if task:
+                return {"status": task["status"], "task_id": task["id"], "conversation_id": task["conversation_id"], "plan_hash": task["plan_hash"], "preview": json.loads(task["preview_json"]), "result": json.loads(task["result_json"] or "null")}
         return (
             {"status": "completed", "result": json.loads(row["result"])}
             if row
@@ -672,7 +821,7 @@ def threshold(item_id: int, payload: dict, request: Request):
     return action(
         "stock",
         {
-            **payload,
+            **{key: value for key, value in payload.items() if key != "threshold"},
             "item_id": item_id,
             "action": "threshold",
             "quantity": payload.get("threshold"),
@@ -698,9 +847,9 @@ def archive(payload: dict, request: Request):
     return action(
         "archive_location",
         {
-            **payload,
             "lab": payload.get("source_lab"),
             "location_code": payload.get("source_location"),
+            "note": payload.get("note") or "停用位置",
         },
         request,
     )
@@ -708,56 +857,25 @@ def archive(payload: dict, request: Request):
 
 @app.post("/api/locations/move")
 def move(payload: dict, request: Request):
-    def execute():
-        if not payload.get("confirmed"):
-            raise ValueError("请确认位置转移")
-        preview = preview_location(
-            conn, payload.get("source_lab"), payload.get("source_location")
-        )
-        result = []
-        for row in preview["rows"]:
+    with connect() as conn:
+        rows = preview_location(conn, payload.get("source_lab"), payload.get("source_location"))["rows"]
+        operations = []
+        for row in rows:
             item = stock.view(conn, row["id"])
             if not item["active"]:
                 continue
-            stock.check_version(
-                item, (payload.get("versions") or {}).get(str(item["id"]))
-            )
             if stock.number(item["borrowed_quantity"]) or item["review_reason"]:
                 raise ValueError("位置包含未归还或待核对物品，请先处理")
             for state in stock.STATES:
-                current = stock.ensure_balance(conn, row["id"])
-                if stock.number(current[state]):
-                    result.append(
-                        flow.transfer(
-                            conn,
-                            {
-                                **payload,
-                                "item_id": row["id"],
-                                "version": current["version"],
-                                "state": state,
-                                "quantity": current[state],
-                            },
-                            actor_name(request),
-                        )
-                    )
-            conn.execute(
-                "UPDATE stock_balances SET active=0,version=version+1 WHERE item_id=?",
-                (row["id"],),
-            )
-        return {
-            "ok": True,
-            "moved_count": len(result),
-            "merged_count": 0,
-            "deleted_zero_count": 0,
-        }
-
-    with connect() as conn:
-        return mutation(request, conn, payload, execute)
+                if stock.number(item[state]):
+                    operations.append({"kind": "transfer", "payload": {"item_id": item["id"], "state": state, "quantity": item[state], "target_lab": payload.get("target_lab"), "target_location": payload.get("target_location"), "note": payload.get("note")}})
+        operations.append({"kind": "archive_location", "payload": {"lab": payload.get("source_lab"), "location_code": payload.get("source_location"), "note": payload.get("note") or "位置转移后停用"}})
+        return form_preview(conn, "mixed", {"operations": operations}, request)
 
 
 async def uploaded(file: UploadFile) -> Path:
-    if Path(file.filename or "").suffix.lower() not in (".xls", ".xlsx"):
-        raise ValueError("仅支持 Excel 文件")
+    if Path(file.filename or "").suffix.lower() not in (".xls", ".xlsx", ".csv"):
+        raise ValueError("请使用 XLS、XLSX 或 CSV 文件")
     contents = await file.read(20 * 1024 * 1024 + 1)
     if len(contents) > 20 * 1024 * 1024:
         raise ValueError("文件不能超过二十兆字节")
@@ -1057,58 +1175,46 @@ async def location_photo(
     location_code: str = Form(...),
     version: int = Form(0),
 ):
-    from PIL import Image, UnidentifiedImageError
-
-    contents = await file.read(5 * 1024 * 1024 + 1)
-    if len(contents) > 5 * 1024 * 1024:
-        raise ValueError("位置照片不能超过五兆字节")
-    try:
-        image = Image.open(io.BytesIO(contents))
-        if image.width * image.height > 20_000_000:
-            raise ValueError("照片尺寸过大")
-        image.thumbnail((1600, 1600))
-        image = image.convert("RGB")
-        buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=85)
-    except (UnidentifiedImageError, OSError) as exc:
-        raise ValueError("请选择有效照片") from exc
-
-    def execute():
-        old = conn.execute(
-            "SELECT * FROM location_details WHERE lab=? AND location_code=?",
-            (lab, location_code),
-        ).fetchone()
-        if old and old["version"] != version:
-            raise stock.Conflict("位置照片已经变化，请刷新")
-        name = uuid.uuid4().hex + ".jpg"
-        directory = PHOTO_DIR
-        directory.mkdir(mode=0o750, parents=True, exist_ok=True)
-        (directory / name).write_bytes(buffer.getvalue())
-        conn.execute(
-            "INSERT INTO location_details(lab,location_code,photo_path) VALUES (?,?,?) ON CONFLICT(lab,location_code) DO UPDATE SET photo_path=excluded.photo_path,version=location_details.version+1",
-            (lab, location_code, name),
-        )
-        return {"ok": True, "photo_url": "/api/media/" + name}
-
     with connect() as conn:
-        return mutation(
-            request,
-            conn,
-            {
-                "lab": lab,
-                "location_code": location_code,
-                "version": version,
-                "hash": hashlib.sha256(contents).hexdigest(),
-            },
-            execute,
-        )
+        conversation_id = request.headers.get("x-conversation-id")
+        if not conversation_id:
+            conversation_id = chat_session.new_conversation(conn, request.headers.get("x-device-id", ""))["conversation_id"]
+    attachment = await upload_chat_attachment(conversation_id, request, file)
+    with connect() as conn:
+        return form_preview(conn, "location_details", {"lab": lab, "location_code": location_code, "photo_attachment_id": attachment["id"]}, request, conversation_id)
 
 
 @app.get("/api/media/{name}")
 def media(name: str):
+    if __import__("re").fullmatch(r"attachment:[0-9a-f]{32}", name):
+        from .attachments import image_payload
+
+        with connect() as conn:
+            row = conn.execute("SELECT path,filename FROM chat_attachments WHERE id=?", (name[11:],)).fetchone()
+            if not row:
+                raise HTTPException(404, "照片不存在")
+            payload = image_payload(Path(row["path"]), row["filename"])
+            return Response(base64.b64decode(payload["data"]), media_type="image/jpeg")
     if not __import__("re").fullmatch(r"(?:[0-9a-f]{32}|chat-[0-9a-f]{32})\.jpg", name):
         raise HTTPException(status_code=404)
     return FileResponse(PHOTO_DIR / name, media_type="image/jpeg")
+
+
+@app.get("/api/downloads/{file_id}")
+def download(file_id: str):
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM exported_files WHERE id=?", (file_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "导出文件不存在")
+        path = Path(row["path"])
+        if not path.is_file():
+            raise HTTPException(404, "导出文件不存在")
+        content = path.read_bytes()
+        if len(content) != row["size"] or hashlib.sha256(content).hexdigest() != row["sha256"]:
+            raise HTTPException(409, "导出文件校验失败，请重新导出")
+        from urllib.parse import quote
+
+        return Response(content, media_type="application/octet-stream", headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(row["filename"]), "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

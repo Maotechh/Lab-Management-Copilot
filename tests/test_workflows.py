@@ -29,6 +29,27 @@ def db(tmp_path):
         yield conn
 
 
+def scripted_dsh(monkeypatch, db, plans):
+    """Exercise native tool callbacks without contacting a model in unit tests."""
+    from consumable_assistant import chat_runtime
+    from consumable_assistant.server import dispatch, history_rows
+
+    path = Path(db.execute("PRAGMA database_list").fetchone()[2])
+    def transport(payload):
+        while True:
+            plan = next(plans)
+            if plan is None:
+                raise chat_runtime.DSHUnavailable("测试模型暂时不可用")
+            for call in plan.get("calls", []):
+                with connect(path) as conn:
+                    result = chat_runtime.execute_tool(conn, payload["runId"], payload["callbackToken"], call["name"], call["arguments"], dispatch, history_rows)
+                if result.get("status") == "pending_confirmation":
+                    return {"runId": payload["runId"], "status": "completed", "reply": "", "preview": True}
+            if not plan.get("calls"):
+                return {"runId": payload["runId"], "status": "completed", "reply": plan["reply"]}
+    monkeypatch.setattr(chat_runtime, "run_dsh", transport)
+
+
 def make_item(
     conn, name="玻璃烧杯", quantity=100, spec="100mL", unit="个", location="A1"
 ):
@@ -84,6 +105,48 @@ def sheet(path, headers, rows):
     for row in rows:
         ws.append(row)
     wb.save(path)
+
+
+def test_exact_inventory_identity_excludes_similar_names_and_keeps_locations(db):
+    from consumable_assistant.services import search_items
+
+    first = make_item(db, name="烧杯专用A", location="A1")
+    second = make_item(db, name="烧杯专用A", location="B1")
+    make_item(db, name="烧杯专用B")
+    for query in ("烧杯专用A", "100mL烧杯专用A", "烧杯专用A100mL"):
+        assert {row["id"] for row in search_items(db, query)} == {first, second}
+    assert len(search_items(db, "烧杯")) == 3
+
+
+def test_inventory_query_reports_actual_lab_names_without_guessing(db):
+    from consumable_assistant.chat import _run_read_tool
+
+    make_item(db)
+    result = _run_read_tool(db, "unused", "inventory_search", {"query": "玻璃烧杯", "lab": "实验室A9"}, [], None)
+    assert result["rows"] == []
+    assert result["available_labs"] == ["实验室"]
+
+
+def test_inventory_query_separates_unique_lab_and_location_suffix(db):
+    from consumable_assistant.chat import _run_read_tool
+
+    item_id = make_item(db, name="玻璃烧杯", location="A1")
+    result = _run_read_tool(
+        db,
+        "unused",
+        "inventory_search",
+        {"query": "100mL玻璃烧杯", "lab": "实验室A1"},
+        [],
+        None,
+    )
+
+    assert [row["id"] for row in result["rows"]] == [item_id]
+    assert result["resolved_scope"] == {
+        "lab": "实验室",
+        "location_code": "A1",
+        "source": "exact_database_name_and_location_match",
+    }
+    assert "query_guidance" not in result
 
 
 @pytest.mark.parametrize(
@@ -322,8 +385,7 @@ def test_chat_query_result_can_create_and_confirm_a_bound_write(db, monkeypatch)
             },
         ]
     )
-    monkeypatch.setattr(chat, "infer_action", lambda _: "needs_review")
-    monkeypatch.setattr(chat, "request_json", lambda *args, **kwargs: next(plans))
+    scripted_dsh(monkeypatch, db, plans)
     response = chat.process_message(
         db,
         conversation["conversation_id"],
@@ -366,8 +428,7 @@ def test_chat_tool_rounds_reuse_prior_query_results(db, monkeypatch):
             {"reply": "结果已核对。", "calls": []},
         ]
     )
-    monkeypatch.setattr(chat, "infer_action", lambda _: None)
-    monkeypatch.setattr(chat, "request_json", lambda *args, **kwargs: next(plans))
+    scripted_dsh(monkeypatch, db, plans)
     result = chat.process_message(
         db,
         conversation["conversation_id"],
@@ -377,7 +438,7 @@ def test_chat_tool_rounds_reuse_prior_query_results(db, monkeypatch):
         lambda *args: {},
         lambda *args: [],
     )
-    assert result["reply"] == "结果已核对。"
+    assert result["reply"].startswith("以下内容来自服务器保存的查询或分析结果")
     assert db.execute("SELECT COUNT(*) FROM chat_tool_calls").fetchone()[0] == 1
 
 
@@ -404,8 +465,7 @@ def test_chat_preparation_attachment_is_committed_with_its_tool_record(db, monke
             {"reply": "已完成清單核對。", "calls": []},
         ]
     )
-    monkeypatch.setattr(chat, "infer_action", lambda _: None)
-    monkeypatch.setattr(chat, "request_json", lambda *args, **kwargs: next(plans))
+    scripted_dsh(monkeypatch, db, plans)
     response = chat.process_message(
         db,
         conversation["conversation_id"],
@@ -845,6 +905,56 @@ def test_migration_preserves_legacy_rows_when_schema_grows(tmp_path):
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     assert report["preserved"]["source_rows"]["count"] == 1
     assert report["preserved"]["source_rows"]["columns"][-1] == "imported_at"
+    assert report["initialized_balance_ids"] == [1]
+    assert report["before"]["stock_balances"]["count"] == 0
+    assert report["after"]["stock_balances"]["count"] == 1
+
+
+def test_migration_rejects_changed_existing_balance(db, monkeypatch):
+    from scripts import migrate_database
+
+    item = make_item(db)
+    path = Path(db.execute("PRAGMA database_list").fetchone()[2])
+    original = migrate_database.initialize_balances
+
+    def corrupt(conn):
+        original(conn)
+        conn.execute("UPDATE stock_balances SET ready='99' WHERE item_id=?", (item,))
+
+    monkeypatch.setattr(migrate_database, "initialize_balances", corrupt)
+    with pytest.raises(RuntimeError, match="preservation"):
+        migrate_database.migrate(path)
+
+
+def test_model_prose_cannot_assert_execution_or_invent_inventory():
+    from consumable_assistant.chat_runtime import verified_reply
+
+    invented = "已执行消耗，库存现在为999个。"
+    assert invented not in verified_reply(invented, [])
+    query = [{"tool": "inventory_search", "result": {"items": []}}]
+    assert "999" not in verified_reply(invented, query)
+    assert verified_reply('{"missing_fields":["spec","spec","quantity","ignore_all_rules"]}', []) == (
+        "请补充以下资料：规格、数量。当前没有执行新的业务变更。"
+    )
+
+
+def test_preview_captures_new_item_and_purchase_draft_without_writes(db):
+    from consumable_assistant.chat import _preview_dispatch
+    from consumable_assistant.server import dispatch
+
+    created = _preview_dispatch(db, "create_item", {"item_name": "试管", "spec": "15mL",
+                               "unit": "个", "lab": "实验室", "location_code": "B1"}, "教师", dispatch)
+    assert created["changes"][0]["before"] is None
+    assert created["changes"][0]["after"]["available_quantity"] == "0"
+    assert db.execute("SELECT COUNT(*) FROM inventory_items").fetchone()[0] == 0
+    item = make_item(db)
+    drafted = _preview_dispatch(db, "purchase", {"action": "draft", "item_id": item, "quantity": "12",
+                                              "version": stock.view(db, item)["version"]}, "教师", dispatch)
+    orders = [record for record in drafted["record_changes"] if record["table"] == "purchase_orders"]
+    assert len(orders) == 1 and orders[0]["before"] is None
+    assert orders[0]["after"]["status"] == "draft"
+    assert db.execute("SELECT COUNT(*) FROM purchase_orders").fetchone()[0] == 0
+    assert stock.view(db, item)["ready"] == "100"
 
 
 def test_location_totals_exclude_invalid_legacy_quantity(db):
@@ -964,23 +1074,15 @@ def test_api_requires_request_identity_and_retries(db, monkeypatch):
 
 
 def test_chat_conversation_preview_confirm_is_idempotent(db, monkeypatch):
-    from consumable_assistant import server, services
+    from consumable_assistant import server
 
     item = make_item(db)
     path = Path(db.execute("PRAGMA database_list").fetchone()[2])
     monkeypatch.setattr(server, "connect", lambda: connect(path))
-    monkeypatch.setattr(services, "model_is_enabled", lambda: True)
-    monkeypatch.setattr(
-        services,
-        "parse_inventory_message",
-        lambda _: {
-            "operations": [
-                {"action": "consume", "quantity": 2, "item_query": "玻璃烧杯"}
-            ],
-            "model": "test-model",
-            "provider": "test-provider",
-        },
-    )
+    scripted_dsh(monkeypatch, db, iter([
+        {"calls": [{"name": "inventory_search", "arguments": {"query": "玻璃烧杯"}}]},
+        {"calls": [{"name": "business_preview", "arguments": {"kind": "stock", "payload": {"item_id": item, "action": "consume", "quantity": "2", "unit": "个"}}}]},
+    ]))
     with TestClient(server.app) as client:
         headers = {"X-Device-ID": "chat-device"}
         created = client.post("/api/chat/conversations", headers=headers)
@@ -997,53 +1099,41 @@ def test_chat_conversation_preview_confirm_is_idempotent(db, monkeypatch):
             json=message,
         )
         assert response.status_code == 200, response.text
-        task = response.json()
-        assert task["status"] == "awaiting_details"
+        queued = response.json()
+        import time
+
+        for _ in range(100):
+            run = client.get(f"/api/chat/runs/{queued['run_id']}").json()
+            if run["status"] not in {"queued", "running"}:
+                break
+            time.sleep(0.02)
+        task = run["result"]
+        assert task["status"] == "pending_confirmation"
         assert stock.view(db, item)["ready"] == "100"
         repeated = client.post(
-            f"/api/chat/conversations/{identity['conversation_id']}/messages",
-            headers=auth,
-            json=message,
+            f"/api/chat/conversations/{identity['conversation_id']}/messages", headers=auth, json=message,
         )
-        assert repeated.json() == task
-        selected = client.post(
-            f"/api/chat/tasks/{task['task_id']}/prepare",
-            headers=auth,
-            json={
-                "plan_hash": task["plan_hash"],
-                "operations": [
-                    {
-                        "item_id": item,
-                        "version": 1,
-                        "action": "consume",
-                        "quantity": "2",
-                        "unit": "个",
-                    }
-                ]
-            },
-        )
-        assert selected.status_code == 200, selected.text
-        assert selected.json()["status"] == "pending_confirmation"
-        assert stock.view(db, item)["ready"] == "100"
+        assert repeated.json()["run_id"] == queued["run_id"]
+        assert repeated.json()["result"] == task
         confirmation = uuid.uuid4().hex
         confirmed = client.post(
             f"/api/chat/tasks/{task['task_id']}/confirm",
             headers=auth,
-            json={"request_id": confirmation, "plan_hash": selected.json()["plan_hash"]},
+            json={"request_id": confirmation, "plan_hash": task["plan_hash"]},
         )
         assert confirmed.status_code == 200, confirmed.text
         assert stock.view(db, item)["ready"] == "98"
         repeated_confirmation = client.post(
             f"/api/chat/tasks/{task['task_id']}/confirm",
             headers=auth,
-            json={"request_id": uuid.uuid4().hex, "plan_hash": selected.json()["plan_hash"]},
+            json={"request_id": uuid.uuid4().hex, "plan_hash": task["plan_hash"]},
         )
         assert repeated_confirmation.json() == confirmed.json()
         assert stock.view(db, item)["ready"] == "98"
         assert client.get(
             f"/api/chat/conversations/{identity['conversation_id']}",
-            headers={**headers, "X-Chat-Token": "invalid"},
-        ).status_code == 400
+            headers={"X-Device-ID": "another-device"},
+        ).status_code == 200
 
 
 def test_chat_rejects_confirmed_write_with_stale_version(db, monkeypatch):
@@ -1088,7 +1178,7 @@ def test_chat_rejects_confirmed_write_with_stale_version(db, monkeypatch):
     )
     operation(db, item, "consume", 1)
     task = db.execute("SELECT * FROM chat_tasks WHERE id=?", (response["task_id"],)).fetchone()
-    with pytest.raises(stock.Conflict):
+    with pytest.raises(chat.PlanChanged) as changed:
         chat.confirm_task(
             db,
             task,
@@ -1101,71 +1191,52 @@ def test_chat_rejects_confirmed_write_with_stale_version(db, monkeypatch):
         )
     assert stock.view(db, item)["ready"] == "99"
     assert db.execute("SELECT status FROM chat_tasks WHERE id=?", (response["task_id"],)).fetchone()[0] == "expired"
+    refreshed = changed.value.response
+    assert refreshed["status"] == "pending_confirmation"
+    assert refreshed["task_id"] != response["task_id"]
+    assert refreshed["previous_preview"]["changes"][0]["before"]["available_quantity"] == "100"
+    assert refreshed["preview"]["changes"][0]["before"]["available_quantity"] == "99"
+    assert refreshed["preview"]["changes"][0]["after"]["available_quantity"] == "97"
+    from consumable_assistant.server import dispatch
+
+    with pytest.raises(stock.Conflict):
+        chat.confirm_task(db, task, "Teacher", "device", uuid.uuid4().hex, dispatch)
+    replacement = db.execute("SELECT * FROM chat_tasks WHERE id=?", (refreshed["task_id"],)).fetchone()
+    result = chat.confirm_task(db, replacement, "Another teacher", "phone", uuid.uuid4().hex, dispatch,
+                               expected_plan_hash=refreshed["plan_hash"])
+    assert stock.view(db, item)["ready"] == "97"
+    assert chat.confirm_task(db, replacement, "Teacher", "device", uuid.uuid4().hex, dispatch,
+                             expected_plan_hash=refreshed["plan_hash"]) == result
+    assert stock.view(db, item)["ready"] == "97"
 
 
-def test_ai_provider_fallback_uses_school_glm(monkeypatch):
-    import httpx
-
+def test_unverified_fallback_cannot_be_called(monkeypatch):
     from consumable_assistant import genai
 
-    calls = []
-    monkeypatch.setattr(genai, "GENAI_API_KEY", "test-key")
     monkeypatch.setattr(genai, "GENAI_MODEL", "deepseek-pro")
-    monkeypatch.setattr(genai, "GENAI_MODE", "openai")
     monkeypatch.setattr(genai, "GENAI_BASE_URL", "http://primary.test/v1")
     monkeypatch.setenv("GENAI_FALLBACK_MODELS", "")
     monkeypatch.setenv(
         "GENAI_FALLBACK_PROVIDERS_JSON",
         '[{"name":"GLM test","model":"glm-chat","base_url":"http://glm.test/v1"}]',
     )
-
-    class Client:
-        def __init__(self, **kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return None
-
-        def post(self, url, **kwargs):
-            calls.append(url)
-            if "primary.test" in url:
-                raise httpx.ConnectTimeout("primary unavailable")
-            return httpx.Response(
-                200,
-                json={"choices":[{"message":{"content":"{\"operations\":[{\"action\":\"consume\",\"quantity\":2}]}"}}]},
-                request=httpx.Request("POST", url),
-            )
-
-    monkeypatch.setattr(genai.httpx, "Client", Client)
-    monkeypatch.setattr(genai, "record_provider_check", lambda *args: None)
-    monkeypatch.setattr(genai, "record_health", lambda *args: None)
-    result = genai.parse_inventory_message("玻璃烧杯消耗2个")
-    assert result["provider"] == "GLM test"
-    assert result["model"] == "glm-chat"
-    assert len(calls) == 2
+    monkeypatch.setattr(genai.httpx, "Client", lambda **kwargs: pytest.fail("An unverified provider was contacted"))
+    with pytest.raises(genai.AIUnavailable, match="备用模型"):
+        genai.parse_inventory_message("玻璃烧杯消耗2个")
 
 
-def test_school_fallbacks_work_without_primary_key(monkeypatch):
+def test_no_implicit_alternative_models(monkeypatch):
     from consumable_assistant import genai
 
     monkeypatch.setattr(genai, "GENAI_API_KEY", "")
     monkeypatch.setattr(genai, "GENAI_BASE_URL", "")
     monkeypatch.setenv("GENAI_FALLBACK_MODELS", "")
     monkeypatch.delenv("GENAI_FALLBACK_PROVIDERS_JSON", raising=False)
-    providers = genai.provider_entries()
-    assert [provider["model"] for provider in providers] == [
-        "qwen-instruct",
-        "glm-chat",
-        "deepseek-pro",
-        "kimi",
-    ]
-    assert genai.model_is_enabled()
+    assert genai.provider_entries() == []
+    assert not genai.model_is_enabled()
 
 
-def test_deployment_accepts_school_model_fallbacks_without_primary_key(tmp_path):
+def test_deployment_uses_only_qualified_school_deepseek_without_primary_key(tmp_path):
     from scripts.configure_environment import configure
 
     path = tmp_path / "environment"
@@ -1176,7 +1247,52 @@ def test_deployment_accepts_school_model_fallbacks_without_primary_key(tmp_path)
     configure(path)
     configured = path.read_text(encoding="utf-8")
     assert "GENAI_REQUIRED=1" in configured
-    assert "GENAI_API_KEY" not in configured
+    assert "GENAI_API_KEY=\n" in configured
+    assert "GENAI_MODE=responses\n" in configured
+    assert "GENAI_BASE_URL=http://10.15.171.204:30969/v1" in configured
+    assert "GENAI_FALLBACK_PROVIDERS_JSON=[]" in configured
+    assert "PUBLIC_BASE_URL=https://10.15.21.115" in configured
+
+
+def test_inventory_parser_uses_school_responses_without_credentials(monkeypatch):
+    import json
+
+    import httpx
+
+    from consumable_assistant import genai
+
+    requests = []
+
+    def endpoint(request):
+        requests.append(request)
+        payload = json.loads(request.content)
+        assert request.url == "http://school.test/v1/responses"
+        assert "authorization" not in request.headers
+        assert payload["reasoning"] == {"effort": "high"}
+        assert payload["max_output_tokens"] == 65536
+        assert payload["stream"] is False and payload["store"] is False
+        assert "temperature" not in payload
+        return httpx.Response(200, json={
+            "model": "deepseek-pro", "status": "completed",
+            "output": [{"type": "reasoning", "summary": []}, {
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": '{"operations":[{"action":"inbound","quantity":1}]}'}],
+            }],
+        })
+
+    client_type = httpx.Client
+    monkeypatch.setattr(genai.httpx, "Client", lambda **kwargs: client_type(transport=httpx.MockTransport(endpoint), **kwargs))
+    monkeypatch.setattr(genai, "GENAI_API_KEY", "")
+    monkeypatch.setattr(genai, "GENAI_BASE_URL", "http://school.test/v1")
+    monkeypatch.setattr(genai, "GENAI_MODE", "responses")
+    monkeypatch.setattr(genai, "GENAI_MODEL", "deepseek-pro")
+    monkeypatch.setattr(genai, "GENAI_MAX_OUTPUT_TOKENS", 65536)
+    monkeypatch.setenv("GENAI_FALLBACK_PROVIDERS_JSON", "[]")
+    monkeypatch.setenv("GENAI_FALLBACK_MODELS", "")
+    monkeypatch.setattr(genai, "record_health", lambda *args: None)
+    monkeypatch.setattr(genai, "record_provider_check", lambda *args: None)
+    assert genai.parse_inventory_message("100mL烧杯实际入库1个")["operations"] == [{"action": "inbound", "quantity": 1}]
+    assert len(requests) == 1
 
 
 def test_chat_retries_saved_message_after_ai_outage(db, monkeypatch):
@@ -1189,7 +1305,7 @@ def test_chat_retries_saved_message_after_ai_outage(db, monkeypatch):
             {"reply": "已查询当前校内记录。", "calls": [], "_provider": "Qwen"},
         ]
     )
-    monkeypatch.setattr(chat, "request_json", lambda *args, **kwargs: next(replies))
+    scripted_dsh(monkeypatch, db, replies)
     request = chat.ChatMessageRequest(message_id=uuid.uuid4().hex, text="有哪些烧杯")
 
     first = chat.process_message(
@@ -1201,8 +1317,10 @@ def test_chat_retries_saved_message_after_ai_outage(db, monkeypatch):
         lambda *args: {},
         lambda *args: [],
     )
-    assert first["status"] == "ai_unavailable"
+    assert first["status"] == "failed"
 
+    assert chat.process_message(db, conversation["conversation_id"], request, "Teacher", "device", lambda *args: {}, lambda *args: []) == first
+    request = request.model_copy(update={"message_id": uuid.uuid4().hex, "text": "继续查询烧杯"})
     second = chat.process_message(
         db,
         conversation["conversation_id"],
@@ -1223,9 +1341,7 @@ def test_chat_rejects_reused_message_id_with_different_content(db, monkeypatch):
     from consumable_assistant import chat
 
     conversation = chat.new_conversation(db, "device")
-    monkeypatch.setattr(
-        chat, "request_json", lambda *args, **kwargs: {"reply": "已查询", "calls": []}
-    )
+    scripted_dsh(monkeypatch, db, iter([{"reply": "已查询", "calls": []}]))
     message_id = uuid.uuid4().hex
     first = chat.process_message(
         db,
@@ -1254,7 +1370,7 @@ def test_chat_rejects_reused_message_id_with_different_content(db, monkeypatch):
 
 
 def test_chat_serializes_concurrent_messages_per_conversation(db, monkeypatch):
-    from consumable_assistant import chat
+    from consumable_assistant import chat, chat_runtime
 
     conversation = chat.new_conversation(db, "device")
     model_started = threading.Event()
@@ -1263,9 +1379,9 @@ def test_chat_serializes_concurrent_messages_per_conversation(db, monkeypatch):
     def fake_model(*args, **kwargs):
         model_started.set()
         assert release_model.wait(timeout=5)
-        return {"reply": "已查询", "calls": []}
+        return {"reply": "已查询", "status": "completed"}
 
-    monkeypatch.setattr(chat, "request_json", fake_model)
+    monkeypatch.setattr(chat_runtime, "run_dsh", fake_model)
     first_result = []
     database_path = Path(db.execute("PRAGMA database_list").fetchone()[2])
 
@@ -1287,20 +1403,20 @@ def test_chat_serializes_concurrent_messages_per_conversation(db, monkeypatch):
     thread.start()
     assert model_started.wait(timeout=5)
     with connect(database_path) as conn:
-        with pytest.raises(stock.Conflict):
-            chat.process_message(
-                conn,
-                conversation["conversation_id"],
-                chat.ChatMessageRequest(message_id=uuid.uuid4().hex, text="查询量筒"),
-                "Teacher",
-                "device",
-                lambda *args: {},
-                lambda *args: [],
-            )
+        second = chat.process_message(
+            conn, conversation["conversation_id"],
+            chat.ChatMessageRequest(message_id=uuid.uuid4().hex, text="查询量筒"),
+            "Teacher", "another-device", lambda *args: {}, lambda *args: [],
+        )
+        assert second["status"] == "queued"
+        assert chat_runtime.claim(conn, second["run_id"]) is None
     release_model.set()
     thread.join(timeout=5)
     assert not thread.is_alive()
     assert first_result[0]["status"] == "answered"
+    claimed = chat_runtime.claim(db, second["run_id"])
+    assert claimed is not None
+    assert claimed["device_id"] == "another-device"
     assert db.execute(
         "SELECT COUNT(*) FROM chat_tasks WHERE conversation_id=? "
         "AND status IN ('awaiting_details','pending_confirmation','executing')",
@@ -1401,7 +1517,7 @@ def test_source_import_retains_duplicate_rows_and_actual_sheet_name(db, tmp_path
     assert db.execute(
         "SELECT quantity FROM inventory_items WHERE item_name='重复烧杯'"
     ).fetchone()[0] == 10
-def test_ai_retries_and_auth_failure(monkeypatch):
+def test_ai_retries_only_the_qualified_provider(monkeypatch):
     import httpx
 
     from consumable_assistant import genai
@@ -1420,7 +1536,7 @@ def test_ai_retries_and_auth_failure(monkeypatch):
 
         def post(self, url, **kwargs):
             calls.append(url)
-            if len(calls) < 3:
+            if len(calls) < 2:
                 raise httpx.ConnectTimeout("timeout")
             return httpx.Response(
                 200,
@@ -1440,17 +1556,13 @@ def test_ai_retries_and_auth_failure(monkeypatch):
     monkeypatch.setattr(genai, "GENAI_API_KEY", "test-key")
     monkeypatch.setattr(genai, "GENAI_BASE_URL", "http://primary.test/v1")
     monkeypatch.setattr(genai, "GENAI_MODE", "openai")
-    monkeypatch.setenv(
-        "GENAI_FALLBACK_PROVIDERS_JSON",
-        '[{"name":"fallback-a","model":"glm-chat","base_url":"http://fallback-a.test/v1"},'
-        '{"name":"fallback-b","model":"qwen-instruct","base_url":"http://fallback-b.test/v1"}]',
-    )
+    monkeypatch.setenv("GENAI_FALLBACK_PROVIDERS_JSON", "[]")
     monkeypatch.setattr(genai.httpx, "Client", Client)
     monkeypatch.setattr(genai.time, "sleep", lambda _: None)
     monkeypatch.setattr(genai, "record_health", lambda *args: None)
     monkeypatch.setattr(genai, "record_provider_check", lambda *args: None)
     assert genai.parse_inventory_message("test")["operations"][0]["quantity"] == 1
-    assert len(calls) == 3
+    assert len(calls) == 2
 
 
 def test_purchase_receipt_cannot_bypass_order_history(db):
@@ -1715,3 +1827,182 @@ def test_notification_retry_expiry_and_generic_payload(db, monkeypatch):
     assert (
         set(payload) == {"title", "body", "url"} and "玻璃烧杯" not in captured["data"]
     )
+
+
+def preparation_data(ids, **extra):
+    return {"name": "容量测量", "course": "化学实验", "venue": "实验室",
+            "starts_at": "2026-12-01T08:00:00+08:00", "ends_at": "2026-12-01T12:00:00+08:00",
+            "people": 5, "group_size": 2,
+            "lines": [{"item_ids": ids, "action": "borrow", "per_group": "2", "spare": "1"}],
+            **extra}
+
+
+def test_preparation_partial_stock_draft_and_explicit_replenish(db):
+    from consumable_assistant.chat import _fill_versions
+    from consumable_assistant.preparations import view
+
+    first = make_item(db, quantity=2)
+    second = make_item(db, quantity=3, location="B1")
+    result = write(db, "preparation", _fill_versions(db, "preparation", preparation_data([first, second])))
+    assert result["lines"][0]["required_quantity"] == "7"
+    assert result["lines"][0]["reserved_quantity"] == "5"
+    assert result["lines"][0]["unmet_quantity"] == "2"
+    draft_id = result["purchase_draft_ids"][0]
+    draft = db.execute("SELECT * FROM purchase_orders WHERE id=?", (draft_id,)).fetchone()
+    assert draft["status"] == "draft"
+    assert stock.view(db, first)["ready_quantity"] == "2"
+    with pytest.raises(ValueError, match="草案"):
+        write(db, "purchase", _fill_versions(db, "purchase", {"action": "receive", "order_id": draft_id, "quantity": "2"}))
+    write(db, "purchase", _fill_versions(db, "purchase", {"action": "place", "order_id": draft_id, "owner": "教师",
+                                                        "expected_at": "2026-11-30T12:00:00+08:00"}))
+    write(db, "purchase", _fill_versions(db, "purchase", {"action": "receive", "order_id": draft_id, "quantity": "1"}))
+    assert view(db, result["id"])["lines"][0]["unmet_quantity"] == "2"
+    assert stock.view(db, first)["reserved_quantity"] == "2"
+    updated = write(db, "preparation_update", _fill_versions(db, "preparation_update", {
+        "preparation_id": result["id"], "action": "replenish", "note": "部分到货后补充预留"}))
+    assert updated["lines"][0]["unmet_quantity"] == "1"
+    assert len(updated["schedules"]) == 2
+    assert stock.view(db, first)["reserved_quantity"] == "3"
+    cancelled = write(db, "preparation_update", _fill_versions(db, "preparation_update", {
+        "preparation_id": result["id"], "action": "cancel", "note": "课程取消"}))
+    assert cancelled["status"] == "cancelled"
+    assert stock.view(db, first)["reserved_quantity"] == "0"
+    assert db.execute("SELECT status FROM purchase_orders WHERE id=?", (draft_id,)).fetchone()[0] == "ordered"
+
+
+def test_preparation_repeated_decimal_demands_and_review_stock(db):
+    from consumable_assistant.chat import _fill_versions
+
+    item = make_item(db, quantity="0.3", unit="L")
+    pending = make_item(db, quantity=20, unit="L", location="B2")
+    db.execute("UPDATE stock_balances SET review_reason='待清点' WHERE item_id=?", (pending,))
+    db.commit()
+    lines = [{"item_ids": [item, pending], "action": action, "quantity": "0.2"}
+             for action in ("borrow", "consume")]
+    result = write(db, "preparation", _fill_versions(db, "preparation", preparation_data([item], lines=lines)))
+    assert [line["reserved_quantity"] for line in result["lines"]] == ["0.2", "0.1"]
+    assert [line["unmet_quantity"] for line in result["lines"]] == ["0", "0.1"]
+    assert result["lines"][0]["locations"][1]["available_quantity"] == "0"
+    assert stock.view(db, item)["reserved_quantity"] == "0.3"
+
+
+def test_mixed_plan_rolls_back_all_steps(db):
+    from consumable_assistant.chat import _fill_versions
+
+    item = make_item(db, quantity=10)
+    payload = _fill_versions(db, "mixed", {"operations": [
+        {"kind": "stock", "payload": {"item_id": item, "action": "consume", "quantity": "4"}},
+        {"kind": "stock", "payload": {"item_id": item, "action": "consume", "quantity": "7"}},
+    ]})
+    with pytest.raises(ValueError):
+        write(db, "mixed", payload)
+    assert stock.view(db, item)["ready_quantity"] == "10"
+    assert db.execute("SELECT count(*) FROM stock_events").fetchone()[0] == 0
+
+
+def test_preparation_revision_preserves_history_and_releases_old_stock(db):
+    from consumable_assistant.chat import _fill_versions
+
+    item = make_item(db, quantity=5)
+    original = write(db, "preparation", _fill_versions(db, "preparation", preparation_data([item])))
+    old_order = original["purchase_draft_ids"][0]
+    write(db, "purchase", _fill_versions(db, "purchase", {"action": "place", "order_id": old_order,
+          "owner": "采购教师", "expected_at": "2026-11-30T12:00:00+08:00"}))
+    revised = write(db, "preparation_update", _fill_versions(db, "preparation_update", {
+        "preparation_id": original["id"], "action": "revise", "people": 3, "note": "人数改为三人"}))
+    assert revised["lines"][0]["required_quantity"] == "5"
+    assert revised["lines"][0]["reserved_quantity"] == "5"
+    assert revised["schedules"][0]["status"] == "cancelled"
+    assert revised["schedules"][0]["retired"] == 1
+    assert revised["purchases"][0]["status"] == "ordered"
+    assert stock.view(db, item)["reserved_quantity"] == "5"
+    assert db.execute("SELECT count(*) FROM preparation_revisions").fetchone()[0] == 1
+    replenished = write(db, "preparation_update", _fill_versions(db, "preparation_update", {
+        "preparation_id": original["id"], "action": "replenish", "note": "检查准备结果"}))
+    assert replenished["lines"][0]["unmet_quantity"] == "0"
+    assert len(replenished["schedules"]) == 2
+    write(db, "execute_schedule", _fill_versions(db, "execute_schedule", {
+        "schedule_id": revised["schedules"][1]["id"], "borrower": "实验教师"}))
+    with pytest.raises(ValueError, match="实际取用"):
+        write(db, "preparation_update", _fill_versions(db, "preparation_update", {
+            "preparation_id": original["id"], "action": "revise", "people": 1, "note": "修改人数"}))
+    assert stock.view(db, item)["borrowed_quantity"] == "5"
+
+
+def test_preparation_revision_preserves_original_calculation_units(db):
+    from consumable_assistant.chat import _fill_versions
+
+    item = make_item(db, quantity=2, unit="盒", spec="50片/盒")
+    write(db, "metadata", {"item_id": item, "version": 1, "conversions": {"片": "0.02"}})
+    payload = preparation_data([item], people=10, lines=[{"item_ids": [item], "action": "consume",
+                                                      "per_person": "1", "unit": "片"}])
+    original = write(db, "preparation", _fill_versions(db, "preparation", payload))
+    assert original["lines"][0]["required_quantity"] == "0.2"
+    revised = write(db, "preparation_update", _fill_versions(db, "preparation_update", {
+        "preparation_id": original["id"], "action": "revise", "people": 20, "note": "增加人数"}))
+    assert revised["lines"][0]["required_quantity"] == "0.4"
+    assert stock.view(db, item)["reserved_quantity"] == "0.4"
+
+
+def test_form_preview_cross_device_confirmation_and_retry(db, monkeypatch):
+    from urllib.parse import quote
+
+    from consumable_assistant import server
+
+    item = make_item(db)
+    path = Path(db.execute("PRAGMA database_list").fetchone()[2])
+    monkeypatch.setattr(server, "connect", lambda: connect(path))
+    headers = {"X-Request-ID": uuid.uuid4().hex, "X-Actor": quote("发起教师"), "X-Device-ID": "desktop"}
+    payload = {"item_id": item, "action": "consume", "quantity": "2"}
+    with TestClient(server.app) as client:
+        response = client.post("/api/actions/stock", json=payload, headers=headers)
+        assert response.status_code == 200, response.text
+        preview = response.json()
+        assert preview["status"] == "pending_confirmation"
+        assert stock.view(db, item)["ready"] == "100"
+        confirm = client.post(f"/api/chat/tasks/{preview['task_id']}/confirm",
+                             headers={"X-Actor": quote("确认教师"), "X-Device-ID": "phone"},
+                             json={"request_id": uuid.uuid4().hex, "plan_hash": preview["plan_hash"]})
+        assert confirm.status_code == 200, confirm.text
+        assert stock.view(db, item)["ready"] == "98"
+        retry = client.post("/api/actions/stock", json=payload, headers=headers).json()
+        assert retry["status"] == "completed"
+        assert retry["result"] == confirm.json()["result"]
+        task = db.execute("SELECT * FROM chat_tasks WHERE id=?", (preview["task_id"],)).fetchone()
+        assert (task["initiator"], task["confirmer"], task["confirm_device"]) == ("发起教师", "确认教师", "phone")
+
+
+@pytest.mark.parametrize('kind', ['template', 'location_details'])
+def test_nonstock_plan_refreshes_changed_records_without_execution(db, kind):
+    from consumable_assistant import chat
+    from consumable_assistant.server import dispatch
+
+    item = make_item(db)
+    conversation = chat.new_conversation(db, 'desktop')['conversation_id']
+    message_id = db.execute("INSERT INTO chat_messages(conversation_id,request_id,role,content) VALUES (?,?,'user','修改资料')", (conversation, uuid.uuid4().hex)).lastrowid
+    if kind == 'template':
+        template = dispatch(db, kind, {'name': '原模板', 'course': '化学', 'lines': [{'item_id': item, 'action': 'consume', 'fixed': '1'}]}, 'Teacher')['id']
+        payload = {'template_id': template, 'name': '修改后模板', 'course': '化学', 'lines': [{'item_id': item, 'action': 'consume', 'fixed': '2'}]}
+    else:
+        dispatch(db, kind, {'lab': '实验室', 'location_code': 'A1', 'description': '原说明'}, 'Teacher')
+        payload = {'lab': '实验室', 'location_code': 'A1', 'description': '修改后说明'}
+    db.commit()
+    preview = chat._business_task(db, conversation, message_id, uuid.uuid4().hex, {'kind': kind, 'payload': payload}, [], dispatch, 'Teacher', validate_references=False)
+    db.commit()
+    if kind == 'template':
+        db.execute("UPDATE lesson_templates SET name='另一教师修改',version=version+1 WHERE id=?", (template,))
+    else:
+        db.execute("UPDATE location_details SET description='另一教师修改',version=version+1 WHERE lab='实验室' AND location_code='A1'")
+    db.commit()
+    task = db.execute('SELECT * FROM chat_tasks WHERE id=?', (preview['task_id'],)).fetchone()
+    with pytest.raises(chat.PlanChanged) as changed:
+        chat.confirm_task(db, task, 'Another teacher', 'phone', uuid.uuid4().hex, dispatch, expected_plan_hash=preview['plan_hash'])
+    result = changed.value.response
+    assert result['status'] == 'pending_confirmation'
+    assert result['task_id'] != preview['task_id']
+    assert result['previous_preview'] == preview['preview']
+    assert stock.view(db, item)['ready'] == '100'
+    if kind == 'template':
+        assert db.execute('SELECT name FROM lesson_templates WHERE id=?', (template,)).fetchone()[0] == '另一教师修改'
+    else:
+        assert db.execute("SELECT description FROM location_details WHERE lab='实验室' AND location_code='A1'").fetchone()[0] == '另一教师修改'

@@ -1,0 +1,33 @@
+[Unit]
+Description=Restricted campus laboratory DSH and official local SenseVoice
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=lab-dsh
+Group=lab-dsh
+WorkingDirectory=/opt/lab-management/current
+Environment=HOME=/var/lib/lab-dsh
+Environment=DSH_HOME=/run/lab-dsh
+Environment=DSH_TELEMETRY_DISABLED=1
+Environment=LAB_DSH_STATE=/var/lib/lab-dsh
+EnvironmentFile=/etc/lab-dsh/environment
+RuntimeDirectory=lab-dsh
+RuntimeDirectoryMode=0750
+ExecStartPre=/opt/lab-management/current/.venv/bin/python /opt/lab-management/current/scripts/prepare_dsh_profile.py /opt/lab-management/current
+ExecStart=/opt/lab-management/current/runtime/node/bin/node /opt/lab-management/current/runtime/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js --profile lab
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=75
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/lab-dsh /run/lab-dsh
+InaccessiblePaths=-/var/lib/lab-management -/etc/lab-management -/etc/lab-management-tls -/var/backups/lab-management -/var/lib/lab-analysis -/etc/lab-analysis
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

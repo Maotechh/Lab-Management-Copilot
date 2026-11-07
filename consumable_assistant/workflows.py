@@ -10,7 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from . import ledger as stock
-from .importer import add_aliases, read_inventory_sheet
+from .importer import add_aliases
 from .normalization import normalize_text, stable_key
 
 
@@ -217,7 +217,9 @@ def preview_import(
 
     if mode not in ("add", "overwrite"):
         raise ValueError("上传方式无效")
-    df = read_inventory_sheet(path).dropna(how="all")
+    from .attachments import uploaded_frame
+
+    df = uploaded_frame(path).dropna(how="all")
     df.columns = [str(col).strip() for col in df.columns]
     rows, errors, seen = [], [], set()
     for index, row in df.iterrows():
@@ -242,7 +244,7 @@ def preview_import(
             mapped.update(
                 {
                     "row_number": int(index) + 2,
-                    "source_sheet": df.attrs.get("source_sheet", ""),
+                    **df.attrs["sources"][int(index)],
                     "duplicate_row": signature in seen,
                     "item_id": old["id"] if old else None,
                     "version": balance["version"] if balance else None,
@@ -538,9 +540,10 @@ def remap_preparation(conn: sqlite3.Connection, data: dict) -> dict:
 def preparation(
     conn: sqlite3.Connection, path: Path, course: str = "", commit: bool = True
 ) -> dict:
+    from .attachments import uploaded_frame
     from .services import resolve_column
 
-    df = read_inventory_sheet(path).dropna(how="all")
+    df = uploaded_frame(path).dropna(how="all")
     df.columns = [str(col).strip() for col in df.columns]
     alternatives = {
         "name": ["耗材名称", "名称", "物品", "耗材"],
@@ -572,6 +575,7 @@ def preparation(
         row.update(
             {
                 "row_number": int(index) + 2,
+                **df.attrs["sources"][int(index)],
                 "course": row["course"] or course or "未命名课程",
                 "experiment": row["experiment"] or "未命名实验",
                 "required_quantity": stock.text(amount),
@@ -787,7 +791,7 @@ def execute_schedule(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
 
 def purchase(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
     action = data.get("action", "order")
-    if action == "order":
+    if action in {"order", "draft"}:
         item = stock.ensure_balance(conn, int(data["item_id"]))
         stock.check_version(item, data.get("version"))
         amount = stock.convert(item, data.get("quantity"), data.get("unit"))
@@ -795,20 +799,21 @@ def purchase(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
             raise ValueError("订购数量必须大于零")
         order_id = int(
             conn.execute(
-                "INSERT INTO purchase_orders(item_id,quantity,actor,expected_at,note) VALUES (?,?,?,?,?)",
+                "INSERT INTO purchase_orders(item_id,quantity,actor,expected_at,note,status) VALUES (?,?,?,?,?,?)",
                 (
                     item["item_id"],
                     stock.text(amount),
-                    stock.required(data, "owner"),
-                    stock.moment(stock.required(data, "expected_at")),
+                    str(data.get("owner") or actor) if action == "draft" else stock.required(data, "owner"),
+                    "" if action == "draft" else stock.moment(stock.required(data, "expected_at")),
                     data.get("note"),
+                    "draft" if action == "draft" else "ordered",
                 ),
             ).lastrowid
         )
         stock.event(
             conn,
             item["item_id"],
-            "purchase_order",
+            "purchase_draft" if action == "draft" else "purchase_order",
             {},
             actor,
             str(data.get("note") or ""),
@@ -820,11 +825,16 @@ def purchase(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
     ).fetchone()
     if (
         not order
-        or order["status"] != "ordered"
+            or order["status"] not in {"ordered", "draft"}
         or int(data.get("order_version", 0)) != order["version"]
     ):
         raise stock.Conflict("采购记录已经变化或已完成")
-    if action == "cancel":
+    if action == "place":
+        if order["status"] != "draft":
+            raise stock.Conflict("此采购草案已经变化")
+        conn.execute("UPDATE purchase_orders SET status='ordered',actor=?,expected_at=?,version=version+1 WHERE id=?", (stock.required(data, "owner"), stock.moment(stock.required(data, "expected_at")), order["id"]))
+        stock.event(conn, order["item_id"], "purchase_order", {}, actor, str(data.get("note") or ""), order["id"])
+    elif action == "cancel":
         conn.execute(
             "UPDATE purchase_orders SET status='cancelled',version=version+1 WHERE id=?",
             (order["id"],),
@@ -839,6 +849,8 @@ def purchase(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
             order["id"],
         )
     elif action == "receive":
+        if order["status"] != "ordered":
+            raise ValueError("采购草案需要先登记订购，才能登记到货")
         item = stock.ensure_balance(conn, order["item_id"])
         stock.check_version(item, data.get("version"))
         amount = stock.convert(item, data.get("quantity"), data.get("unit"))

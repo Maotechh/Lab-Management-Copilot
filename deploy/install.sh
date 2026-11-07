@@ -2,84 +2,131 @@
 set -Eeuo pipefail
 umask 0027
 
-if [[ "$EUID" -ne 0 ]]; then
-    printf 'Run this installer as root.\n' >&2
-    exit 1
-fi
-
+[[ "$EUID" -eq 0 ]] || { printf 'Run this installer as root.\n' >&2; exit 1; }
 release_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 app_root=/opt/lab-management
 state_dir=/var/lib/lab-management
 service_user=lab-management
-database="$state_dir/consumables.db"
-release_backup="/var/backups/lab-management/release-$(date -u +%Y%m%dT%H%M%SZ)"
+release_backup="/var/backups/lab-management/release-$(date -u +%Y%m%dT%H%M%S.%NZ)"
 previous_release="$(readlink -f "$app_root/current" || true)"
 changed=0
 paused=0
 
-if [[ "$release_dir" != "$app_root"/releases/* ]]; then
-    printf 'Extract the release into %s/releases/<release-id> first.\n' "$app_root" >&2
-    exit 1
-fi
-if [[ -e "$app_root/current" && ! -L "$app_root/current" ]]; then
-    printf 'The current release must be a symbolic link.\n' >&2
-    exit 1
-fi
+[[ "$release_dir" == "$app_root"/releases/* ]] || { printf 'Extract the release beneath %s/releases first.\n' "$app_root" >&2; exit 1; }
+[[ ! -e "$app_root/current" || -L "$app_root/current" ]] || { printf 'The current release must be a symbolic link.\n' >&2; exit 1; }
+for executable in python3 nginx openssl podman newuidmap newgidmap loginctl curl flock; do
+    command -v "$executable" >/dev/null || { printf 'Missing required dependency: %s\n' "$executable" >&2; exit 1; }
+done
+python3 "$release_dir/scripts/release_manifest.py" verify --root "$release_dir"
+for name in server.crt server.key lab-root-ca.crt; do
+    [[ -f "/etc/lab-management-tls/$name" ]] || { printf 'Install the verified IP-SAN TLS file first: %s\n' "$name" >&2; exit 1; }
+done
+openssl verify -CAfile /etc/lab-management-tls/lab-root-ca.crt -verify_ip 10.15.21.115 /etc/lab-management-tls/server.crt
+openssl x509 -in /etc/lab-management-tls/server.crt -checkend 604800 -noout
+cmp <(openssl x509 -in /etc/lab-management-tls/server.crt -pubkey -noout) <(openssl pkey -in /etc/lab-management-tls/server.key -pubout)
+
 chown -hR root:root "$release_dir"
 if ! id "$service_user" >/dev/null 2>&1; then
     useradd --system --home-dir "$state_dir" --shell /usr/sbin/nologin "$service_user"
 fi
 install -d -m 0750 -o "$service_user" -g "$service_user" "$state_dir"
 install -d -m 0750 -o root -g "$service_user" /etc/lab-management /etc/lab-management/push
-install -d -m 0700 /var/backups/lab-management "$release_backup"
-if [[ ! -f "$database" ]]; then
-    install -m 0640 -o "$service_user" -g "$service_user" "$release_dir/bootstrap/consumables.db" "$database"
+install -d -m 0700 /var/backups/lab-management
+if [[ ! -f "$state_dir/consumables.db" ]]; then
+    install -m 0640 -o "$service_user" -g "$service_user" "$release_dir/bootstrap/consumables.db" "$state_dir/consumables.db"
 fi
 if [[ ! -f /etc/lab-management/environment ]]; then
     install -m 0640 -o root -g "$service_user" "$release_dir/bootstrap/environment" /etc/lab-management/environment
 fi
-if [[ ! -e "$release_dir/data" ]]; then ln -s "$state_dir" "$release_dir/data"; fi
+[[ -e "$release_dir/data" ]] || ln -s "$state_dir" "$release_dir/data"
 python3 -m venv "$release_dir/.venv"
 python_bin="$release_dir/.venv/bin/python"
 "$python_bin" -m pip install -r "$release_dir/requirements.txt"
 "$python_bin" -m pip freeze > "$release_dir/installed-requirements.txt"
 chown -hR root:"$service_user" "$release_dir"
 chmod -R g+rX "$release_dir"
-
-saved_paths=()
-for path in /etc/systemd/system/consumable-{assistant,notifications,backup}.{service,timer} /etc/nginx/sites-available/lab-management /etc/lab-management/environment; do
-    if [[ -f "$path" ]]; then saved_paths+=("${path#/}"); fi
-done
-tar -C / -czf "$release_backup/configuration.tar.gz" "${saved_paths[@]}"
+chmod 0755 "$release_dir" "$release_dir/runtime" "$release_dir/.venv" "$release_dir/.venv/bin"
+# The two isolated users can read code, never the application's state or settings.
+chmod -R o+rX "$release_dir/consumable_assistant" "$release_dir/scripts" "$release_dir/runtime" "$release_dir/.venv"
 
 rollback() {
     local result=$?
     trap - ERR
     if [[ "$changed" == 1 ]]; then
-        systemctl stop consumable-notifications consumable-assistant consumable-backup.timer || true
-        "$python_bin" "$release_dir/scripts/restore_database.py" --snapshot "$release_backup/database.db" --database "$database" --services-stopped
-        tar -C / -xzf "$release_backup/configuration.tar.gz"
-        if [[ -n "$previous_release" && -d "$previous_release" ]]; then
-            ln -sfn "$previous_release" "$app_root/current.next"
-            mv -Tf "$app_root/current.next" "$app_root/current"
-        fi
-        systemctl daemon-reload
-        systemctl restart consumable-assistant || true
-        if tar -tzf "$release_backup/configuration.tar.gz" | grep -q 'consumable-notifications.service'; then
-            systemctl restart consumable-notifications || true
-            systemctl restart consumable-backup.timer || true
-        else
-            systemctl disable consumable-notifications consumable-backup.timer || true
-        fi
-        nginx -t && systemctl reload-or-restart nginx || true
-        printf 'Release failed. Previous code and database were restored from %s.\n' "$release_backup" >&2
+        systemctl stop consumable-notifications consumable-assistant consumable-dsh consumable-analysis || true
+        flock -u 9 || true
+        "$python_bin" "$release_dir/scripts/consistent_backup.py" restore --snapshot "$release_backup" || {
+            printf 'Automatic restoration failed. Keep all writers stopped. Verified snapshot: %s\n' "$release_backup" >&2
+            exit "$result"
+        }
+        printf 'Previous code, inventory, conversations, files and settings restored from %s.\n' "$release_backup" >&2
     elif [[ "$paused" == 1 ]]; then
-        systemctl start consumable-assistant || true
-        systemctl start consumable-notifications consumable-backup.timer || true
+        if [[ -n "$previous_release" ]]; then
+            systemctl start consumable-assistant consumable-notifications || true
+        fi
     fi
+    systemctl start consumable-backup.timer || true
     exit "$result"
 }
 trap rollback ERR
+
+# Finish any previous backup before pausing its schedule and all durable writers.
+systemctl stop consumable-backup.timer || true
+while systemctl is-active --quiet consumable-backup.service; do sleep 1; done
+paused=1
+"$python_bin" "$release_dir/scripts/consistent_backup.py" create --snapshot "$release_backup" --leave-stopped
+exec 9>/run/lab-management-release.lock
+flock -n 9
+changed=1
+
+candidate_dir="$release_backup/migration-candidate"
+install -d -m 0700 "$candidate_dir"
+cp "$state_dir/consumables.db" "$candidate_dir/consumables.db"
+"$python_bin" "$release_dir/scripts/migrate_database.py" --database "$candidate_dir/consumables.db" --report "$release_backup/migration-candidate.json" > "$release_backup/migration-candidate-summary.json"
+# Rehearse extraction and restoration into an isolated directory before migration.
+"$python_bin" "$release_dir/scripts/full_backup.py" restore --snapshot "$release_backup" --destination-root "$release_backup/restore-rehearsal" --services-stopped
+"$python_bin" "$release_dir/scripts/migrate_database.py" --database "$state_dir/consumables.db" --report "$release_backup/migration.json" > "$release_backup/migration-summary.json"
+chown -R "$service_user:$service_user" "$state_dir"
+
+if ! id lab-dsh >/dev/null 2>&1; then
+    useradd --system --home-dir /var/lib/lab-dsh --shell /usr/sbin/nologin lab-dsh
+fi
+if ! getent group lab-analysis-client >/dev/null; then groupadd --system lab-analysis-client; fi
+if ! id lab-analysis >/dev/null 2>&1; then
+    useradd --system --gid lab-analysis-client --home-dir /var/lib/lab-analysis --shell /usr/sbin/nologin lab-analysis
+fi
+usermod -a -G lab-analysis-client "$service_user"
+install -d -m 0750 -o lab-dsh -g lab-dsh /var/lib/lab-dsh
+install -d -m 0750 -o root -g lab-dsh /etc/lab-dsh
+install -d -m 0700 -o lab-analysis -g lab-analysis-client /var/lib/lab-analysis
+install -d -m 0750 -o root -g lab-analysis-client /etc/lab-analysis
+analysis_uid="$(id -u lab-analysis)"
+# Existing subordinate-ID ranges are retained; allocate only when absent.
+"$python_bin" "$release_dir/scripts/configure_analysis_user.py"
+loginctl enable-linger lab-analysis
+systemctl start "user@$analysis_uid.service"
+install -d -m 0750 -o lab-analysis -g lab-analysis-client /run/lab-analysis
+install -d -m 0700 -o lab-analysis -g lab-analysis-client /var/lib/lab-analysis/.config /var/lib/lab-analysis/.config/containers
+cat > /var/lib/lab-analysis/.config/containers/storage.conf <<'CONFIG'
+[storage]
+driver = "overlay"
+runroot = "/run/lab-analysis/containers"
+graphroot = "/var/lib/lab-analysis/.local/share/containers/storage"
+CONFIG
+chown lab-analysis:lab-analysis-client /var/lib/lab-analysis/.config/containers/storage.conf
+chmod 0600 /var/lib/lab-analysis/.config/containers/storage.conf
+image_digest=sha256:05a994d2344eb364cc186910f4fc8786a38215f39f00d0acc25bff33a08f4177
+analysis_image="docker.io/library/python@$image_digest"
+analysis_command=(runuser -u lab-analysis -- env "XDG_RUNTIME_DIR=/run/user/$analysis_uid" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$analysis_uid/bus" podman --cgroup-manager=systemd)
+if ! "${analysis_command[@]}" image exists "$analysis_image"; then
+    "${analysis_command[@]}" pull "$analysis_image" || "${analysis_command[@]}" pull "docker.1ms.run/library/python@$image_digest"
+fi
+# Config ID is shared by the identical official manifest at the alternate registry.
+analysis_id="$("${analysis_command[@]}" image inspect --format '{{.Id}}' "$analysis_image" 2>/dev/null || "${analysis_command[@]}" image inspect --format '{{.Id}}' "docker.1ms.run/library/python@$image_digest")"
+[[ "$analysis_id" == 78976a69c067520ef8be34cde307ef9f6fea6dcefa50edb57039773d241ca0db ]] || { printf 'Unexpected analysis image config.\n' >&2; false; }
+printf 'LAB_ANALYSIS_STATE=/var/lib/lab-analysis\nLAB_ANALYSIS_SOCKET=/run/lab-analysis/broker.sock\nLAB_ANALYSIS_IMAGE=%s\n' "$analysis_id" > /etc/lab-analysis/environment
+chown root:lab-analysis-client /etc/lab-analysis/environment
+chmod 0640 /etc/lab-analysis/environment
 
 if [[ ! -f /etc/lab-management/push/vapid-private.pem ]]; then
     VAPID_KEY_DIRECTORY=/etc/lab-management/push "$python_bin" "$release_dir/scripts/generate_push_keys.py" > "$release_backup/push-public-settings.txt"
@@ -87,26 +134,36 @@ fi
 chown root:"$service_user" /etc/lab-management/push/*
 chmod 0640 /etc/lab-management/push/*
 "$python_bin" "$release_dir/scripts/configure_environment.py" /etc/lab-management/environment
+cat > /etc/lab-dsh/environment <<CONFIG
+LAB_CALLBACK_URL=http://127.0.0.1:8000
+LAB_DSH_PORT=8766
+LAB_VOICE_MODEL_DIR=$release_dir/runtime/voice/sensevoice-onnx
+LAB_VOICE_VAD_PATH=$release_dir/runtime/voice/silero/silero_vad.onnx
+CONFIG
+chown root:lab-dsh /etc/lab-dsh/environment
+chmod 0640 /etc/lab-dsh/environment
+"$python_bin" - "$release_dir" <<'PY'
+import json, pathlib, sys
+release = pathlib.Path(sys.argv[1])
+manifest = json.loads((release / 'release-manifest.json').read_text())
+manifest['application_release'] = str(release)
+path = pathlib.Path('/etc/lab-management/release.json')
+path.write_text(json.dumps(manifest, indent=2) + '\n')
+path.chmod(0o640)
+PY
+chown root:"$service_user" /etc/lab-management/release.json
 
-paused=1
-systemctl stop consumable-backup.timer consumable-notifications consumable-assistant || true
-"$python_bin" "$release_dir/scripts/backup_database.py" --database "$database" --directory "$release_backup"
-snapshot_files=("$release_backup"/hourly-*.db)
-cp -- "${snapshot_files[0]}" "$release_backup/database.db"
-if [[ -d "$state_dir/photos" ]]; then tar -C "$state_dir" -czf "$release_backup/photos.tar.gz" photos; fi
-changed=1
-
-candidate="$state_dir/release-check-$(date -u +%Y%m%dT%H%M%SZ).db"
-install -m 0600 -o "$service_user" -g "$service_user" "$release_backup/database.db" "$candidate"
-runuser -u "$service_user" -- "$python_bin" "$release_dir/scripts/migrate_database.py" --database "$candidate" --report "$state_dir/migration-check.json"
-runuser -u "$service_user" -- "$python_bin" "$release_dir/scripts/migrate_database.py" --database "$database" --report "$state_dir/migration-latest.json"
-cp "$state_dir/migration-latest.json" "$release_backup/migration.json"
-
-for unit in consumable-assistant.service consumable-notifications.service consumable-backup.service consumable-backup.timer; do
-    install -m 0644 "$release_dir/deploy/$unit" "/etc/systemd/system/$unit"
+for unit in consumable-assistant.service consumable-notifications.service consumable-dsh.service consumable-analysis.service consumable-backup.service consumable-backup.timer; do
+    sed "s/@ANALYSIS_UID@/$analysis_uid/g" "$release_dir/deploy/$unit" > "/etc/systemd/system/$unit"
+    chmod 0644 "/etc/systemd/system/$unit"
 done
-systemd-analyze verify /etc/systemd/system/consumable-assistant.service /etc/systemd/system/consumable-notifications.service /etc/systemd/system/consumable-backup.service /etc/systemd/system/consumable-backup.timer
-if [[ ! -f /etc/nginx/snippets/lab-management-auth.conf ]]; then install -m 0644 /dev/null /etc/nginx/snippets/lab-management-auth.conf; fi
+systemd-analyze verify /etc/systemd/system/consumable-{assistant,notifications,dsh,analysis,backup}.service /etc/systemd/system/consumable-backup.timer
+[[ -f /etc/nginx/snippets/lab-management-auth.conf ]] || install -m 0644 /dev/null /etc/nginx/snippets/lab-management-auth.conf
+install -d -m 0755 /var/www/lab-management-trust
+install -m 0644 /etc/lab-management-tls/lab-root-ca.crt /var/www/lab-management-trust/lab-root-ca.crt
+fingerprint="$(openssl x509 -in /etc/lab-management-tls/lab-root-ca.crt -sha256 -fingerprint -noout | cut -d= -f2)"
+sed "s/@@CA_FINGERPRINT@@/$fingerprint/g" "$release_dir/deploy/trust.html" > /var/www/lab-management-trust/index.html
+chmod 0644 /var/www/lab-management-trust/index.html
 install -m 0644 "$release_dir/deploy/nginx.conf" /etc/nginx/sites-available/lab-management
 ln -sfn /etc/nginx/sites-available/lab-management /etc/nginx/sites-enabled/lab-management
 if [[ -L /etc/nginx/sites-enabled/default ]]; then unlink /etc/nginx/sites-enabled/default; fi
@@ -114,14 +171,20 @@ nginx -t
 ln -sfn "$release_dir" "$app_root/current.next"
 mv -Tf "$app_root/current.next" "$app_root/current"
 systemctl daemon-reload
-systemctl enable consumable-assistant consumable-notifications consumable-backup.timer nginx
+systemctl enable consumable-assistant consumable-notifications consumable-dsh consumable-analysis consumable-backup.timer nginx
+systemctl restart consumable-analysis consumable-dsh
+curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:8766/health > "$release_backup/health-dsh.json"
 systemctl restart consumable-assistant
 curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:8000/api/stats > "$release_backup/health-stats.json"
 curl --fail --silent --show-error --max-time 120 -X POST http://127.0.0.1:8000/api/ai/check > "$release_backup/health-ai.json"
-"$python_bin" -c 'import json,sys; assert json.load(open(sys.argv[1]))["status"] == "available", "AI availability check failed"' "$release_backup/health-ai.json"
-systemctl restart consumable-notifications consumable-backup.timer
-systemctl start consumable-backup.service
+"$python_bin" -c 'import json,sys; assert json.load(open(sys.argv[1]))["status"] == "available", "School model unavailable"' "$release_backup/health-ai.json"
+"$python_bin" "$release_dir/scripts/verify_analysis_sandbox.py" --report "$release_backup/analysis-verification.json"
+systemctl restart consumable-notifications
 systemctl reload-or-restart nginx
+curl --fail --silent --show-error --cacert /etc/lab-management-tls/lab-root-ca.crt https://10.15.21.115/api/stats > "$release_backup/health-https.json"
+flock -u 9
+"$python_bin" "$release_dir/scripts/consistent_backup.py" create --snapshot "$release_backup/installed-snapshot"
+systemctl restart consumable-backup.timer
 changed=0
 trap - ERR
-printf 'Deployment and AI checks passed. Backup: %s\nCampus, VPN, trusted HTTPS and authorized-device push checks remain required.\n' "$release_backup"
+printf 'Release installed and server checks passed. Verified previous snapshot: %s\nActual device trust, recording, VPN and background push checks remain required.\n' "$release_backup"

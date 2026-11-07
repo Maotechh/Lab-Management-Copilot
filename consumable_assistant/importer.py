@@ -2,10 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
-import subprocess
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -80,36 +77,12 @@ SOURCE_CONFIGS = [
 
 
 def read_inventory_sheet(path: Path) -> pd.DataFrame:
-    if path.suffix.lower() == ".xls":
-        with tempfile.TemporaryDirectory() as tmp:
-            env = os.environ.copy()
-            env["XDG_CACHE_HOME"] = os.path.join(tmp, "cache")
-            os.makedirs(env["XDG_CACHE_HOME"], exist_ok=True)
-            subprocess.run(
-                [
-                    "soffice",
-                    "--headless",
-                    "--convert-to",
-                    "xlsx",
-                    "--outdir",
-                    tmp,
-                    str(path),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-                env=env,
-            )
-            converted = list(Path(tmp).glob("*.xlsx"))
-            if not converted:
-                raise RuntimeError(f"无法读取 {path.name}，没有得到转换后的 xlsx 文件")
-            workbook = pd.ExcelFile(converted[0])
-            frame = pd.read_excel(workbook, sheet_name=workbook.sheet_names[0], dtype=object)
-            frame.attrs["source_sheet"] = workbook.sheet_names[0]
-            return frame
-    workbook = pd.ExcelFile(path)
-    frame = pd.read_excel(workbook, sheet_name=workbook.sheet_names[0], dtype=object)
-    frame.attrs["source_sheet"] = workbook.sheet_names[0]
+    """Legacy source importer reads its original first sheet without executing Office."""
+    from .attachments import tables
+
+    sheet = tables(path)[0]
+    frame = pd.DataFrame([row["values"] for row in sheet["records"]], columns=sheet["columns"])
+    frame.attrs["source_sheet"] = sheet["sheet"]
     return frame
 
 

@@ -103,16 +103,30 @@
 
           <section class="tab-panel active" id="tab-chat">
             <div class="surface chat-surface">
+              <div class="toolbar compact">
+                <label for="sharedConversation">共享对话</label>
+                <select id="sharedConversation" aria-label="选择共享对话"></select>
+                <button id="newConversation" type="button">新建对话</button>
+                <button id="moreConversations" type="button" hidden>更多对话</button>
+                <button id="olderMessages" type="button" hidden>以前的消息</button>
+              </div>
+              <p id="chatConnection" class="muted small-text" role="status">正在连接共享对话</p>
               <div id="chatMessages" class="chat-transcript" aria-live="polite"></div>
+              <div id="chatRunStatus" aria-live="polite"></div>
               <label class="field-label" for="chatText">消息</label>
               <textarea id="chatText" rows="3" placeholder="查找物品、准备实验或记录耗材操作"></textarea>
               <div class="toolbar compact chat-composer-actions">
                 <label class="chat-attachment-label" for="chatFile"><i data-lucide="paperclip" class="icon-sm"></i>附加文件</label>
-                <input id="chatFile" type="file" accept=".xlsx,.xls,image/jpeg,image/png,image/webp" />
+                <input id="chatFile" type="file" multiple accept=".xlsx,.xls,.csv,.jpg,.jpeg,.png,.webp,.heic,.heif" />
                 <span id="chatAttachmentName" class="muted small-text"></span>
                 <button id="previewBtn" type="button" class="primary"><i data-lucide="send" class="icon-sm"></i>发送</button>
+                <button id="recordVoice" type="button">录音</button>
+                <button id="stopVoice" type="button" hidden>停止并识别</button>
+                <button id="cancelVoice" type="button" hidden>取消录音</button>
                 <button id="commitBtn" type="button" class="secondary" disabled><i data-lucide="check" class="icon-sm"></i>生成确认预览</button>
               </div>
+              <p id="voiceStatus" role="status" class="muted small-text"></p>
+              <div id="attachmentPreviews" class="attachment-previews"></div>
               <div id="chatTaskActions" class="toolbar compact" hidden></div>
               <div id="previewBox" class="preview"></div>
             </div>
@@ -261,8 +275,18 @@
     </div>
 
     <div id="toast" role="status" aria-live="polite"></div>
+    <dialog id="businessConfirmation" aria-labelledby="businessConfirmTitle">
+      <h2 id="businessConfirmTitle">确认业务变更</h2>
+      <div id="businessConfirmationBody"></div>
+      <p id="businessConfirmDetails"></p>
+      <form method="dialog" class="toolbar">
+        <button value="cancel" type="submit">暂不执行</button>
+        <button value="confirm" type="submit" class="primary">确认执行全部变更</button>
+      </form>
+    </dialog>
     <script src="/static/lucide.min.js"></script>
     <script src="/static/app.js"></script>
+    <script src="/static/mobile.js"></script>
     <script src="/static/operations.js"></script>
   </body>
 </html>

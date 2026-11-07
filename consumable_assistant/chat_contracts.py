@@ -74,7 +74,7 @@ class Template(Payload):
 
 
 class Purchase(Payload):
-    action: Literal["order", "receive", "cancel"] = "order"
+    action: Literal["draft", "place", "order", "receive", "cancel"] = "order"
     item_id: ID | None = None
     order_id: ID | None = None
     quantity: Quantity | None = None
@@ -82,6 +82,31 @@ class Purchase(Payload):
     owner: str | None = None
     expected_at: str | None = None
     note: str | None = None
+
+
+class PreparationLine(Payload):
+    item_ids: list[ID] = Field(min_length=1, max_length=100)
+    action: Literal["consume", "borrow"]
+    unit: str | None = None
+    quantity: Quantity | None = None
+    per_person: Quantity = "0"
+    per_group: Quantity = "0"
+    fixed: Quantity = "0"
+    spare: Quantity = "0"
+    source: str | None = None
+
+
+class Preparation(Schedule):
+    lines: list[PreparationLine] = Field(min_length=1, max_length=200)
+
+
+class PlanStep(Payload):
+    kind: str
+    payload: dict
+
+
+class MixedPlan(Payload):
+    operations: list[PlanStep] = Field(min_length=1, max_length=200)
 
 
 class Item(Payload):
@@ -109,8 +134,8 @@ class Metadata(Payload):
     conversions: dict[str, Quantity] | None = None
 
 
-def contract(name, **fields):
-    return create_model(name, __base__=Payload, **fields)
+def contract(model_name, **fields):
+    return create_model(model_name, __base__=Payload, **fields)
 
 
 CONTRACTS = {
@@ -118,6 +143,15 @@ CONTRACTS = {
     "bulk": contract("Bulk", operations=(list[Stock], Field(min_length=1, max_length=200))),
     "purchase": Purchase,
     "schedule": Schedule,
+    "preparation": Preparation,
+    "preparation_update": contract("PreparationUpdate", preparation_id=(ID, ...),
+                                   action=(Literal["replenish", "cancel", "revise"], ...), note=(Text, ...),
+                                   name=(Text | None, None), course=(Text | None, None), venue=(Text | None, None),
+                                   starts_at=(Text | None, None), ends_at=(Text | None, None),
+                                   people=(Annotated[int, Field(ge=0)] | None, None),
+                                   group_size=(Annotated[int, Field(gt=0)] | None, None),
+                                   lines=(list[PreparationLine] | None, Field(default=None, min_length=1, max_length=200))),
+    "mixed": MixedPlan,
     "template": Template,
     "create_item": Item,
     "metadata": Metadata,
@@ -147,9 +181,15 @@ def validate_payload(kind: str, data: dict) -> dict:
     if kind == "bulk":
         for row in result["operations"]:
             validate_payload("stock", row)
+    if kind == "mixed":
+        for step in result["operations"]:
+            if step["kind"] == "mixed":
+                raise ValueError("混合计划不能嵌套")
+            step["payload"] = validate_payload(step["kind"], step["payload"])
     if kind == "purchase":
         action = result.get("action", "order")
-        required = {"order": ("item_id", "quantity", "owner", "expected_at"),
+        required = {"draft": ("item_id", "quantity"), "place": ("order_id", "owner", "expected_at"),
+                    "order": ("item_id", "quantity", "owner", "expected_at"),
                     "receive": ("order_id", "quantity"), "cancel": ("order_id", "note")}[action]
         if any(result.get(key) in (None, "") for key in required):
             raise ValueError("采购操作缺少必要信息：" + "、".join(required))

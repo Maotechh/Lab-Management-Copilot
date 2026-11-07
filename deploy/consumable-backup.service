@@ -1,12 +1,15 @@
 [Unit]
-Description=Verified lab inventory backup
+Description=Consistent inventory, shared chat, attachments and configuration backup
 
 [Service]
 Type=oneshot
 UMask=0077
-ExecStart=/opt/lab-management/current/.venv/bin/python /opt/lab-management/current/scripts/backup_database.py
+ExecStart=/opt/lab-management/current/.venv/bin/python /opt/lab-management/current/scripts/consistent_backup.py create
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/backups/lab-management
 ReadWritePaths=/var/lib/lab-management
+ReadWritePaths=-/var/lib/lab-dsh -/var/lib/lab-release-configuration
+ReadWritePaths=/run
+TimeoutStartSec=15min

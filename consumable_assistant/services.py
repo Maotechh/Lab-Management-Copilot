@@ -164,6 +164,11 @@ def search_items(
         ranked.append(row)
     if query:
         ranked.sort(key=lambda item: (item["score"], item["quantity"]), reverse=True)
+        # Exact identities must not be mixed with similarly spelled materials.
+        # Preserve every matching location and specification for disambiguation.
+        exact = [item for item in ranked if exact_item_query(item, query)]
+        if exact:
+            ranked = exact
     else:
         ranked.sort(
             key=lambda item: (item["low_stock"], item["updated_at"]), reverse=True
@@ -171,6 +176,17 @@ def search_items(
     limited = ranked[:limit]
     attach_latest_transactions(conn, limited)
     return limited
+
+
+def exact_item_query(item: dict[str, Any], query: str) -> bool:
+    """Match a name or alias, optionally qualified by its specification."""
+    names = [item.get("item_name"), *(item.get("aliases") or [])]
+    specification = normalize_text(item.get("spec"))
+    for name in names:
+        normalized = normalize_text(name)
+        if normalized and query in {normalized, normalized + specification, specification + normalized}:
+            return True
+    return False
 
 
 def transaction_candidates(

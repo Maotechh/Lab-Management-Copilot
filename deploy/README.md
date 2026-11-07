@@ -1,36 +1,54 @@
-# Server Deployment
+# Server deployment
 
-The application runs as the `lab-management` system user under systemd. Nginx listens on the server's private IPv4 address and proxies to `127.0.0.1:8000`.
+The release uses FastAPI and SQLite for all business rules, a separate loopback DSH service for conversation and official SenseVoice recognition, and a separate rootless Podman account for temporary analysis. Nginx listens only on the private campus address. There is no login. Preserve the existing campus and school VPN access restrictions.
 
-The application process is independent of an SSH window. For an interactive maintenance shell, use `scripts/ssh_keepalive.sh` from the release checkout. It sends a keepalive probe every 20 seconds, allows six missed probes, and retries a dropped connection three times by default:
+## Build and identify the release
 
-```bash
-scripts/ssh_keepalive.sh -p 22112 lihanze@10.15.66.32
+Use Node.js `24.22.2`, `pnpm@11.28.5`, a committed application revision and a committed DSH revision based on the designated official source. On Linux x86_64, place the pinned Node distribution on PATH and run:
+
+```sh
+python scripts/build_dsh_runtime.py --source /path/to/committed/deepseek-harness --destination /path/to/application/runtime --node-prefix /path/to/node-v24.22.2-linux-x64
 ```
 
-Set `SSH_KEEPALIVE_MAX_RETRIES=0` only when an indefinitely reconnecting maintenance shell is wanted. Do not run application processes directly in that shell; use the systemd units below so a terminal disconnect does not stop the service.
+The build installs the frozen source lock, compiles the DSH artifacts, creates a dependency-only deployment importer, checks that no registry resolution changed, and materializes the dependency files. The explicit profile contains only the laboratory bundle. Do not copy a developer's `node_modules` or home directory.
 
-On Ubuntu 24.04, install `python3-venv`, `nginx`, and `libreoffice-calc`. Extract the current application, requirements, attachments, and this deployment directory into `/opt/lab-management/releases/<release-id>`.
+Copy the verified official voice files into `runtime/voice/sensevoice-onnx/model.int8.onnx`, `runtime/voice/sensevoice-onnx/tokens.txt` and `runtime/voice/silero/silero_vad.onnx`. Then run:
 
-For the initial deployment, include a consistent SQLite backup as `bootstrap/consumables.db` and the existing application environment as `bootstrap/environment`. Treat this directory and transfer archives as secrets. Run `bash deploy/install.sh` as root from the extracted release. Remove bootstrap files after installation. Subsequent deployments preserve the existing database and environment.
+```sh
+python scripts/release_manifest.py create --root /path/to/application
+```
 
-- Application data: `/var/lib/lab-management/consumables.db`
-- Environment: `/etc/lab-management/environment`
-- Initial database backup: `/var/backups/lab-management/initial-consumables.db`
-- Logs: `journalctl -u consumable-assistant`
-- Service status: `systemctl status consumable-assistant nginx`
-- Optional Nginx access authentication: `/etc/nginx/snippets/lab-management-auth.conf`
+The manifest records both commits, the exact Node.js and pnpm versions, lockfile hashes and release file checksums. It also validates the pinned voice models. The generated runtime, manifest and deployment archives are local release artifacts and must not be committed. Preserve the immutable release directory for restoration.
 
-Access remains without login, as requested. The installer preserves the existing firewall. Permit HTTP/HTTPS only from approved campus and school VPN source networks. Do not expose Uvicorn or add a public IPv6 listener. Existing campus routing has not yet passed client verification.
+## Install
 
-The V2 installer installs dependencies before pausing writes. It creates a verified release snapshot, checks migration on a copy, migrates the actual database, validates systemd/Nginx and requires a successful real AI health check. A failure restores the previous code, environment and database snapshot. Do not change the current symlink alone across schema versions.
+Ubuntu requires Python with venv support, Nginx, rootless Podman, `uidmap`, systemd user sessions and cgroup v2. Install the private-IP server certificate, server key and public root certificate as `/etc/lab-management-tls/server.crt`, `server.key` and `lab-root-ca.crt`. Keep the CA signing key outside the server and preserve it encrypted under the maintainer's control. The CA signing key is not an application backup input.
 
-Additional units are `consumable-notifications.service`, `consumable-backup.service` and `consumable-backup.timer`. The worker checks AI every five minutes and processes persistent generic Web Push jobs. The backup timer runs hourly, retaining seven days of hourly databases and thirty days of daily databases/photos. Every database backup includes a test restoration and row-count/integrity check.
+Extract the identified application and runtime into `/opt/lab-management/releases/<release-id>`. For a first installation only, provide the existing inventory and environment under `bootstrap/`; never reimport the original three attachments. Run:
 
-For a manual restore, stop the application, notification worker and backup timer, then run `scripts/restore_database.py --snapshot <release-backup>/database.db --database /var/lib/lab-management/consumables.db --services-stopped` using the release Python. Select the matching code release before restarting services. Restore the matching `photos.tar.gz` when recovering photos onto a replacement machine.
+```sh
+bash deploy/install.sh
+```
 
-Protected environment configuration is preserved. `GENAI_REQUIRED=1` is enforced. AI requests use the existing institutional GenAI endpoint first, then the built-in school endpoints in this order: Qwen (`qwen-instruct`), GLM (`glm-chat`), DeepSeek (`deepseek-pro`) and Kimi (`kimi`). Set `GENAI_FALLBACK_PROVIDERS_JSON` only when the institution changes an endpoint or model. The ASR endpoint is not used because the application has no voice input. Check `/api/ai/status` and `journalctl -u consumable-notifications`; use `/api/ai/check` for a real request, limited to one health check per minute per process. Campus connectivity and successful structured output must be verified on the deployed host.
+Dependencies are prepared before business writes pause. The installer creates and verifies a complete previous-version snapshot, restores it into an isolated directory, migrates that copy and checks preservation before migrating production. A later failure restores matching code, application state, DSH state and settings. A failed restoration keeps durable writers stopped.
 
-VAPID signing keys are generated once in `/etc/lab-management/push`, with access restricted to root and the service group. Set `VAPID_SUBJECT=mailto:<institutional-contact>` and `PUBLIC_BASE_URL=https://<school-domain>`. A school DNS record, trusted certificate and outbound access to browser push providers are required. Apply the HTTPS Nginx example only after replacing its domain/certificate values. Confirm a notification on an authorized phone with the page closed.
+The application account owns `/var/lib/lab-management`. The DSH account owns `/var/lib/lab-dsh`, including Session events and image attachments. Its replaceable profile is recreated under `/run/lab-dsh`; dependencies remain in the release directory. DSH cannot read the production database or application credentials. The analysis account owns `/var/lib/lab-analysis` and its rootless image storage; it cannot access either production data directory.
 
-See `ACCEPTANCE-V2.md` for the fourteen-item evidence and outstanding real-network/device requirements. Generated migration reports include each item's original quantity and new states and must remain protected because they contain business data.
+The application and DSH use the school `deepseek-pro` endpoint at `POST http://10.15.171.204:30969/v1/responses`, with high reasoning effort and `store: false`. The endpoint requires no API key; deployment clears the application's old key and never copies it into DSH. The DSH transport uses a nonsecret placeholder authorization header required by its OpenAI client. Unverified alternative model configurations fail before any request. VAPID keys in `/etc/lab-management/push` are reused. The public entry is `https://10.15.21.115`; HTTP presents certificate installation instructions. The notification contact is the repository's issues URL. Push payloads contain generic reminders only.
+
+## Complete backup and restoration
+
+The hourly timer pauses the application, notification worker and DSH, creates one complete verified snapshot, and resumes previously active writers. Snapshots include database rows, uploaded attachments, location photos, exports, DSH events, configuration, TLS server files and recorded service configuration. Existing backups are retained. Monitor available disk space; complete snapshots are not automatically deleted.
+
+```sh
+sudo /opt/lab-management/current/.venv/bin/python /opt/lab-management/current/scripts/consistent_backup.py create
+sudo /opt/lab-management/current/.venv/bin/python /opt/lab-management/current/scripts/consistent_backup.py restore --snapshot /var/backups/lab-management/<snapshot>
+```
+
+Restore requires the recorded immutable release directory. The coordinator verifies its files, stops writers, restores all named roots, selects the matching release, restores service configuration, and resumes the recorded services. Existing replaced roots remain with `.restore-previous` names. Preserve or move those directories before another restoration. For a rehearsal on an isolated destination, use `scripts/full_backup.py restore --destination-root <directory> --services-stopped` instead; it never changes the selected production release.
+
+## Required actual verification
+
+Installation checks actual school-model availability, loopback DSH, rootless isolation/resource limits and HTTPS from the server. These checks do not establish teacher-device certificate trust, campus/VPN access, microphone permission or background push delivery. Verify those on a computer, iPhone Safari and Android Chrome, recording system/browser versions. Both phones must record, upload a photo, share a conversation, confirm a plan and receive a generic test notification after the page is closed and the screen locked. Verify that clicking the notification displays the campus detail page. iPhone Web Push requires a supported iOS version and installation on the home screen.
+
+The attachment inventory remains awaiting teacher verification. Physical stock confirmation, actual reagent-system integration and actual floorplan production are outside this release's completion conditions. Deployment evidence must distinguish passed checks from work that remains.

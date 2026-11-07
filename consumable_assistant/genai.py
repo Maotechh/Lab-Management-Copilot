@@ -29,29 +29,6 @@ AI_REQUIRED = os.environ.get("GENAI_REQUIRED", "1") != "0"
 HEALTH_LOCK = threading.Lock()
 LAST_HEALTH_CHECK = 0.0
 LOGGER = logging.getLogger(__name__)
-DEFAULT_FALLBACK_PROVIDERS = (
-    {
-        "name": "Qwen3.8-Flash-Next-FP8",
-        "model": "qwen-instruct",
-        "base_url": "http://10.15.171.204:30277/v1",
-    },
-    {
-        "name": "GLM-5.3-Flash",
-        "model": "glm-chat",
-        "base_url": "http://10.15.171.204:30155/v1",
-    },
-    {
-        "name": "DeepSeek 校内直连接口",
-        "model": "deepseek-pro",
-        "base_url": "http://10.15.171.204:30969/v1",
-    },
-    {
-        "name": "Kimi-K3",
-        "model": "kimi",
-        "base_url": "http://10.15.171.204:30515/v1",
-        "timeout": 20,
-    },
-)
 MAX_PROVIDER_CALLS = 8
 HEALTH_INTERVAL = 300
 
@@ -144,7 +121,7 @@ def _check_health() -> dict[str, Any]:
                         if isinstance(op, dict)
                     )
                 ),
-                max_output_tokens=96,
+                max_output_tokens=65536,
             )
             if not parsed:
                 raise AIUnavailable("模型没有返回可用操作")
@@ -211,44 +188,18 @@ def provider_entries() -> list[dict[str, Any]]:
         "primary": True,
     }
     entries = [primary] if primary["base_url"].strip() else []
-    for model in os.environ.get("GENAI_FALLBACK_MODELS", "").split(","):
-        model = model.strip()
-        if model and model != GENAI_MODEL and primary["base_url"].strip():
-            entries.append({**primary, "name": model, "model": model, "primary": False})
+    # A configured endpoint is not evidence of native tools and image support.
+    # Only the school DeepSeek integration is qualified for this release.
     raw = os.environ.get("GENAI_FALLBACK_PROVIDERS_JSON", "").strip()
     try:
-        fallbacks = json.loads(raw) if raw else list(DEFAULT_FALLBACK_PROVIDERS)
+        fallbacks = json.loads(raw) if raw else []
     except json.JSONDecodeError as exc:
         raise AIUnavailable("GENAI_FALLBACK_PROVIDERS_JSON 格式无效") from exc
-    if not isinstance(fallbacks, list):
-        raise AIUnavailable("GENAI_FALLBACK_PROVIDERS_JSON 必须是数组")
-    for item in fallbacks:
-        if not isinstance(item, dict):
-            raise AIUnavailable("备用模型配置无效")
-        name, model, base_url = (
-            str(item.get(key) or "").strip()
-            for key in ("name", "model", "base_url")
-        )
-        if not name or not model or not base_url.startswith(("http://", "https://")):
-            raise AIUnavailable("备用模型配置需要名称、模型和 HTTP 地址")
-        entries.append(
-            {
-                "name": name,
-                "model": model,
-                "base_url": base_url.rstrip("/"),
-                "mode": "openai",
-                "api_key": str(item.get("api_key") or ""),
-                "primary": False,
-            }
-        )
-    unique = []
-    seen = set()
-    for item in entries:
-        marker = (item["base_url"], item["model"])
-        if marker not in seen:
-            unique.append(item)
-            seen.add(marker)
-    return unique[:MAX_PROVIDER_CALLS]
+    if fallbacks or os.environ.get("GENAI_FALLBACK_MODELS", "").strip():
+        raise AIUnavailable("备用模型尚未完成工具调用与图片能力验证，请使用学校 DeepSeek")
+    if GENAI_MODEL != "deepseek-pro":
+        raise AIUnavailable("本版本仅使用已经验证的学校 deepseek-pro")
+    return entries
 
 
 def request_json(
@@ -289,6 +240,7 @@ def request_json(
                     min(float(provider.get("timeout", GENAI_PROVIDER_TIMEOUT)), remaining),
                 )
                 with httpx.Client(
+                    trust_env=False,
                     timeout=httpx.Timeout(
                         provider_timeout,
                         connect=min(3.0, provider_timeout),
@@ -325,16 +277,18 @@ def provider_request(
     provider: dict[str, Any], system: str, prompt: str, max_tokens: int
 ) -> dict[str, Any]:
     mode = provider.get("mode", "openai")
-    if mode == "response":
+    if mode in {"response", "responses"}:
         body = {
             "model": provider["model"],
-            "input": f"{system}\n\n{prompt}",
+            "input": prompt,
             "instructions": system,
-            "temperature": GENAI_TEMPERATURE,
             "max_output_tokens": max_tokens,
+            "reasoning": {"effort": "high"},
             "stream": False,
+            "store": False,
         }
-        url = provider["base_url"]
+        base_url = provider["base_url"].rstrip("/")
+        url = base_url if base_url.endswith("/responses") else base_url + "/responses"
     elif mode == "completion":
         body = {
             "model": provider["model"],
@@ -384,17 +338,12 @@ def record_provider_check(
 
 
 def build_request(text: str) -> tuple[str, dict[str, Any]]:
-    if GENAI_MODE == "response":
-        endpoint = GENAI_BASE_URL or GENAI_RESPONSE_URL
-        payload = {
-            "model": GENAI_MODEL,
-            "input": build_prompt(text),
-            "instructions": SYSTEM_PROMPT,
-            "temperature": GENAI_TEMPERATURE,
-            "max_output_tokens": GENAI_MAX_OUTPUT_TOKENS,
-            "stream": False,
-        }
-        return endpoint, payload
+    if GENAI_MODE in {"response", "responses"}:
+        request = provider_request(
+            {"model": GENAI_MODEL, "mode": GENAI_MODE, "base_url": GENAI_BASE_URL or GENAI_RESPONSE_URL},
+            SYSTEM_PROMPT, build_prompt(text), GENAI_MAX_OUTPUT_TOKENS,
+        )
+        return request["url"], request["body"]
     endpoint = GENAI_BASE_URL or GENAI_COMPLETION_URL
     payload = {
         "model": GENAI_MODEL,
@@ -409,10 +358,10 @@ def build_request(text: str) -> tuple[str, dict[str, Any]]:
 
 
 def build_headers() -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {GENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
+    if GENAI_API_KEY:
+        headers["Authorization"] = f"Bearer {GENAI_API_KEY}"
+    return headers
 
 
 SYSTEM_PROMPT = """

@@ -1,0 +1,32 @@
+[Unit]
+Description=Lab isolated rootless analysis broker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=lab-analysis
+Group=lab-analysis-client
+WorkingDirectory=/opt/lab-management/current
+Environment=HOME=/var/lib/lab-analysis
+Environment=XDG_RUNTIME_DIR=/run/user/@ANALYSIS_UID@
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@ANALYSIS_UID@/bus
+Environment=LAB_ANALYSIS_STATE=/var/lib/lab-analysis
+EnvironmentFile=/etc/lab-analysis/environment
+ExecStart=/opt/lab-management/current/.venv/bin/python -m consumable_assistant.analysis_broker
+RuntimeDirectory=lab-analysis
+RuntimeDirectoryMode=0750
+Delegate=yes
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=75
+UMask=0007
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/var/lib/lab-analysis /run/lab-analysis /run/user/@ANALYSIS_UID@
+InaccessiblePaths=-/root -/home -/var/lib/lab-management -/etc/lab-management -/var/backups/lab-management -/var/lib/lab-dsh -/etc/lab-dsh
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
