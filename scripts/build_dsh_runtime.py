@@ -74,7 +74,7 @@ def build(source: Path, destination: Path, node_prefix: Path) -> None:
              '--config.allow-unused-patches=true', '--config.node-linker=hoisted',
              '--config.pnpmfile=' + str(tree / 'scripts/python-runtime-deploy.pnpmfile.mjs'),
              '--config.link-workspace-packages=true', '--config.hoist-workspace-packages=false', str(payload / 'dsh')], tree)
-        helper = temporary / 'materialize.ts'
+        helper = temporary / 'materialize.mts'
         helper.write_text(
             'import {materializeStagedLinks,deduplicateStagedWorkspacePackages} from '
             + json.dumps(str(tree / 'scripts/build-exe-for-python-sdk-staging.ts')) + ';\n'
