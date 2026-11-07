@@ -55,10 +55,11 @@ function initWorkflows() {
   });
   bindForm('locationDetailsForm',async()=>{
     const lab=value('detailsLab'),location_code=value('detailsLocation');
-    const locations=await api('/api/locations');let old=locations.rows.find(row=>row.lab===lab&&row.location_code===location_code)?.details;
-    await perform('location_details',{lab,location_code,description:value('detailsDescription'),version:old?.version||0});
+    const locations=await api('/api/locations');const old=locations.rows.find(row=>row.lab===lab&&row.location_code===location_code)?.details;
     const file=$('#detailsPhoto').files[0];
-    if(file){const latest=await api('/api/locations');old=latest.rows.find(row=>row.lab===lab&&row.location_code===location_code)?.details;const form=new FormData();form.append('lab',lab);form.append('location_code',location_code);form.append('version',old?.version||1);form.append('file',file);await api('/api/locations/photo',{method:'POST',body:form});}
+    let photo_attachment_id;
+    if(file){await ensureChatConversation();const form=new FormData();form.append('file',file);const attachment=await chatApi(`/api/chat/conversations/${state.chatConversationId}/attachments`,{method:'POST',body:form});photo_attachment_id=attachment.id;}
+    await perform('location_details',{lab,location_code,description:value('detailsDescription'),version:old?.version||0,...(photo_attachment_id?{photo_attachment_id}:{})});
   });
   bindForm('historyForm',loadHistory);
   $('#addLessonLine').addEventListener('click',()=>addLessonLine());
