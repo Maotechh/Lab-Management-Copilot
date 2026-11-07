@@ -420,6 +420,10 @@ def extract_text(payload: Any) -> str | None:
                 return text
         return None
     if isinstance(payload, dict):
+        # Responses places reasoning before the assistant's output. Reasoning
+        # and tool arguments are not a final answer, even if they contain JSON.
+        if payload.get('type') in ('reasoning', 'reasoning_text', 'function_call', 'function_call_output', 'tool_call'):
+            return None
         for key in ("output_text", "text", "content", "response", "message", "answer"):
             if key in payload:
                 text = extract_text(payload[key])

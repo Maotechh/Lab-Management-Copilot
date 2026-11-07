@@ -1835,6 +1835,21 @@ def test_notification_retry_expiry_and_generic_payload(db, monkeypatch):
     assert payload['url'] == '/?tab=alerts'
 
 
+def test_responses_health_uses_final_answer_after_reasoning():
+    from consumable_assistant.genai import extract_text, parse_model_json
+
+    expected = {'operations': [{'action': 'inbound', 'quantity': 1}]}
+    import json
+
+    response = {'object': 'response', 'output': [
+        {'type': 'reasoning', 'content': [{'type': 'reasoning_text', 'text': 'Consider {"quantity":999} before answering.'}]},
+        {'type': 'function_call', 'name': 'unused', 'arguments': '{"quantity":999}'},
+        {'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': json.dumps(expected)}]},
+    ]}
+    assert parse_model_json(extract_text(response)) == expected
+    assert extract_text({'output': response['output'][:2]}) is None
+
+
 def preparation_data(ids, **extra):
     return {"name": "容量测量", "course": "化学实验", "venue": "实验室",
             "starts_at": "2026-12-01T08:00:00+08:00", "ends_at": "2026-12-01T12:00:00+08:00",
