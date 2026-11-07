@@ -52,3 +52,17 @@ Restore requires the recorded immutable release directory. The coordinator verif
 Installation checks actual school-model availability, loopback DSH, rootless isolation/resource limits and HTTPS from the server. These checks do not establish teacher-device certificate trust, campus/VPN access, microphone permission or background push delivery. Verify those on a computer, iPhone Safari and Android Chrome, recording system/browser versions. Both phones must record, upload a photo, share a conversation, confirm a plan and receive a generic test notification after the page is closed and the screen locked. Verify that clicking the notification displays the campus detail page. iPhone Web Push requires a supported iOS version and installation on the home screen.
 
 The attachment inventory remains awaiting teacher verification. Physical stock confirmation, actual reagent-system integration and actual floorplan production are outside this release's completion conditions. Deployment evidence must distinguish passed checks from work that remains.
+
+### Selected-device notification checks
+
+Use `scripts/check_device_notification.py` as the application account with its service environment. With no arguments it lists device IDs, actor names and subscription status without exposing provider URLs or keys. `--device-id ID --delay-seconds 45` creates a marked generic test for that device only, allowing the teacher to close the page and lock the screen. `--event-id ID` reads the delivery state. This does not change inventory. For example:
+
+```sh
+sudo systemd-run --pipe --wait --collect \
+  --property=User=lab-management \
+  --property=EnvironmentFile=/etc/lab-management/environment \
+  --working-directory=/opt/lab-management/current \
+  /opt/lab-management/current/.venv/bin/python scripts/check_device_notification.py
+```
+
+Append the selected action after the script path. `sent` means the notification provider accepted the request; record actual device receipt and navigation separately. An HTTP status in the delivery error helps distinguish expired subscriptions from provider rejection. A connection timeout requires checking the server's access to the actual provider. Follow [PHONE-VALIDATION.md](PHONE-VALIDATION.md) for the device checks.

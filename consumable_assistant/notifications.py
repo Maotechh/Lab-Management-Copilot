@@ -41,7 +41,7 @@ def validate_subscription(subscription: dict) -> None:
             raise ValueError("推送地址不能指向内部网络")
 
 
-def send(subscription: dict) -> None:
+def send(subscription: dict, *, test: bool = False) -> None:
     import requests
     from pywebpush import webpush
 
@@ -56,8 +56,8 @@ def send(subscription: dict) -> None:
         subscription_info=subscription,
         data=json.dumps(
             {
-                "title": "耗材管理提醒",
-                "body": "库存或实验安排需要关注，请进入校内系统查看。",
+                "title": "耗材管理测试提醒" if test else "耗材管理提醒",
+                "body": "这是设备通知测试，请进入校内提醒页面查看。" if test else "库存或实验安排需要关注，请进入校内系统查看。",
                 "url": "/?tab=alerts",
             },
             ensure_ascii=False,
@@ -102,7 +102,7 @@ def tick() -> None:
         ):
             return
         deliveries = conn.execute(
-            "SELECT d.*,s.subscription,s.active FROM push_deliveries d JOIN push_subscriptions s ON s.id=d.subscription_id JOIN notification_events e ON e.id=d.event_id LEFT JOIN alert_states a ON a.item_id=e.item_id WHERE d.status='pending' AND julianday(d.next_attempt)<=julianday('now') AND (a.item_id IS NULL OR (a.is_low=1 AND a.acknowledged=0 AND (a.snooze_until IS NULL OR julianday(a.snooze_until)<=julianday('now')))) LIMIT 20"
+            "SELECT d.*,s.subscription,s.active,e.kind AS event_kind FROM push_deliveries d JOIN push_subscriptions s ON s.id=d.subscription_id JOIN notification_events e ON e.id=d.event_id LEFT JOIN alert_states a ON a.item_id=e.item_id WHERE d.status='pending' AND julianday(d.next_attempt)<=julianday('now') AND (a.item_id IS NULL OR (a.is_low=1 AND a.acknowledged=0 AND (a.snooze_until IS NULL OR julianday(a.snooze_until)<=julianday('now')))) LIMIT 20"
         ).fetchall()
     for delivery in deliveries:
         state, error = "sent", None
@@ -111,7 +111,11 @@ def tick() -> None:
             if not delivery["active"]:
                 state = "disabled"
             else:
-                send(json.loads(delivery["subscription"]))
+                subscription = json.loads(delivery["subscription"])
+                if delivery["event_kind"] == "delivery_test":
+                    send(subscription, test=True)
+                else:
+                    send(subscription)
         except Exception as exc:  # noqa: BLE001 - Persist provider errors without exposing subscription data.
             response = getattr(exc, "response", None)
             code = getattr(response, "status_code", None)
@@ -122,7 +126,7 @@ def tick() -> None:
                 if attempts >= 8
                 else "pending"
             )
-            error = type(exc).__name__
+            error = f"{type(exc).__name__}:{code}" if code else type(exc).__name__
         with connect() as conn:
             if state == "expired":
                 conn.execute(

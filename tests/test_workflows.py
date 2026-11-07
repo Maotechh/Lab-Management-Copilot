@@ -2120,3 +2120,28 @@ def test_shared_event_stream_resumes_after_the_last_delivered_event(db, monkeypa
     event = asyncio.run(read_one())
     assert event.startswith(f'id: {ids[2]}\nevent: message\n')
     assert '"number":2' in event
+
+
+def test_marked_notification_test_targets_one_device_and_preserves_inventory(db, monkeypatch):
+    from consumable_assistant import notifications
+    from scripts.check_device_notification import queue
+
+    item = make_item(db)
+    for device in ('iphone', 'android'):
+        db.execute('INSERT INTO push_subscriptions(endpoint,subscription,actor,device_id) VALUES (?,?,?,?)',
+                   ('https://push.apple.com/' + device, '{}', 'Teacher', device))
+    db.commit()
+    queued = queue(db, 'iphone', 0)
+    assert db.execute('SELECT COUNT(*) FROM push_deliveries').fetchone()[0] == 1
+    assert db.execute('SELECT item_id FROM notification_events WHERE id=?', (queued['event_id'],)).fetchone()[0] is None
+    path = Path(db.execute('PRAGMA database_list').fetchone()[2])
+    monkeypatch.setattr(notifications, 'connect', lambda: connect(path))
+    monkeypatch.setenv('VAPID_PRIVATE_KEY', 'test-key')
+    monkeypatch.setenv('VAPID_SUBJECT', 'https://example.org/contact')
+    sent = []
+    monkeypatch.setattr(notifications, 'send', lambda subscription, **options: sent.append(options))
+    notifications.tick()
+    assert sent == [{'test': True}]
+    assert db.execute('SELECT status FROM push_deliveries').fetchone()[0] == 'sent'
+    assert stock.view(db, item)['ready'] == '100'
+    assert db.execute('SELECT COUNT(*) FROM stock_events').fetchone()[0] == 0
