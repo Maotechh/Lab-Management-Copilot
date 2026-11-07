@@ -1825,8 +1825,14 @@ def test_notification_retry_expiry_and_generic_payload(db, monkeypatch):
     original_send({})
     payload = json.loads(captured["data"])
     assert (
-        set(payload) == {"title", "body", "url"} and "玻璃烧杯" not in captured["data"]
+        set(payload) == {"title", "body", "url", "test"} and "玻璃烧杯" not in captured["data"]
     )
+    assert payload['test'] is False
+    original_send({}, test=True)
+    payload = json.loads(captured['data'])
+    assert payload['test'] is True
+    assert payload['title'] == '耗材管理测试提醒'
+    assert payload['url'] == '/?tab=alerts'
 
 
 def preparation_data(ids, **extra):

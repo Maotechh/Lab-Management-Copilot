@@ -59,6 +59,7 @@ def send(subscription: dict, *, test: bool = False) -> None:
                 "title": "耗材管理测试提醒" if test else "耗材管理提醒",
                 "body": "这是设备通知测试，请进入校内提醒页面查看。" if test else "库存或实验安排需要关注，请进入校内系统查看。",
                 "url": "/?tab=alerts",
+                "test": test,
             },
             ensure_ascii=False,
         ),

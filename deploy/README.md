@@ -66,3 +66,5 @@ sudo systemd-run --pipe --wait --collect \
 ```
 
 Append the selected action after the script path. `sent` means the notification provider accepted the request; record actual device receipt and navigation separately. An HTTP status in the delivery error helps distinguish expired subscriptions from provider rejection. A connection timeout requires checking the server's access to the actual provider. Follow [PHONE-VALIDATION.md](PHONE-VALIDATION.md) for the device checks.
+
+Run `node scripts/check_notification_worker.cjs` to verify generic notification contents, explicitly marked tests and navigation with both open and closed pages. This uses the actual worker source with browser APIs substituted in memory; actual locked-screen phone delivery remains a separate required check.
