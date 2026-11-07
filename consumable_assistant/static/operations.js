@@ -37,9 +37,9 @@ function initWorkflows() {
   bindForm('receiveForm',()=>{const order=ops.data.purchases.find(row=>row.id===Number(value('receiveOrder')));if(!order)throw new Error('请选择采购记录');return perform('purchase',{...base(order.item),action:'receive',order_id:order.id,order_version:order.version,quantity:value('receiveQuantity')});});
   bindForm('lessonForm',event=>{
     const lines=lessonLines(); const template=ops.data.templates.find(row=>row.id===Number(value('lessonTemplate')));
-    const data={name:value('lessonName'),course:value('lessonCourse'),people:Number(value('lessonPeople')),group_size:Number(value('lessonGroupSize')),lines};
+    const data={name:value('lessonName'),course:value('lessonCourse'),lines};
     if(event.submitter.value==='template') return perform('template',{...data,template_id:template?.id,version:template?.version});
-    return perform('schedule',{...data,venue:value('lessonVenue'),starts_at:iso('lessonStart'),ends_at:iso('lessonEnd')});
+    return perform('schedule',{...data,people:Number(value('lessonPeople')),group_size:Number(value('lessonGroupSize')),venue:value('lessonVenue'),starts_at:iso('lessonStart'),ends_at:iso('lessonEnd')});
   });
   bindForm('maintenanceForm',()=>{
     const kind=value('maintenanceAction');
@@ -48,7 +48,7 @@ function initWorkflows() {
     if(kind==='metadata'){
       const conversions={...item.unit_conversions};
       if(value('conversionUnit')){if(value('conversionFactor'))conversions[value('conversionUnit')]=value('conversionFactor');else delete conversions[value('conversionUnit')];}
-      return perform(kind,{...data,item_name:value('maintenanceName'),spec:value('maintenanceSpec'),brand:value('maintenanceBrand'),category:value('maintenanceCategory'),lab:value('maintenanceLab'),location_code:value('maintenanceLocation'),usage_type:value('maintenanceUsage'),conversions});
+      return perform(kind,{...base(item),item_name:value('maintenanceName'),spec:value('maintenanceSpec'),brand:value('maintenanceBrand'),category:value('maintenanceCategory'),lab:value('maintenanceLab'),location_code:value('maintenanceLocation'),usage_type:value('maintenanceUsage'),conversions});
     }
     if(kind==='transfer')return perform(kind,{...data,target_lab:value('maintenanceLab'),target_location:value('maintenanceLocation'),state:value('maintenanceFrom')});
     return perform('stock',{...data,action:kind,...(kind==='state'?{from_state:value('maintenanceFrom'),to_state:value('maintenanceTo')}:{})});
