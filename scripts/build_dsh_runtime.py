@@ -10,10 +10,45 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 NODE_VERSION = 'v24.22.2'
 PNPM_VERSION = '11.28.5'
+
+
+def dependency_closure(source: Path, roots: dict[str, str]) -> dict[str, str]:
+    """Include required workspace peers that pnpm production deploy omits."""
+    manifests = {}
+    for pattern in ('vendor/*/package.json', 'packages/*/*/package.json',
+                    'native/system/package.json', 'native/system/packages/*/package.json',
+                    'apps/*/package.json'):
+        for path in source.glob(pattern):
+            manifest = json.loads(path.read_text())
+            manifests[manifest['name']] = manifest
+    result = dict(roots)
+    pending = list(roots)
+    while pending:
+        name = pending.pop()
+        manifest = manifests[name]
+        for section in ('dependencies', 'peerDependencies', 'optionalDependencies'):
+            for dependency, version in manifest.get(section, {}).items():
+                if dependency in manifests and dependency not in result:
+                    result[dependency] = version if version.startswith('workspace:') else 'workspace:*'
+                    pending.append(dependency)
+    return result
+
+
+@contextmanager
+def build_directory(parent: Path):
+    directory = Path(tempfile.mkdtemp(prefix='lab-dsh-build-', dir=parent))
+    try:
+        yield directory
+    except BaseException:
+        print(f'Build files retained for diagnosis: {directory}', flush=True)
+        raise
+    else:
+        shutil.rmtree(directory)
 
 
 def run(arguments: list[str], cwd: Path, capture: bool = False) -> str:
@@ -36,7 +71,7 @@ def build(source: Path, destination: Path, node_prefix: Path) -> None:
         raise ValueError('Commit the DSH changes before producing a release runtime')
     commit = run(['git', 'rev-parse', 'HEAD'], source, True)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='lab-dsh-build-', dir=destination.parent) as directory:
+    with build_directory(destination.parent) as directory:
         temporary = Path(directory)
         tree = temporary / 'source'
         tree.mkdir()
@@ -53,10 +88,11 @@ def build(source: Path, destination: Path, node_prefix: Path) -> None:
         run(['node', '--input-type=module', '-e',
              "import{readFileSync,writeFileSync}from'node:fs';import{load}from'js-yaml';"
              "writeFileSync('registry-lock.json',JSON.stringify(load(readFileSync('pnpm-lock.yaml','utf8')).packages))"], tree)
-        dependencies = {
+        profile_dependencies = {
             '@deepseek-ai/dsh': 'workspace:*',
             '@deepseek-ai/dsh-lab-copilot': 'workspace:*',
         }
+        dependencies = dependency_closure(tree, profile_dependencies)
         closure = tree / 'apps/lab-delivery'
         closure.mkdir()
         (closure / 'package.json').write_text(json.dumps({
@@ -87,7 +123,7 @@ def build(source: Path, destination: Path, node_prefix: Path) -> None:
         profile.mkdir()
         (profile / 'cordis.yml').write_text('[]\n')
         installed = {name: json.loads((payload / 'dsh/node_modules' / name / 'package.json').read_text())['version']
-                     for name in dependencies if name.startswith('@deepseek-ai/')}
+                     for name in profile_dependencies}
         (profile / 'package.json').write_text(json.dumps({
             'name': 'lab-profile', 'private': True, 'type': 'module', 'dependencies': installed,
             'dsh': {'profile': {'bundles': ['@deepseek-ai/dsh-lab-copilot']}},

@@ -7,9 +7,25 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import consistent_backup as backup
+from scripts.build_dsh_runtime import dependency_closure
 from scripts.configure_analysis_user import configure
 from scripts.prepare_dsh_profile import prepare
 from scripts.release_manifest import describe
+
+
+def test_runtime_includes_transitive_workspace_peers_without_development_tools(tmp_path):
+    for name, manifest in {
+        'cli': {'name': 'cli', 'dependencies': {'boot': 'workspace:*'}, 'devDependencies': {'test-only': 'workspace:*'}},
+        'boot': {'name': 'boot', 'peerDependencies': {'group': 'workspace:~'}},
+        'group': {'name': 'group', 'peerDependencies': {'boot': 'workspace:*'}},
+        'test-only': {'name': 'test-only'},
+    }.items():
+        path = tmp_path / 'apps' / name / 'package.json'
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(manifest))
+    assert dependency_closure(tmp_path, {'cli': 'workspace:*'}) == {
+        'cli': 'workspace:*', 'boot': 'workspace:*', 'group': 'workspace:~',
+    }
 
 
 def test_backup_failure_resumes_exactly_the_previously_active_writers(tmp_path, monkeypatch):
