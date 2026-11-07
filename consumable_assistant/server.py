@@ -561,6 +561,17 @@ def transaction_preview(payload: dict):
 def dispatch(conn: sqlite3.Connection, kind: str, data: dict, actor: str) -> dict:
     if kind == "mixed":
         operations = data["operations"]
+        receipt_items, inbound_items = set(), set()
+        for step in operations:
+            payload = step["payload"]
+            if step["kind"] == "purchase" and payload.get("action") == "receive":
+                order = conn.execute("SELECT item_id FROM purchase_orders WHERE id=?", (payload.get("order_id"),)).fetchone()
+                if order:
+                    receipt_items.add(order["item_id"])
+            stock_operations = payload.get("operations", []) if step["kind"] == "bulk" else [payload] if step["kind"] == "stock" else []
+            inbound_items.update(op.get("item_id") for op in stock_operations if op.get("action") == "inbound")
+        if receipt_items & inbound_items:
+            raise ValueError("采购到货登记已经增加实际库存，不能在同一计划中为该物品重复登记普通入库。如有独立的其他入库，请另建计划。")
         for step in operations:
             current = chat_session._fill_versions(conn, step["kind"], step["payload"])
             if current != step["payload"]:

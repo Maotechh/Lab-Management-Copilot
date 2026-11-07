@@ -2020,6 +2020,30 @@ def test_mixed_plan_rolls_back_all_steps(db):
     assert db.execute("SELECT count(*) FROM stock_events").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize('stock_kind', ['stock', 'bulk'])
+def test_mixed_purchase_receipt_cannot_duplicate_the_same_inbound(db, stock_kind):
+    from consumable_assistant.chat import _fill_versions
+
+    item = make_item(db, quantity=10)
+    order = write(db, 'purchase', _fill_versions(db, 'purchase', {
+        'action': 'order', 'item_id': item, 'quantity': '8', 'owner': '教师',
+        'expected_at': '2026-12-01T12:00:00+08:00'}))['id']
+    inbound = {'item_id': item, 'action': 'inbound', 'quantity': '3'}
+    payload = _fill_versions(db, 'mixed', {'operations': [
+        {'kind': 'purchase', 'payload': {'action': 'receive', 'order_id': order, 'quantity': '3'}},
+        {'kind': stock_kind, 'payload': {'operations': [inbound]} if stock_kind == 'bulk' else inbound},
+    ]})
+    with pytest.raises(ValueError, match='采购到货登记已经增加实际库存'):
+        write(db, 'mixed', payload)
+    assert stock.view(db, item)['ready'] == '10'
+    assert db.execute('SELECT received FROM purchase_orders WHERE id=?', (order,)).fetchone()[0] == '0'
+    assert db.execute("SELECT count(*) FROM stock_events WHERE action IN ('purchase_receive','inbound')").fetchone()[0] == 0
+    # A receipt itself includes inbound and remains one confirmed operation.
+    write(db, 'purchase', _fill_versions(db, 'purchase', {'action': 'receive', 'order_id': order, 'quantity': '3'}))
+    assert stock.view(db, item)['ready'] == '13'
+    assert db.execute('SELECT received FROM purchase_orders WHERE id=?', (order,)).fetchone()[0] == '3'
+
+
 def test_preparation_revision_preserves_history_and_releases_old_stock(db):
     from consumable_assistant.chat import _fill_versions
 

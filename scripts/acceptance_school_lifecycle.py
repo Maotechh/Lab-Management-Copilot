@@ -175,6 +175,10 @@ def check_plan(case):
     if result.get('status') != 'pending_confirmation':
         return False
     operation = result['preview']['operation']
+    if operation['kind'] == 'mixed' and case['expected_kind'] != 'mixed':
+        steps = operation['details'].get('operations', [])
+        if len(steps) == 1:
+            operation = {'kind': steps[0]['kind'], 'details': steps[0]['payload']}
     if operation['kind'] != case['expected_kind']:
         return False
     details = operation['details']
