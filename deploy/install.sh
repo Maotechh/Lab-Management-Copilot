@@ -120,12 +120,13 @@ chown lab-analysis:lab-analysis-client /var/lib/lab-analysis/.config/containers/
 chmod 0600 /var/lib/lab-analysis/.config/containers/storage.conf
 image_digest=sha256:05a994d2344eb364cc186910f4fc8786a38215f39f00d0acc25bff33a08f4177
 analysis_image="docker.io/library/python@$image_digest"
+alternate_analysis_image="docker.1ms.run/library/python@$image_digest"
 analysis_command=(runuser -u lab-analysis -- env "XDG_RUNTIME_DIR=/run/user/$analysis_uid" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$analysis_uid/bus" podman --cgroup-manager=systemd)
-if ! "${analysis_command[@]}" image exists "$analysis_image"; then
-    "${analysis_command[@]}" pull "$analysis_image" || "${analysis_command[@]}" pull "docker.1ms.run/library/python@$image_digest"
+if ! "${analysis_command[@]}" image exists "$analysis_image" && ! "${analysis_command[@]}" image exists "$alternate_analysis_image"; then
+    timeout --kill-after=15s 180s "${analysis_command[@]}" pull "$analysis_image" || timeout --kill-after=15s 180s "${analysis_command[@]}" pull "$alternate_analysis_image"
 fi
 # Config ID is shared by the identical official manifest at the alternate registry.
-analysis_id="$("${analysis_command[@]}" image inspect --format '{{.Id}}' "$analysis_image" 2>/dev/null || "${analysis_command[@]}" image inspect --format '{{.Id}}' "docker.1ms.run/library/python@$image_digest")"
+analysis_id="$("${analysis_command[@]}" image inspect --format '{{.Id}}' "$analysis_image" 2>/dev/null || "${analysis_command[@]}" image inspect --format '{{.Id}}' "$alternate_analysis_image")"
 [[ "$analysis_id" == 78976a69c067520ef8be34cde307ef9f6fea6dcefa50edb57039773d241ca0db ]] || { printf 'Unexpected analysis image config.\n' >&2; false; }
 printf 'LAB_ANALYSIS_STATE=/var/lib/lab-analysis\nLAB_ANALYSIS_SOCKET=/run/lab-analysis/broker.sock\nLAB_ANALYSIS_IMAGE=%s\n' "$analysis_id" > /etc/lab-analysis/environment
 chown root:lab-analysis-client /etc/lab-analysis/environment
