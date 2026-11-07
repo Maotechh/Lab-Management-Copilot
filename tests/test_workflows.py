@@ -1905,6 +1905,50 @@ def test_responses_health_uses_final_answer_after_reasoning():
     assert extract_text({'output': response['output'][:2]}) is None
 
 
+def test_chat_history_export_preserves_filters_decimal_values_and_literal_text(db, monkeypatch, tmp_path):
+    import hashlib
+    import io
+
+    from openpyxl import load_workbook
+
+    from consumable_assistant import chat, server
+    from scripts.acceptance_school_lifecycle import digest
+
+    monkeypatch.setenv('CONSUMABLE_EXPORT_DIR', str(tmp_path / 'exports'))
+    item = make_item(db, name='=1+1', quantity='0.3', unit='克')
+    event = operation(db, item, 'consume', '0.1', note='=HYPERLINK("https://example.org")')['id']
+    db.execute("UPDATE stock_events SET created_at='2026-11-07 17:00:00' WHERE id=?", (event,))
+    conversation = chat.new_conversation(db, 'desktop')['conversation_id']
+    db.commit()
+    database = Path(db.execute('PRAGMA database_list').fetchone()[2])
+    before = digest(database)
+    filters = {'action': 'consume', 'actor': '测试教师', 'from_date': '2026-11-08', 'to_date': '2026-11-08'}
+    result = chat._run_read_tool(db, conversation, 'export_history', filters, [], server.history_rows)
+    db.commit()
+    assert result['row_count'] == 1 and result['filters'] == filters
+    record = db.execute('SELECT * FROM exported_files WHERE id=?', (result['id'],)).fetchone()
+    content = Path(record['path']).read_bytes()
+    assert record['conversation_id'] == conversation
+    assert hashlib.sha256(content).hexdigest() == result['sha256']
+    workbook = load_workbook(io.BytesIO(content))
+    rows = list(workbook['业务历史'].values)
+    row = dict(zip(rows[0], rows[1], strict=True))
+    assert (row['id'], row['item_id'], row['delta_quantity'], row['quantity_after']) == (event, item, '-0.1', '0.2')
+    assert row['item_name'] == '=1+1' and row['note'].startswith('=HYPERLINK')
+    assert all(cell.data_type != 'f' for sheet in workbook for cells in sheet for cell in cells)
+    metadata = dict(list(workbook['导出说明'].values)[1:])
+    assert all(metadata[key] == value for key, value in filters.items())
+    assert metadata['row_count'] == 1 and metadata['generated_at'].endswith('+08:00')
+    monkeypatch.setattr(server, 'connect', lambda: connect(database))
+    with TestClient(server.app) as client:
+        download = client.get(result['url'])
+        assert download.status_code == 200 and download.content == content
+        direct = client.get('/api/export/history', params=filters)
+        assert direct.status_code == 200
+        assert list(load_workbook(io.BytesIO(direct.content))['业务历史'].values) == rows
+    assert digest(database) == before
+
+
 def preparation_data(ids, **extra):
     return {"name": "容量测量", "course": "化学实验", "venue": "实验室",
             "starts_at": "2026-12-01T08:00:00+08:00", "ends_at": "2026-12-01T12:00:00+08:00",

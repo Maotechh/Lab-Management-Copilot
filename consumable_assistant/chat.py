@@ -35,7 +35,7 @@ inventory_search 的 query 使用教师给出的完整耗材名称，规格可�
 - inventory_import_preview：attachment_id、mode（add 或 overwrite），可选 category，只预览导入。
 - business_preview：kind 和 payload，格式见业务 JSON Schema。编号必须来自当前对话中已查询的记录。一次完整任务使用一个计划，混合操作使用 mixed。
 - analyze_attachments：attachment_ids 和 code（Python 程序），仅分析选定附件，输出文件写入 /output。分析结果不能直接修改业务数据，正式数量由服务器校验。
-- export_inventory：可选 query、lab、category。export_task：task_id，导出服务器保存的计划和实际结果。
+- export_inventory：可选 query、lab、category。export_history：可选 q、actor、action、from_date、to_date，导出实际业务历史。export_task：task_id，导出服务器保存的计划和实际结果。
 完整实验准备使用 preparation，按人、按组、固定和备用数量计算，明确消耗或借用。库存不足时仍预留已有数量，保存未满足需求和采购草案。draft 不表示订购，预计到货不表示实际到货。补充预留使用 preparation_update 的 replenish，必须重新预览确认。
 准备和预留不等于实际取用。归还必须关联原借用记录，明确待清洗、破损或遗失。日期按照上海时区解释，计划显示明确时间和偏移。
 业务预览只能称为待确认。预览后结束本轮，不能声称业务已完成。更正人数、数量、位置或时间后重新查询并生成完整预览。所有教师共享对话，姓名未经身份验证。
@@ -348,6 +348,17 @@ def _run_read_tool(
 
         content = export_inventory_workbook(conn, q=str(args.get("query") or ""), lab=args.get("lab") or None, category=args.get("category") or None)
         return {"type": "export", **exports.save(conn, conversation_id, content, "inventory.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+    if name == "export_history":
+        from . import exports
+
+        filters = {key: args[key] for key in ("q", "actor", "action", "from_date", "to_date") if args.get(key)}
+        if args.get("query") and not filters.get("q"):
+            filters["q"] = args["query"]
+        rows = history_fn(conn, {**filters, "limit": 10000})
+        content = exports.history_workbook(rows, filters)
+        return {"type": "export", "row_count": len(rows), "filters": filters,
+                **exports.save(conn, conversation_id, content, "history.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
     if name == "export_task":
         from .exports import task_report
 

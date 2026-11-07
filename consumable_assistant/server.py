@@ -19,7 +19,6 @@ from urllib.parse import unquote, urlsplit
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from openpyxl import Workbook
 from pydantic import BaseModel, Field
 
 from . import chat as chat_session
@@ -1028,35 +1027,12 @@ def history(request: Request):
 
 @app.get("/api/export/history")
 def export_history(request: Request):
+    from .exports import history_workbook
+
     with connect() as conn:
-        rows = history_rows(conn, {**dict(request.query_params), "limit": 10000})
-    workbook = Workbook()
-    sheet = workbook.active
-    fields = [
-        "created_at",
-        "actor",
-        "action_label",
-        "item_name",
-        "spec",
-        "lab",
-        "location_code",
-        "delta_quantity",
-        "quantity_after",
-        "note",
-    ]
-    sheet.append(fields)
-    for row in rows:
-        sheet.append(
-            [
-                str(row.get(key) or "").replace("=", "\uff1d", 1)
-                if isinstance(row.get(key), str) and row[key].startswith("=")
-                else row.get(key)
-                for key in fields
-            ]
-        )
-    output = io.BytesIO()
-    workbook.save(output)
-    return excel(output.getvalue(), "history.xlsx")
+        filters = dict(request.query_params)
+        rows = history_rows(conn, {**filters, "limit": 10000})
+    return excel(history_workbook(rows, filters), "history.xlsx")
 
 
 def excel(content: bytes, name: str):

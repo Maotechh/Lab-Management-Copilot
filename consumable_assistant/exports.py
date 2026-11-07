@@ -6,11 +6,38 @@ import io
 import json
 import os
 import uuid
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook
 
 from .settings import DB_PATH
+
+
+def history_workbook(rows: list[dict], filters: dict) -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "业务历史"
+    fields = ["created_at", "actor", "action_label", "item_name", "spec",
+              "lab", "location_code", "delta_quantity", "quantity_after", "note",
+              "id", "item_id", "unit", "related_id", "reversed_by", "changes"]
+    sheet.append(fields)
+    for row in rows:
+        sheet.append([row.get(key) for key in fields])
+        for cell in sheet[sheet.max_row]:
+            if isinstance(cell.value, str):
+                cell.data_type = "s"
+    source = workbook.create_sheet("导出说明")
+    source.append(["字段", "内容"])
+    for key, value in {"generated_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
+                       "row_count": len(rows), **filters}.items():
+        source.append([key, value])
+        if isinstance(value, str):
+            source.cell(source.max_row, 2).data_type = "s"
+    output = io.BytesIO()
+    workbook.save(output)
+    return output.getvalue()
 
 
 def directory() -> Path:

@@ -23,7 +23,7 @@ from .dsh_client import DSHUnavailable, run_dsh
 TOOL_NAMES = frozenset({
     "inventory_search", "workflow_query", "history_search", "prepare_attachment",
     "inventory_import_preview", "business_preview", "export_inventory",
-    "read_attachment", "analyze_attachments", "export_task",
+    "read_attachment", "analyze_attachments", "export_task", "export_history",
 })
 
 
