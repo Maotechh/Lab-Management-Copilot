@@ -168,6 +168,9 @@ install -m 0644 "$release_dir/deploy/nginx.conf" /etc/nginx/sites-available/lab-
 ln -sfn /etc/nginx/sites-available/lab-management /etc/nginx/sites-enabled/lab-management
 if [[ -L /etc/nginx/sites-enabled/default ]]; then unlink /etc/nginx/sites-enabled/default; fi
 nginx -t
+if command -v ufw >/dev/null && LC_ALL=C ufw status | grep -q '^Status: active'; then
+    ufw allow from 10.0.0.0/8 to 10.15.21.115 port 443 proto tcp comment 'Lab management campus and VPN HTTPS'
+fi
 ln -sfn "$release_dir" "$app_root/current.next"
 mv -Tf "$app_root/current.next" "$app_root/current"
 systemctl daemon-reload
