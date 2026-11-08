@@ -92,10 +92,15 @@ def main():
                     sha256=result['sha256'], filters=result['filters'], event_id=event))
                 args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2))
                 print(json.dumps(report['results'][-1], ensure_ascii=False), flush=True)
-        report.update(passed=3, unconfirmed_business_changes=0)
-        args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+        report.update(unconfirmed_business_changes=0)
         return 0
+    except Exception as exc:
+        report['failure'] = dict(type=type(exc).__name__, detail=str(exc)[:2000])
+        raise
     finally:
+        report['passed'] = len(report['results'])
+        report['business_state_unchanged'] = digest(database) == before
+        args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2))
         stop_server(process)
 
 
