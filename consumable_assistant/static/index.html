@@ -1,76 +1,23 @@
-<!doctype html>
-<html lang="zh-CN">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>耗材智能管理助手</title>
-    <link rel="icon" href="data:," />
-    <link rel="manifest" href="/static/manifest.webmanifest" />
-    <meta name="theme-color" content="#2563eb" />
-    <link rel="stylesheet" href="/static/styles.css" />
-  </head>
-  <body>
-    <div class="app-frame">
-      <aside class="sidebar">
-        <div class="brand">
-          <div class="brand-mark">CA</div>
-          <div>
-            <h1>耗材智能管理助手</h1>
-            <p>校内库存控制台</p>
-          </div>
-        </div>
-        <p class="sidebar-copy">
-          面向化学实验教学平台的库存查询、预警、出入库和实验准备清单。
-        </p>
-        <nav class="tabs" aria-label="主导航">
-          <button class="tab active" data-tab="chat"><i data-lucide="message-square" class="icon-sm"></i>聊天助手</button>
-          <button class="tab" data-tab="search"><i data-lucide="search" class="icon-sm"></i>库存查询</button>
-          <button class="tab" data-tab="alerts"><i data-lucide="alert-triangle" class="icon-sm"></i>库存预警</button>
-          <button class="tab" data-tab="prepare"><i data-lucide="scan-search" class="icon-sm"></i>批量查询</button>
-          <button class="tab" data-tab="admin"><i data-lucide="database" class="icon-sm"></i>数据管理</button>
-          <button class="tab" data-tab="loans"><i data-lucide="handshake" class="icon-sm"></i>借用与归还</button>
-          <button class="tab" data-tab="lessons"><i data-lucide="calendar-days" class="icon-sm"></i>实验安排</button>
-          <button class="tab" data-tab="purchases"><i data-lucide="shopping-cart" class="icon-sm"></i>采购跟踪</button>
-          <button class="tab" data-tab="maintenance"><i data-lucide="clipboard-check" class="icon-sm"></i>清点与维护</button>
-          <button class="tab" data-tab="history"><i data-lucide="history" class="icon-sm"></i>操作历史</button>
-        </nav>
-        <div class="ai-health">
-          <span class="badge" id="aiStatus">AI 状态待检查</span>
-          <button id="aiCheckBtn" class="secondary" title="检查 AI 连接"><i data-lucide="refresh-cw" class="icon-sm"></i>检查 AI</button>
-        </div>
-        <div class="sidebar-card">
-          <span class="small-label">快捷动作</span>
-          <div class="sidebar-actions">
-            <button id="refreshAllBtn" class="secondary"><i data-lucide="refresh-cw" class="icon-sm"></i>刷新</button>
-            <a class="button secondary" href="/api/export/inventory"><i data-lucide="download" class="icon-sm"></i>导出库存</a>
-          </div>
-        </div>
-      </aside>
-
-      <section class="workspace">
-        <header class="app-header">
-          <div>
-            <span class="eyebrow">School Lab Ops</span>
-            <p id="statusLine">正在读取数据</p>
-          </div>
-          <div class="header-actions">
-            <label class="operator-field">操作人<input id="operatorName" autocomplete="name" placeholder="姓名" aria-describedby="actorNote" /></label>
-            <small id="actorNote">自行登记，未经身份核验</small>
-            <button id="requestNotifyBtn" class="secondary" title="允许浏览器通知" aria-label="允许浏览器通知"><i data-lucide="bell" class="icon-sm"></i>允许通知</button>
-          </div>
-        </header>
-
-        <main class="app-shell">
-          <div id="profileBanner" class="notice" role="status" hidden></div>
-          <div id="pendingRequest" class="notice" role="status" hidden></div>
-          <div id="pageError" role="alert" class="notice danger" hidden></div>
-          <section class="metrics" id="metrics"></section>
-
-          <section class="tab-panel" id="tab-search">
-            <div class="surface">
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><meta name="theme-color" content="#166653"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="耗材助手"><title>耗材助手 · 实验室管理</title><link rel="icon" href="/static/icon-192.png"><link rel="apple-touch-icon" href="/static/icon-192.png"><link rel="manifest" href="/static/manifest.webmanifest"><link rel="stylesheet" href="/static/styles.css"></head><body data-page="chat"><a href="#mainContent" class="skip-link">跳转至主要内容</a><div class="app-frame"><aside class="sidebar" id="sidebar"><a class="brand" href="/?tab=chat"><span class="brand-mark"><i data-lucide="flask-conical" aria-hidden="true"></i></span><span><strong>耗材助手</strong><small>实验室管理</small></span></a><nav class="primary-nav" aria-label="主要导航"><button type="button" class="tab " data-tab="chat"><i data-lucide="message-circle" aria-hidden="true"></i><span>助手</span></button><button type="button" class="tab " data-tab="search"><i data-lucide="boxes" aria-hidden="true"></i><span>库存</span></button><button type="button" class="tab " data-tab="tasks"><i data-lucide="clipboard-list" aria-hidden="true"></i><span>事务</span></button><button type="button" class="tab " data-tab="more"><i data-lucide="grid-2x2" aria-hidden="true"></i><span>更多</span></button></nav><section class="conversation-navigation"><div class="section-heading"><h2>共享对话</h2><button id="newConversation" type="button" class="icon-only quiet" aria-label="新建共享对话"><i data-lucide="square-pen" aria-hidden="true"></i></button></div><label class="conversation-search"><i data-lucide="search" aria-hidden="true"></i><input id="conversationSearch" type="search" placeholder="查找对话" aria-label="查找共享对话"></label><select id="sharedConversation" class="sr-only" aria-label="选择共享对话" tabindex="-1"></select><div id="conversationList" class="conversation-list"></div><button id="moreConversations" type="button" class="quiet" hidden>加载更多对话</button></section><footer class="sidebar-footer"><span class="connection-dot"></span><span>校内共享空间</span><button type="button" class="icon-only quiet" data-open-settings aria-label="使用设置"><i data-lucide="settings" aria-hidden="true"></i></button></footer></aside><section class="workspace"><header class="app-header"><div class="header-context"><button type="button" id="openNavigation" class="icon-only quiet mobile-only" aria-label="打开导航与对话列表"><i data-lucide="panel-left" aria-hidden="true"></i></button><div><h1 id="pageTitle">聊天助手</h1><p id="statusLine" role="status">正在连接实验室</p></div></div><div class="header-actions"><button type="button" id="quickSearch" class="quiet icon-only" aria-label="查找库存"><i data-lucide="search" aria-hidden="true"></i></button><button type="button" id="actorButton" class="actor-button" data-open-settings><i data-lucide="user-round" aria-hidden="true"></i><span id="actorDisplay">登记姓名</span></button></div></header><div class="system-notices"><div id="profileBanner" class="notice" role="status" hidden></div><div id="pendingRequest" class="notice" role="status" hidden></div><div id="pageError" role="alert" class="notice danger" hidden></div></div><main class="app-shell" id="mainContent" tabindex="-1"><nav class="section-tabs" id="taskNavigation" aria-label="事务分类" hidden><button type="button" class="tab " data-tab="tasks"><i data-lucide="clipboard-list" aria-hidden="true"></i><span>待处理</span></button><button type="button" class="tab " data-tab="loans"><i data-lucide="handshake" aria-hidden="true"></i><span>借用归还</span></button><button type="button" class="tab " data-tab="lessons"><i data-lucide="calendar-days" aria-hidden="true"></i><span>实验安排</span></button><button type="button" class="tab " data-tab="purchases"><i data-lucide="shopping-cart" aria-hidden="true"></i><span>采购</span></button><button type="button" class="tab " data-tab="alerts"><i data-lucide="bell" aria-hidden="true"></i><span>库存提醒</span></button></nav><div class="section-back" id="sectionBack" hidden><button type="button" class="quiet tab" data-tab="more"><i data-lucide="arrow-left" aria-hidden="true"></i>全部工具</button></div><section class="metrics" id="metrics" aria-label="库存概况" hidden></section><section class="tab-panel active" id="tab-chat" aria-label="聊天助手">
+ <div class="chat-layout" id="chatLayout">
+  <div class="conversation-main">
+   <div class="conversation-heading"><div><span class="eyebrow">实验室共享对话</span><h2 id="conversationTitle">新的对话</h2></div><button type="button" id="conversationPicker" class="quiet" aria-label="查看共享对话"><i data-lucide="list" aria-hidden="true"></i><span>对话列表</span></button></div>
+   <div class="thread-scroll" id="threadScroll"><button id="olderMessages" type="button" class="quiet older-messages" hidden>查看更早的消息</button><div id="chatMessages" class="chat-transcript" aria-live="polite" aria-relevant="additions text"></div></div>
+   <div id="chatRunStatus" class="run-list" aria-live="polite"></div>
+   <button id="taskBanner" type="button" class="task-banner" hidden><i data-lucide="clipboard-check" aria-hidden="true"></i><span><strong id="taskBannerTitle">有一项变更需要确认</strong><small id="taskBannerDetail">查看完整预览后确认</small></span><i data-lucide="chevron-right" aria-hidden="true"></i></button>
+   <div class="composer-area">
+    <div class="composer" id="composer"><div id="attachmentPreviews" class="attachment-previews"></div><label for="chatText" class="sr-only">向耗材助手发送消息</label><textarea id="chatText" rows="1" placeholder="询问耗材位置，或说明需要处理的事情…" enterkeyhint="enter"></textarea>
+     <div class="composer-toolbar"><div class="composer-tools"><label class="attachment-button" for="chatFile" tabindex="0" role="button"><i data-lucide="paperclip" aria-hidden="true"></i><span>附件</span></label><input id="chatFile" class="sr-only" type="file" multiple accept=".xlsx,.xls,.csv,.jpg,.jpeg,.png,.webp,.heic,.heif"><button id="recordVoice" type="button" class="quiet"><i data-lucide="mic" aria-hidden="true"></i><span>录音</span></button><button id="stopVoice" type="button" class="record-stop" hidden>停止并识别</button><button id="cancelVoice" type="button" class="quiet" hidden>取消</button></div><button id="previewBtn" type="button" class="primary send-button"><span>发送</span><i data-lucide="arrow-up" aria-hidden="true"></i></button></div>
+    </div><span id="chatAttachmentName" class="sr-only"></span><p id="voiceStatus" role="status" class="voice-status"></p><div class="composer-caption"><span>业务变更在核对预览后执行</span><span id="sendHint">Enter 发送，Shift＋Enter 换行</span></div>
+   </div>
+  </div>
+  <aside class="plan-panel" id="planPanel" aria-labelledby="planTitle" hidden><header class="plan-heading"><div><span class="eyebrow">本次计划</span><h2 id="planTitle" tabindex="-1">核对本次变更</h2></div><button type="button" id="closePlan" class="icon-only quiet" aria-label="关闭预览"><i data-lucide="x" aria-hidden="true"></i></button></header><p id="planMeta" class="plan-meta"></p><div id="previewBox" class="preview"></div><footer class="plan-footer"><p id="planStateNote" role="status"></p><button id="commitBtn" type="button" class="primary" disabled>生成确认预览</button><div id="chatTaskActions" hidden></div></footer></aside>
+ </div>
+</section>          <section class="tab-panel" id="tab-search">
+            <div class="page-intro"><span class="eyebrow">库存与位置</span><h2>找到耗材，再处理需要的事情</h2><p>按名称、规格、房间或柜子查询。选择耗材可查看详情并登记操作。</p></div><div class="surface">
               <div class="toolbar">
-                <input id="searchInput" type="search" placeholder="名称、规格、实验室、位置" />
-                <select id="categoryFilter">
+                <input aria-label="耗材名称、规格或位置" id="searchInput" type="search" placeholder="名称、规格、实验室、位置" />
+                <select id="categoryFilter" aria-label="耗材类别">
                   <option value="">全部类别</option>
                   <option value="普通化学">普通化学</option>
                   <option value="有机化学">有机化学</option>
@@ -80,7 +27,7 @@
                 <button id="searchBtn"><i data-lucide="search" class="icon-sm"></i>查询</button>
               </div>
               <div id="searchSummary" class="summary-strip muted">输入耗材名称、规格或位置开始查询。</div>
-              <div class="form-grid"><label>分配开始时间（上海时间）<input id="searchStart" type="datetime-local" /></label><label>分配结束时间（上海时间）<input id="searchEnd" type="datetime-local" /></label></div>
+              <details class="advanced-filter"><summary>按实验时间检查可用数量</summary><div class="form-grid"><label>分配开始时间（上海时间）<input id="searchStart" type="datetime-local" /></label><label>分配结束时间（上海时间）<input id="searchEnd" type="datetime-local" /></label><button id="applyTimeFilter" type="button">应用时间范围</button></div></details>
               <div class="table-wrap responsive-cards">
                 <table>
                   <thead>
@@ -100,58 +47,8 @@
               </div>
             </div>
           </section>
-
-          <section class="tab-panel active" id="tab-chat">
-            <div class="surface chat-surface">
-              <div class="toolbar compact">
-                <label for="sharedConversation">共享对话</label>
-                <select id="sharedConversation" aria-label="选择共享对话"></select>
-                <button id="newConversation" type="button">新建对话</button>
-                <button id="moreConversations" type="button" hidden>更多对话</button>
-                <button id="olderMessages" type="button" hidden>以前的消息</button>
-              </div>
-              <p id="chatConnection" class="muted small-text" role="status">正在连接共享对话</p>
-              <div id="chatMessages" class="chat-transcript" aria-live="polite"></div>
-              <div id="chatRunStatus" aria-live="polite"></div>
-              <label class="field-label" for="chatText">消息</label>
-              <textarea id="chatText" rows="3" placeholder="查找物品、准备实验或记录耗材操作"></textarea>
-              <div class="toolbar compact chat-composer-actions">
-                <label class="chat-attachment-label" for="chatFile"><i data-lucide="paperclip" class="icon-sm"></i>附加文件</label>
-                <input id="chatFile" type="file" multiple accept=".xlsx,.xls,.csv,.jpg,.jpeg,.png,.webp,.heic,.heif" />
-                <span id="chatAttachmentName" class="muted small-text"></span>
-                <button id="previewBtn" type="button" class="primary"><i data-lucide="send" class="icon-sm"></i>发送</button>
-                <button id="recordVoice" type="button">录音</button>
-                <button id="stopVoice" type="button" hidden>停止并识别</button>
-                <button id="cancelVoice" type="button" hidden>取消录音</button>
-                <button id="commitBtn" type="button" class="secondary" disabled><i data-lucide="check" class="icon-sm"></i>生成确认预览</button>
-              </div>
-              <p id="voiceStatus" role="status" class="muted small-text"></p>
-              <div id="attachmentPreviews" class="attachment-previews"></div>
-              <div id="chatTaskActions" class="toolbar compact" hidden></div>
-              <div id="previewBox" class="preview"></div>
-            </div>
-            <div class="surface">
-                <h2>最近操作</h2>
-                <div class="table-wrap short responsive-cards">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>时间</th>
-                        <th>动作</th>
-                        <th>耗材</th>
-                        <th>数量</th>
-                        <th>结果</th>
-                        <th>操作</th>
-                      </tr>
-                    </thead>
-                    <tbody id="transactionRows"></tbody>
-                  </table>
-                </div>
-            </div>
-          </section>
-
-          <section class="tab-panel" id="tab-alerts">
-            <div class="surface">
+<section class="tab-panel" id="tab-tasks"><div class="page-intro"><span class="eyebrow">共享事务</span><h2>接下来需要处理的事情</h2><p>查看各个对话中的计划，以及尚未完成的借还、实验和采购。</p></div><div id="taskOverview" class="task-overview"></div><section class="surface"><div class="section-heading"><h3>聊天计划</h3><button type="button" id="refreshTasks" class="quiet"><i data-lucide="refresh-cw" aria-hidden="true"></i>刷新</button></div><p class="muted small-text">进入对应对话后，可以查看完整内容并确认。</p><div id="sharedTasks" class="shared-task-list" aria-live="polite"></div></section><section class="surface"><div class="section-heading"><h3>最近操作</h3><button type="button" class="tab quiet" data-tab="history">全部记录<i data-lucide="arrow-up-right" aria-hidden="true"></i></button></div><div class="table-wrap responsive-cards"><table><thead><tr><th>时间</th><th>动作</th><th>耗材</th><th>数量</th><th>结果</th><th>操作</th></tr></thead><tbody id="transactionRows"></tbody></table></div></section></section><section class="tab-panel" id="tab-more"><div class="page-intro"><span class="eyebrow">实验室工具</span><h2>按需要选择操作方式</h2><p>日常工作可以直接在助手中完成，也可以使用下方表单。</p></div><div class="tool-grid"><button type="button" class="tool-card tab" data-tab="prepare"><i data-lucide="file-spreadsheet" aria-hidden="true"></i><span><strong>清单核对</strong><small>逐项匹配 Excel 清单与现有库存</small></span><i data-lucide="chevron-right" aria-hidden="true"></i></button><button type="button" class="tool-card tab" data-tab="maintenance"><i data-lucide="clipboard-check" aria-hidden="true"></i><span><strong>清点与维护</strong><small>清点数量、修改资料、管理物品状态</small></span><i data-lucide="chevron-right" aria-hidden="true"></i></button><button type="button" class="tool-card tab" data-tab="admin"><i data-lucide="folder-input" aria-hidden="true"></i><span><strong>表格与位置</strong><small>导入库存表，维护房间与柜子</small></span><i data-lucide="chevron-right" aria-hidden="true"></i></button><button type="button" class="tool-card tab" data-tab="history"><i data-lucide="history" aria-hidden="true"></i><span><strong>操作记录</strong><small>按日期和操作人查询、导出记录</small></span><i data-lucide="chevron-right" aria-hidden="true"></i></button><button type="button" class="tool-card" data-open-settings><i data-lucide="settings" aria-hidden="true"></i><span><strong>使用设置</strong><small>操作人姓名、通知、安装与设备信息</small></span><i data-lucide="chevron-right" aria-hidden="true"></i></button><a class="tool-card" href="/api/export/inventory"><i data-lucide="download" aria-hidden="true"></i><span><strong>导出库存</strong><small>下载当前全部库存资料</small></span><i data-lucide="chevron-right" aria-hidden="true"></i></a></div></section>          <section class="tab-panel" id="tab-alerts">
+            <div class="page-intro"><span class="eyebrow">库存提醒</span><h2>需要关注的耗材</h2><p>查看数量不足的物品，调整阈值或登记处理情况。</p></div><div class="surface">
               <div class="table-wrap responsive-cards">
                 <table>
                   <thead>
@@ -171,14 +68,13 @@
               </div>
             </div>
           </section>
-
           <section class="tab-panel" id="tab-prepare">
             <div class="surface">
               <div class="toolbar">
                 <label class="field-label compact-field" for="courseName">课程
                   <input id="courseName" type="text" placeholder="例如：普通化学实验" />
                 </label>
-                <input id="prepareFile" type="file" accept=".xlsx,.xls" />
+                <label class="file-picker" for="prepareFile">实验耗材清单<input id="prepareFile" type="file" accept=".xlsx,.xls" /></label>
                 <button id="prepareBtn"><i data-lucide="file-spreadsheet" class="icon-sm"></i>分析批量清单</button>
                 <button id="consumePrepareBtn" class="primary" disabled><i data-lucide="package-minus" class="icon-sm"></i>扣减已选库存</button>
                 <button id="exportPrepareBtn" class="secondary" disabled><i data-lucide="download" class="icon-sm"></i>导出结果</button>
@@ -213,14 +109,13 @@
               </div>
             </div>
           </section>
-
           <section class="tab-panel" id="tab-admin">
             <div class="two-column admin-grid">
               <div class="surface">
                 <h2>批量上传库存</h2>
                 <p class="muted small-text">表格至少需要“耗材名称”和“数量”，建议同时填写类别、实验室、位置、规格型号、数量单位和库存预警。</p>
                 <div class="toolbar upload-form">
-                  <input id="batchUploadFile" type="file" accept=".xlsx,.xls" />
+                  <label class="file-picker" for="batchUploadFile">库存数据表<input id="batchUploadFile" type="file" accept=".xlsx,.xls" /></label>
                   <select id="batchUploadMode" aria-label="批量上传方式">
                     <option value="add">新增并累加数量</option>
                     <option value="overwrite">覆盖当前数量</option>
@@ -264,29 +159,10 @@
               </div>
               <pre id="adminLog"></pre>
             </div>
-          </section>
-          <section class="tab-panel" id="tab-loans"></section>
-          <section class="tab-panel" id="tab-lessons"></section>
-          <section class="tab-panel" id="tab-purchases"></section>
-          <section class="tab-panel" id="tab-maintenance"></section>
-          <section class="tab-panel" id="tab-history"></section>
-        </main>
-      </section>
-    </div>
-
-    <div id="toast" role="status" aria-live="polite"></div>
-    <dialog id="businessConfirmation" aria-labelledby="businessConfirmTitle">
-      <h2 id="businessConfirmTitle">确认业务变更</h2>
-      <div id="businessConfirmationBody"></div>
-      <p id="businessConfirmDetails"></p>
-      <form method="dialog" class="toolbar">
-        <button value="cancel" type="submit">暂不执行</button>
-        <button value="confirm" type="submit" class="primary">确认执行全部变更</button>
-      </form>
-    </dialog>
-    <script src="/static/lucide.min.js"></script>
-    <script src="/static/app.js"></script>
-    <script src="/static/mobile.js"></script>
-    <script src="/static/operations.js"></script>
-  </body>
-</html>
+          </section><section class="tab-panel" id="tab-loans"></section><section class="tab-panel" id="tab-lessons"></section><section class="tab-panel" id="tab-purchases"></section><section class="tab-panel" id="tab-maintenance"></section><section class="tab-panel" id="tab-history"></section></main></section><nav class="bottom-nav" aria-label="手机主要导航"><button type="button" class="tab " data-tab="chat"><i data-lucide="message-circle" aria-hidden="true"></i><span>助手</span></button><button type="button" class="tab " data-tab="search"><i data-lucide="boxes" aria-hidden="true"></i><span>库存</span></button><button type="button" class="tab " data-tab="tasks"><i data-lucide="clipboard-list" aria-hidden="true"></i><span>事务</span></button><button type="button" class="tab " data-tab="more"><i data-lucide="grid-2x2" aria-hidden="true"></i><span>更多</span></button></nav></div><div id="toast" role="status" aria-live="polite"></div>
+<dialog id="navigationDialog" class="navigation-dialog" aria-label="导航与共享对话"><div class="drawer-heading"><strong>实验室管理</strong><button type="button" class="quiet icon-only" id="closeNavigation" aria-label="关闭对话列表"><i data-lucide="x" aria-hidden="true"></i></button></div><div id="mobileSidebarSlot"></div></dialog>
+<dialog id="settingsDialog" aria-labelledby="settingsTitle"><header class="dialog-heading"><div><span class="eyebrow">此设备</span><h2 id="settingsTitle">使用设置</h2></div><button type="button" class="quiet icon-only" data-close-dialog aria-label="关闭设置"><i data-lucide="x" aria-hidden="true"></i></button></header><div class="dialog-content"><section class="settings-section"><h3>操作人</h3><label class="field-label" for="operatorName">您的姓名</label><input id="operatorName" autocomplete="name" placeholder="填写姓名" aria-describedby="actorNote"><p id="actorNote" class="muted small-text">用于记录发起人与确认人。姓名由本人填写，不表示身份已经验证。</p><button type="button" id="saveActor" class="primary">保存姓名</button></section><section class="settings-section"><h3>手机使用与通知</h3><p>iPhone 请使用 Safari 添加至主屏幕，Android 请在 Chrome 中安装网站应用。</p><button type="button" id="installApp" hidden>安装到此设备</button><button id="requestNotifyBtn" type="button"><i data-lucide="bell" aria-hidden="true"></i>允许通知</button><p id="notificationStatus" class="muted small-text"></p><p class="muted small-text">通知只显示通用提醒，详情需要连接校园网或学校 VPN 查看。</p><p class="device-code">设备编号：<span id="deviceId"></span></p></section><section class="settings-section"><h3>连接与数据</h3><p id="chatConnection" role="status" class="muted small-text">正在连接共享对话</p><span id="aiStatus" class="badge">AI 状态待检查</span><div class="toolbar"><button type="button" id="aiCheckBtn">检查模型连接</button><button type="button" id="refreshAllBtn">刷新页面数据</button></div></section></div></dialog>
+<dialog id="businessConfirmation" aria-labelledby="businessConfirmTitle"><header class="dialog-heading"><div><span class="eyebrow">业务变更</span><h2 id="businessConfirmTitle">核对本次变更</h2></div></header><div class="dialog-content"><div id="businessConfirmationBody"></div><p id="businessConfirmDetails" class="muted small-text"></p></div><form method="dialog" class="dialog-footer"><button value="cancel" type="submit">暂不执行</button><button value="confirm" type="submit" class="primary">确认执行全部变更</button></form></dialog>
+<dialog id="itemDialog" aria-labelledby="itemTitle"><header class="dialog-heading"><div><span class="eyebrow">耗材详情</span><h2 id="itemTitle"></h2></div><button type="button" class="quiet icon-only" data-close-dialog aria-label="关闭耗材详情"><i data-lucide="x" aria-hidden="true"></i></button></header><div class="dialog-content" id="itemDetails"></div></dialog>
+<dialog id="noteDialog" aria-labelledby="noteTitle"><form method="dialog"><header class="dialog-heading"><h2 id="noteTitle">填写原因</h2></header><div class="dialog-content"><label class="field-label" for="operationNote">原因或说明</label><textarea id="operationNote" rows="3" required></textarea></div><footer class="dialog-footer"><button value="cancel" formnovalidate>暂不处理</button><button value="continue" class="primary">查看变更预览</button></footer></form></dialog>
+<script src="/static/lucide.min.js"></script><script src="/static/app.js"></script><script src="/static/mobile.js"></script><script src="/static/operations.js"></script><script src="/static/interface.js"></script></body></html>

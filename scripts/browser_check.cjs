@@ -8,12 +8,22 @@ fs.mkdirSync(output,{recursive:true});
 let runningBrowser;
 let runningPage;
 (async()=>{
- const browser=await chromium.launch({headless:true,...(process.env.BROWSER_CHANNEL?{channel:process.env.BROWSER_CHANNEL}:{})});runningBrowser=browser;
+ const browser=await chromium.launch({headless:true,...(process.env.BROWSER_EXECUTABLE?{executablePath:process.env.BROWSER_EXECUTABLE}:{}),...(process.env.BROWSER_CHANNEL?{channel:process.env.BROWSER_CHANNEL}:{})});runningBrowser=browser;
  const page=await browser.newPage({viewport:{width:1440,height:1000},timezoneId:'America/New_York'});runningPage=page;
- const errors=[];page.on('pageerror',error=>errors.push(error.message));
+ const errors=[];const checks=[];page.on('pageerror',error=>errors.push(error.message));
  await page.goto(url);await page.waitForFunction(()=>document.querySelector('#loanItem')?.options.length>2);
- await page.locator('#operatorName').fill('验证教师');
- const tab=async name=>{await page.locator(`.tab[data-tab="${name}"]`).click();};
+ await page.locator('#actorButton').click();await page.locator('#operatorName').fill('验证教师');await page.locator('#saveActor').click();
+ const tab=async name=>{
+   const visible=page.locator(`.tab[data-tab="${name}"]:visible`).first();
+   if(await visible.count()){await visible.click();return;}
+   if(['loans','lessons','purchases','alerts'].includes(name)){
+     await page.locator('.tab[data-tab="tasks"]:visible').first().click();
+     await page.locator(`#taskNavigation .tab[data-tab="${name}"]`).click();
+     return;
+   }
+   await page.locator('.tab[data-tab="more"]:visible').first().click();
+   await page.locator(`.tool-card.tab[data-tab="${name}"]`).click();
+ };
  const pollJson=async(path,ready)=>{
    const deadline=Date.now()+330000;let value;
    while(Date.now()<deadline){const response=await page.request.get(url+path);assert.equal(response.status(),200);value=await response.json();if(ready(value))return value;await page.waitForTimeout(250);}
@@ -78,7 +88,7 @@ let runningPage;
  await tab('prepare');await page.locator('#prepareFile').setInputFiles(preparePath);
  let response=page.waitForResponse(r=>r.url().endsWith('/api/prepare/preview'));await page.locator('#prepareBtn').click();assert.equal((await response).status(),200);
  await page.locator('[data-prepare-match]').waitFor();
- response=page.waitForResponse(r=>r.url().endsWith('/api/actions/prepare_remap'));await page.locator('[data-prepare-match]').selectOption(itemId);const remap=await response;assert.equal(remap.status(),200);await confirmPreview(await remap.json());
+ response=page.waitForResponse(r=>r.url().endsWith('/api/actions/prepare_remap'));await page.locator('[data-prepare-match]').selectOption(itemId);const remapAgain=await response;assert.equal(remapAgain.status(),200);await confirmPreview(await remapAgain.json());
  await page.waitForFunction(()=>!document.querySelector('[data-prepare-row]').disabled);
  await page.locator('[data-prepare-row]').check();await page.locator('#schedulePrepareBtn').click();
  for(const [id,value]of[['lessonName','Browser lesson '+Date.now()],['lessonCourse','Browser course'],['lessonVenue','Room 1'],['lessonStart','2026-12-02T10:00'],['lessonEnd','2026-12-02T11:00']])await page.locator('#'+id).fill(value);
@@ -93,7 +103,7 @@ let runningPage;
  const schedule=await page.evaluate(async name=>(await (await fetch('/api/workflows')).json()).schedules.find(row=>row.name===name),lessonName);
  assert.equal(schedule.starts_at,'2026-12-02T02:00:00.000000+00:00');
  await page.locator('#executeBorrower').fill('Browser class');
- page.once('dialog',dialog=>dialog.accept());response=page.waitForResponse(r=>r.url().endsWith('/api/actions/execute_schedule'));
+ response=page.waitForResponse(r=>r.url().endsWith('/api/actions/execute_schedule'));
  await page.locator(`[data-workflow=execute][data-id="${schedule.id}"]`).click();const execution=await response;assert.equal(execution.status(),200,await execution.text());await confirmPreview(await execution.json());
  await pollJson('/api/items/'+itemId,item=>item.ready==='30');
  await tab('admin');await page.locator('#batchUploadFile').setInputFiles(uploadPath);
@@ -114,16 +124,30 @@ let runningPage;
  response=page.waitForResponse(r=>r.url().includes('/api/chat/conversations/')&&r.url().endsWith('/messages'));await page.locator('#previewBtn').click();const chatResult=await response;assert.equal(chatResult.status(),200,await chatResult.text());
  const queued=await chatResult.json();assert.ok(queued.run_id);
  const completed=await pollJson('/api/chat/runs/'+queued.run_id,run=>['completed','failed','cancelled'].includes(run.status));
- assert.equal(completed.status,'completed',JSON.stringify(completed));
+ if(process.env.BROWSER_ALLOW_AI_UNAVAILABLE==='1')assert.ok(['completed','failed'].includes(completed.status),JSON.stringify(completed));
+ else assert.equal(completed.status,'completed',JSON.stringify(completed));
+ checks.push(completed.status==='completed'?'chat_query_completed':'chat_saved_when_ai_unavailable');
  await page.waitForFunction(()=>document.querySelectorAll('#chatMessages .chat-message').length>=2);
  const conversation=await page.evaluate(()=>localStorage.getItem('lab-chat-conversation'));
  await page.reload();await page.waitForFunction(id=>localStorage.getItem('lab-chat-conversation')===id&&document.querySelectorAll('#chatMessages .chat-message').length>=2,conversation);
  const phone=await browser.newPage({viewport:{width:390,height:844}});
  await phone.addInitScript(id=>{localStorage.setItem('lab-chat-conversation',id);localStorage.setItem('lab-actor','共享验证教师');},conversation);
- await phone.goto(url);await phone.locator('.tab[data-tab="chat"]').click();
+ await phone.goto(url);await phone.locator('.tab[data-tab="chat"]:visible').click();
  await phone.waitForFunction(name=>document.querySelector('#chatMessages').textContent.includes(name),name);
  assert.equal(await phone.evaluate(()=>localStorage.getItem('lab-chat-conversation')),conversation);
  await phone.close();
+ await tab('prepare');await page.locator('#prepareFile').setInputFiles(preparePath);
+ response=page.waitForResponse(r=>r.url().endsWith('/api/prepare/preview'));await page.locator('#prepareBtn').click();assert.equal((await response).status(),200);
+ await page.locator('[data-prepare-match]').waitFor();
+ response=page.waitForResponse(r=>r.url().endsWith('/api/actions/prepare_remap'));await page.locator('[data-prepare-match]').selectOption(itemId);const remap=await response;assert.equal(remap.status(),200);await confirmPreview(await remap.json());
+ await page.waitForFunction(()=>!document.querySelector('[data-prepare-row]').disabled);
+ await page.locator('[data-prepare-action]').selectOption('consume');await page.locator('[data-prepare-row]').check();
+ const readyBeforePrepare=Number(await page.evaluate(async id=>(await (await fetch('/api/items/'+id)).json()).ready,itemId));
+ response=page.waitForResponse(r=>r.url().endsWith('/api/prepare/consume')&&r.request().method()==='POST');await page.locator('#consumePrepareBtn').click();
+ const consumePreview=await response;assert.equal(consumePreview.status(),200,await consumePreview.text());const preparedPlan=await consumePreview.json();assert.equal(preparedPlan.status,'pending_confirmation');
+ assert.equal(Number(await page.evaluate(async id=>(await (await fetch('/api/items/'+id)).json()).ready,itemId)),readyBeforePrepare);
+ await confirmPreview(preparedPlan);
+ assert.equal(Number(await page.evaluate(async id=>(await (await fetch('/api/items/'+id)).json()).ready,itemId)),readyBeforePrepare-3);checks.push('prepare_consumption_requires_confirmation');
  for(const size of [{width:1440,height:1000},{width:390,height:844},{width:844,height:390}]){
    await page.setViewportSize(size);
    for(const name of ['search','chat','prepare','loans','lessons','purchases','maintenance','history','alerts','admin']){
@@ -133,6 +157,6 @@ let runningPage;
    }
    await tab('loans');await page.screenshot({path:`${output}/loans-${size.width}.png`,fullPage:true});
  }
- assert.deepEqual(errors,[]);console.log(JSON.stringify({browser:'passed',viewports:[1440,390,844],item_id:itemId,errors}));
+ assert.deepEqual(errors,[]);console.log(JSON.stringify({browser:'passed',checks,viewports:[1440,390,844],item_id:itemId,errors}));
  await browser.close();
 })().catch(async error=>{console.error(error);if(runningPage){console.error(await runningPage.locator('#pageError').textContent().catch(()=>''));await runningPage.screenshot({path:`${output}/failure.png`,fullPage:true}).catch(()=>{});}await runningBrowser?.close();process.exitCode=1;});

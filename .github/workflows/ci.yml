@@ -45,7 +45,5 @@ jobs:
 
     - name: Check JavaScript and installer syntax
       run: |
-        node --check consumable_assistant/static/app.js
-        node --check consumable_assistant/static/operations.js
-        node --check consumable_assistant/static/sw.js
+        for file in consumable_assistant/static/*.js; do node --check "$file"; done
         bash -n deploy/install.sh

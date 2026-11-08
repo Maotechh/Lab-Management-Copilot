@@ -2338,3 +2338,36 @@ def test_marked_notification_test_targets_one_device_and_preserves_inventory(db,
     assert db.execute('SELECT status FROM push_deliveries').fetchone()[0] == 'sent'
     assert stock.view(db, item)['ready'] == '100'
     assert db.execute('SELECT COUNT(*) FROM stock_events').fetchone()[0] == 0
+
+
+def test_shared_task_list_is_read_only_paginated_and_cross_device(db, monkeypatch):
+    from consumable_assistant import chat, server
+
+    make_item(db)
+    conversations = [chat.new_conversation(db, 'device-first')['conversation_id'] for _ in range(3)]
+    for index, conversation in enumerate(conversations):
+        message = db.execute(
+            "INSERT INTO chat_messages(conversation_id,request_id,role,content) VALUES (?,?,?,?)",
+            (conversation, uuid.uuid4().hex, 'user', f'待处理实验 {index}'),
+        ).lastrowid
+        db.execute(
+            "INSERT INTO chat_tasks(id,conversation_id,message_id,status,kind,plan_json,plan_hash,preview_json,expires_at,initiator) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (f'ui-task-{index}', conversation, message,
+             'completed' if index == 0 else 'pending_confirmation',
+             'stock', '{}', f'plan-{index}', '{}', '2026-12-01T00:00:00+00:00', '测试教师'),
+        )
+    db.commit()
+    database = Path(db.execute('PRAGMA database_list').fetchone()[2])
+    from scripts.full_backup import database_digest
+
+    monkeypatch.setattr(server, 'connect', lambda: connect(database))
+    with TestClient(server.app) as client:
+        before = database_digest(database)
+        first = client.get('/api/chat/tasks?limit=1', headers={'X-Device-ID':'device-second'}).json()
+        assert first['shared'] is True
+        assert [row['id'] for row in first['tasks']] == ['ui-task-2']
+        assert first['tasks'][0]['title'] == '待处理实验 2'
+        second = client.get('/api/chat/tasks', params={'limit':1, 'before':first['next_before']}).json()
+        assert [row['id'] for row in second['tasks']] == ['ui-task-1']
+        assert second['next_before'] is None
+        assert database_digest(database) == before

@@ -218,6 +218,24 @@ def list_chat_conversations(before: int | None = None, limit: int = 100):
         return {"conversations": values, "shared": True, "next_before": values[-1]["cursor"] if len(values) == min(max(limit, 1), 100) else None}
 
 
+@app.get("/api/chat/tasks")
+def list_shared_chat_tasks(before: int | None = None, limit: int = 100):
+    """Read pending plans across the same shared workspace as conversations."""
+    page_size = min(max(limit, 1), 100)
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT t.rowid AS cursor,t.id,t.conversation_id,t.status,t.kind,"
+            "t.initiator,t.expires_at,t.created_at,m.content AS title "
+            "FROM chat_tasks t JOIN chat_messages m ON m.id=t.message_id "
+            "WHERE t.status IN ('awaiting_details','pending_confirmation') "
+            "AND (? IS NULL OR t.rowid<?) ORDER BY t.rowid DESC LIMIT ?",
+            (before, before, page_size + 1),
+        ).fetchall()
+        values = [dict(row) for row in rows[:page_size]]
+        return {"tasks": values, "shared": True,
+                "next_before": values[-1]["cursor"] if len(rows) > page_size else None}
+
+
 @app.get("/api/chat/runs/{run_id}")
 def get_chat_run(run_id: str):
     with connect() as conn:
@@ -776,7 +794,14 @@ def form_preview(conn, kind: str, payload: dict, request: Request, conversation_
             conn.execute("BEGIN IMMEDIATE")
         actor = actor_name(request)
         chat_runtime.expire_plans(conn, conversation_id, request_id)
-        cursor = conn.execute("INSERT INTO chat_messages(conversation_id,request_id,role,content,request_hash,actor,device_id) VALUES (?,?,'user',?,?,?,?)", (conversation_id, request_id, "表单操作：" + kind, digest, actor, request.headers.get("x-device-id", "")))
+        operation_label = ACTION_LABELS.get(str(payload.get("action", "")), "库存变更") if kind == "stock" else {
+            "purchase": "采购处理", "schedule": "实验预留", "template": "实验模板",
+            "execute_schedule": "执行实验安排", "cancel_schedule": "取消实验安排",
+            "metadata": "修改耗材资料", "create_item": "新增耗材", "transfer": "位置转移",
+            "location_details": "修改位置资料", "alert": "调整提醒", "import": "表格导入",
+            "prepare": "清单处理", "undo": "撤销操作",
+        }.get(kind, "业务变更")
+        cursor = conn.execute("INSERT INTO chat_messages(conversation_id,request_id,role,content,request_hash,actor,device_id) VALUES (?,?,'user',?,?,?,?)", (conversation_id, request_id, "通过表单登记" + operation_label, digest, actor, request.headers.get("x-device-id", "")))
         attachments = [dict(row) for row in conn.execute("SELECT * FROM chat_attachments WHERE conversation_id=?", (conversation_id,))]
         result = chat_session._business_task(conn, conversation_id, cursor.lastrowid, request_id, {"kind": kind, "payload": payload}, attachments, dispatch, actor, validate_references=False)
         result["conversation_id"] = conversation_id

@@ -9,7 +9,7 @@ const state = {
   locationPreview: null,
   preparePreviewId: null,
   prepareActions: {},
-  chatConversationId: null,
+  chatConversationId: new URLSearchParams(location.search).get('conversation'),
   chatToken: null,
   chatConversationPromise: null,
   chatTaskId: null,
@@ -54,7 +54,8 @@ async function api(path, options = {}) {
   };
   if (writing) {
     let actor = $('#operatorName')?.value.trim() || localStorage.getItem('lab-actor') || '';
-    if (!actor) { $('#operatorName')?.focus(); throw new Error('请先填写操作人姓名'); }
+    if (!actor && window.ensureActorName) actor = await window.ensureActorName();
+    if (!actor) throw new Error('请填写操作人姓名后再继续');
     localStorage.setItem('lab-actor', actor);
     const signature = options.body instanceof FormData
       ? JSON.stringify([...options.body.entries()].map(([key,value]) => [key, value instanceof File ? `${value.name}:${value.size}:${value.lastModified}` : value]))
@@ -150,7 +151,10 @@ let chatListCursor;
 async function refreshConversationList(append = false) {
   const listing = await chatApi('/api/chat/conversations' + (append && chatListCursor ? `?before=${chatListCursor}` : ''));
   const select = $('#sharedConversation');
-  if (!append) select.innerHTML = '';
+  if (!append) { select.innerHTML = ''; state.conversations = []; }
+  state.conversations ||= [];
+  const seen = new Set(state.conversations.map(row => row.id));
+  state.conversations.push(...(listing.conversations || []).filter(row => !seen.has(row.id)));
   for (const row of listing.conversations || []) {
     const option = document.createElement('option'); option.value = row.id;
     option.textContent = `${row.title || '实验室对话'} · ${formatDate(row.updated_at)}`;
@@ -159,20 +163,27 @@ async function refreshConversationList(append = false) {
   select.value = state.chatConversationId || '';
   chatListCursor = listing.next_before;
   $('#moreConversations').hidden = !chatListCursor;
+  window.renderConversationNavigation?.(state.conversations);
 }
 
 async function selectConversation(id) {
   if (localStorage.getItem('lab-chat-pending')) throw new Error('请先重试尚未确认结果的原消息，再切换对话');
+  if ($('#chatFile').files.length) throw new Error('请先发送或移除附件，再切换对话');
+  if (state.chatConversationId) localStorage.setItem('lab-chat-draft-' + state.chatConversationId, $('#chatText').value);
   chatEvents?.close(); chatEvents = null;
   state.chatConversationId = id;
   localStorage.setItem('lab-chat-conversation', id);
+  $('#chatText').value = localStorage.getItem('lab-chat-draft-' + id) || '';
+  window.fitComposer?.();
   await updateChatSnapshot(id);
   await refreshConversationList();
 }
 
 async function createSharedConversation() {
+  if (localStorage.getItem('lab-chat-pending') || $('#chatFile').files.length) throw new Error('请先发送或处理当前消息，再新建对话');
   const created = await chatApi('/api/chat/conversations', {method:'POST'});
   await selectConversation(created.conversation_id);
+  window.navigateTo?.('chat');
 }
 
 async function updateChatSnapshot(id = state.chatConversationId) {
@@ -218,6 +229,7 @@ function renderChatRuns(runs) {
 
 async function showPlanConfirmation(result) {
   const dialog = $('#businessConfirmation');
+  dialog.returnValue = 'cancel';
   $('#businessConfirmationBody').innerHTML = businessPreviewHtml(result.preview);
   $('#businessConfirmDetails').textContent = '确认将执行以上全部变更。任何老师均可确认，姓名为本人填写。计划有效期为三十分钟。';
   return new Promise(resolve => {
@@ -230,23 +242,27 @@ async function loadChat() {
   await ensureChatConversation();
   const config = await api('/api/config');
   const banner = $('#profileBanner');
+  state.config = config;
   const notices = [];
   if (config.simulated) notices.push('当前为模拟数据环境。');
-  if (!config.inventory_confirmed) notices.push('库存资料尚未由教师确认，请核对实物后再用于教学操作。');
+  if (!config.inventory_confirmed) notices.push('附件库存尚未经老师核对，请先核对实物。');
   if (!config.notifications_configured) notices.push('手机后台通知尚未配置，低库存情况请在系统页面中查看。');
   banner.hidden = notices.length === 0;
   banner.textContent = notices.join(' ');
 }
 
 function restoreChatTask(tasks) {
-  const active = tasks.find(task => ['awaiting_details','pending_confirmation'].includes(task.status));
+  const pending = tasks.filter(task => ['awaiting_details','pending_confirmation'].includes(task.status));
+  const active = pending.find(task => task.id === state.preferredTaskId) || pending[0];
   if (!active) {
+    state.renderedPreviewKey = null;
     state.chatTaskId = null; state.chatPhase = null; state.chatPreview = null;
     state.chatPlanHash = null;
     state.preview = null;
     $('#previewBox').innerHTML = ''; $('#commitBtn').disabled = true;
     $('#commitBtn').innerHTML = '<i data-lucide="check" class="icon-sm"></i>生成确认预览';
     renderChatTaskActions();
+    window.updatePlanUI?.();
     return;
   }
   state.chatTaskId = active.id;
@@ -254,6 +270,12 @@ function restoreChatTask(tasks) {
   state.chatPhase = active.status === 'awaiting_details' ? 'details' : 'confirm';
   state.chatPreview = active.preview;
   state.chatPlanHash = active.plan_hash;
+  const previewKey = active.id + ':' + active.plan_hash;
+  if (state.renderedPreviewKey === previewKey && $('#previewBox').childElementCount) {
+    window.updatePlanUI?.();
+    return;
+  }
+  state.renderedPreviewKey = previewKey;
   if (state.chatPhase === 'details' && active.preview?.operations) {
     state.preview = active.preview;
     state.selectedItemIds = {};
@@ -266,20 +288,30 @@ function restoreChatTask(tasks) {
     $('#commitBtn').innerHTML = '<i data-lucide="check" class="icon-sm"></i>确认执行';
   }
   renderChatTaskActions();
+  window.updatePlanUI?.();
   window.lucide?.createIcons();
 }
 
 function renderChatMessages(messages) {
+  const scroll = $('#threadScroll');
+  const key = state.chatConversationId + ':' + JSON.stringify(messages);
+  if (state.renderedMessageKey === key) return;
+  const sameConversation = state.renderedConversationId === state.chatConversationId;
+  const nearEnd = !sameConversation || scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 120;
+  const oldHeight = scroll.scrollHeight, oldTop = scroll.scrollTop;
+  const older = sameConversation && messages[0]?.id < (state.firstRenderedMessage || 0);
+  state.renderedMessageKey = key; state.renderedConversationId = state.chatConversationId;
+  state.firstRenderedMessage = messages[0]?.id;
   $('#chatMessages').innerHTML = messages.map(message => {
     const result = message.result || {};
     const detail = result.tool_results?.map(entry => renderToolResult(entry)).join('') || '';
     const completed = result.status === 'completed' ? renderCompletedResult(result.result) : '';
     const previous = result.previous_preview ? `<details class="chat-result"><summary>查看已失效的原预览，对比当前预览</summary>${businessPreviewHtml(result.previous_preview)}</details>` : '';
     const attachments = (result.attachments || []).map(file => `<span class="chat-file-chip"><i data-lucide="paperclip" class="icon-sm"></i>${escapeHtml(file.filename)}</span>`).join('');
-    return `<article class="chat-message ${message.role === 'user' ? 'user' : 'assistant'}"><div class="chat-message-role">${message.role === 'user' ? escapeHtml(message.actor || '老师') : '耗材助手'} · ${escapeHtml(formatDate(message.created_at))}</div><div class="chat-message-body">${escapeHtml(message.content || result.reply || '')}</div>${attachments}${detail}${completed}${previous}${result.status === 'pending_confirmation' ? businessPreviewHtml(result.preview) : ''}</article>`;
+    return `<article class="chat-message ${message.role === 'user' ? 'user' : 'assistant'}"><div class="chat-message-role">${message.role === 'user' ? escapeHtml(message.actor || '老师') : '耗材助手'} · ${escapeHtml(formatDate(message.created_at))}</div><div class="chat-message-body">${escapeHtml(message.content || result.reply || '')}</div>${attachments}${detail}${completed}${previous}${result.status === 'pending_confirmation' ? '<div class="chat-result"><p>已生成变更预览，请核对计划中的数量、位置与关联记录。</p></div>' : ''}</article>`;
   }).join('') || '<div class="chat-empty">';
-  if (!messages.length) $('#chatMessages').innerHTML = '<div class="chat-empty">请输入查询或操作内容。</div>';
-  $('#chatMessages').scrollTop = $('#chatMessages').scrollHeight;
+  if (!messages.length) $('#chatMessages').innerHTML = window.emptyChatHtml?.() || '<div class="chat-empty">请输入查询或操作内容。</div>';
+  requestAnimationFrame(() => { scroll.scrollTop = older ? oldTop + scroll.scrollHeight - oldHeight : nearEnd ? scroll.scrollHeight : oldTop; });
   window.lucide?.createIcons();
 }
 
@@ -396,11 +428,14 @@ async function cancelChatTask() {
 }
 
 async function sendChatMessage() {
+  if (state.chatSending) return;
   const text = $('#chatText').value.trim();
   const files = [...$('#chatFile').files];
   if (!text && !files.length && !localStorage.getItem('lab-chat-pending')) { toast('请输入消息或附加文件'); return; }
   if (files.length > 8 || files.some(file => file.size > 20 * 1024 * 1024)) { showError(new Error('每条消息最多八个附件，单个附件最多 20 MB')); return; }
+  state.chatSending = true;
   $('#previewBtn').disabled = true;
+  $('#previewBtn').textContent = files.length ? '上传中…' : '发送中…';
   try {
     await ensureChatConversation();
     let pending = JSON.parse(localStorage.getItem('lab-chat-pending') || 'null');
@@ -421,10 +456,19 @@ async function sendChatMessage() {
       body:JSON.stringify({message_id:pending.message_id,text:pending.text,attachments:pending.attachments,task_id:pending.task_id,plan_hash:pending.plan_hash}),
     });
     localStorage.removeItem('lab-chat-pending'); localStorage.removeItem('lab-chat-draft');
-    $('#chatText').value = ''; $('#chatFile').value = ''; renderSelectedAttachments();
+    localStorage.removeItem('lab-chat-draft-' + state.chatConversationId);
+    if ($('#chatText').value.trim() === text) $('#chatText').value = '';
+    if ($('#chatText').value) localStorage.setItem('lab-chat-draft-' + state.chatConversationId, $('#chatText').value);
+    $('#chatFile').value = ''; renderSelectedAttachments();
+    window.fitComposer?.();
     await updateChatSnapshot();
   } catch (error) { showError(error); }
-  finally { $('#previewBtn').disabled = false; }
+  finally {
+    state.chatSending = false;
+    $('#previewBtn').disabled = Boolean(state.voicePhase && state.voicePhase !== 'idle');
+    $('#previewBtn').innerHTML = '<span>发送</span><i data-lucide="arrow-up" aria-hidden="true"></i>';
+    window.lucide?.createIcons();
+  }
 }
 
 function escapeHtml(value) {
@@ -465,7 +509,6 @@ async function loadStats() {
   const data = await api("/api/stats");
   $("#metrics").innerHTML = `
     <div class="metric"><span>耗材条目</span><strong>${data.item_count}</strong></div>
-    <div class="metric"><span>原始数据行</span><strong>${data.source_row_count}</strong></div>
     <div class="metric"><span>操作记录</span><strong>${data.transaction_count}</strong></div>
     <div class="metric"><span>库存预警</span><strong>${data.low_stock_count}</strong></div>
   `;
@@ -480,6 +523,7 @@ async function loadSearch() {
   const start=$('#searchStart').value,end=$('#searchEnd').value;
   if(start&&end){params.set('starts_at',shanghaiTime(start));params.set('ends_at',shanghaiTime(end));}
   const data = await api(`/api/items/search?${params.toString()}`);
+  state.inventoryRows = data.rows;
   $("#searchRows").innerHTML = data.rows.map(renderInventoryRow).join("") || emptyRow(8, "没有匹配结果");
   renderSearchSummary(data);
   if (window.lucide) window.lucide.createIcons();
@@ -503,14 +547,14 @@ function renderInventoryRow(row) {
     <tr>
       <td data-label="类别">${escapeHtml(row.category)}</td>
       <td data-label="实验室">${escapeHtml(row.lab)}</td>
-      <td data-label="耗材" class="name-cell"><strong>${escapeHtml(row.item_name)}</strong>${renderAliases(row.aliases)}</td>
+      <td data-label="耗材" class="name-cell"><button type="button" class="item-link" data-item-detail="${row.id}">${escapeHtml(row.item_name)}</button>${renderAliases(row.aliases)}</td>
       <td data-label="规格">${spec}</td>
       <td data-label="位置"><strong>${escapeHtml(row.location_code)}</strong></td>
       <td data-label="数量"><strong>可用 ${formatQuantity(row.available_quantity, row.unit)}</strong><div class="muted small-text">总量 ${formatQuantity(row.owned_quantity, row.unit)} · 借出 ${row.borrowed_quantity} · 预留 ${row.reserved_quantity}</div><div class="muted small-text">待清洗 ${row.cleaning} · 维修 ${row.repair} · 待核对 ${row.quarantine}</div>${row.review_reason ? `<span class="badge danger">${escapeHtml(row.review_reason)}</span>` : ''}</td>
       <td data-label="预警">
         <div class="inline-edit">
-          <input class="number-input threshold-input" data-threshold-input="${row.id}" data-version="${row.version}" type="number" min="0" step="any" value="${Number(row.threshold || 0)}" />
-          <button class="secondary icon-only" data-threshold-id="${row.id}" title="保存预警"><i data-lucide="save" class="icon-sm"></i></button>
+          <input class="number-input threshold-input" data-threshold-input="${row.id}" data-version="${row.version}" type="number" inputmode="decimal" aria-label="${escapeHtml(row.item_name)}的预警数量" min="0" step="any" value="${Number(row.threshold || 0)}" />
+          <button class="secondary icon-only" data-threshold-id="${row.id}" title="保存预警" aria-label="保存${escapeHtml(row.item_name)}的预警数量"><i data-lucide="save" class="icon-sm"></i></button>
         </div>
       </td>
       <td data-label="最近状态">${low}${renderLatestTransaction(row.latest_transaction, row.unit)}</td>
@@ -580,7 +624,7 @@ async function loadAlerts() {
       <td data-label="预警数量">${formatQuantity(row.threshold, row.unit)}</td>
       <td data-label="还差多少"><span class="badge danger">${formatQuantity(row.missing_quantity, row.unit)}</span></td>
       <td data-label="修改预警">
-        <input class="number-input threshold-input" data-threshold-input="${row.id}" data-version="${row.version}" type="number" min="0" step="any" value="${Number(row.threshold || 0)}" />
+        <input class="number-input threshold-input" data-threshold-input="${row.id}" data-version="${row.version}" type="number" inputmode="decimal" aria-label="${escapeHtml(row.item_name)}的预警数量" min="0" step="any" value="${Number(row.threshold || 0)}" />
         <button data-threshold-id="${row.id}" class="secondary">保存</button>
       </td>
     </tr>
@@ -724,12 +768,14 @@ function actionOption(value, label, active) {
 }
 
 async function commitTransaction() {
+  if (state.chatConfirmInFlight) return;
   if (state.chatTaskId && state.chatPhase === 'confirm') {
     const confirmationKey = `lab-chat-confirm-${state.chatTaskId}`;
     const requestId = state.chatConfirmRequestId || localStorage.getItem(confirmationKey) || newRequestId();
     state.chatConfirmRequestId = requestId;
     localStorage.setItem(confirmationKey, requestId);
     try {
+      state.chatConfirmInFlight = true;
       $('#commitBtn').disabled = true;
       await api(`/api/chat/tasks/${state.chatTaskId}/confirm`, {
         method:'POST',headers:{'Content-Type':'application/json'},
@@ -737,7 +783,7 @@ async function commitTransaction() {
       });
       state.chatTaskId = null; state.chatPhase = null; state.chatPreview = null; state.chatPlanHash = null;
       state.chatConfirmRequestId = null; state.preview = null;
-      localStorage.removeItem('lab-chat-draft'); $('#chatText').value = '';
+      localStorage.removeItem('lab-chat-draft'); localStorage.removeItem('lab-chat-draft-' + state.chatConversationId); $('#chatText').value = ''; window.fitComposer?.();
       $('#previewBox').innerHTML = ''; $('#commitBtn').disabled = true;
       $('#commitBtn').innerHTML = '<i data-lucide="check" class="icon-sm"></i>生成确认预览';
       renderChatTaskActions();
@@ -752,6 +798,9 @@ async function commitTransaction() {
       showError(error);
       $('#commitBtn').disabled = error.refreshedPlan ? state.chatPhase !== 'confirm' : false;
       return;
+    } finally {
+      state.chatConfirmInFlight = false;
+      window.updatePlanUI?.(false);
     }
   }
   if (!state.preview || !state.preview.operations) return;
@@ -830,7 +879,8 @@ async function commitTransaction() {
       $('#commitBtn').disabled = false;
       $('#commitBtn').innerHTML = '<i data-lucide="check" class="icon-sm"></i>确认执行';
       renderChatTaskActions();
-      window.lucide?.createIcons();
+    window.lucide?.createIcons();
+    window.renderMessageRecovery?.();
       await loadChat();
       return;
     } catch (error) {
@@ -946,7 +996,6 @@ async function consumeSelectedPrepareRows() {
     toast("请先选择库存足够的清单条目");
     return;
   }
-  if (!window.confirm(`确认按清单扣减 ${selected.length} 个条目的库存？数量为 0 的条目会保留并继续参与预警。`)) return;
   $("#consumePrepareBtn").disabled = true;
   try {
     const result = await api("/api/prepare/consume", {
@@ -1047,7 +1096,6 @@ async function moveSelectedLocation() {
     toast("请填写原位置和目标实验室、目标位置");
     return;
   }
-  if (!window.confirm(`确认将 ${source.lab || "未填写实验室"} · ${source.location_code || "未填写位置"} 的全部耗材转移到 ${targetLab} · ${targetLocation}？`)) return;
   try {
     const result = await api("/api/locations/move", {
       method: "POST",
@@ -1083,7 +1131,6 @@ async function deleteSelectedLocation() {
     toast("请先查看有耗材的原位置");
     return;
   }
-  if (!window.confirm(`确认停用 ${source.lab || "未填写实验室"} · ${source.location_code || "未填写位置"}？历史记录会保留，现有数量必须先处理。`)) return;
   try {
     const result = await api("/api/locations/delete", {
       method: "POST",
@@ -1150,7 +1197,6 @@ async function saveThreshold(itemId, button) {
 }
 
 async function undoTransaction(txnId) {
-  if (!window.confirm("确认撤销这次库存操作？")) return;
   const button = document.querySelector(`[data-undo-id="${txnId}"]`);
   await api(`/api/transactions/${txnId}/undo`, { method: "POST",headers:{'Content-Type':'application/json'},body:JSON.stringify({version:Number(button?.dataset.version)}) });
   toast("库存操作已撤销");
@@ -1162,13 +1208,9 @@ function requestNotification() {
 }
 
 function bindEvents() {
-  document.querySelectorAll(".tab").forEach((button) => {
-    button.addEventListener("click", () => {
-      document.querySelectorAll(".tab").forEach((tab) => tab.classList.remove("active"));
-      document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.remove("active"));
-      button.classList.add("active");
-      $(`#tab-${button.dataset.tab}`).classList.add("active");
-    });
+  document.addEventListener('click', event => {
+    const button = event.target.closest('.tab[data-tab]');
+    if (button) window.navigateTo?.(button.dataset.tab);
   });
   $("#refreshAllBtn").addEventListener("click", refreshAll);
   $("#searchBtn").addEventListener("click", loadSearch);
@@ -1222,12 +1264,14 @@ function bindEvents() {
     renderPrepareSummary(state.prepareRows);
   });
   $('#chatText').addEventListener('input',()=>{
-    localStorage.setItem('lab-chat-draft',$('#chatText').value);
-    state.preview=null; state.previewInputs={}; $('#previewBox').innerHTML=''; $('#commitBtn').disabled=true;
+    const draftKey = state.chatConversationId ? 'lab-chat-draft-' + state.chatConversationId : 'lab-chat-draft';
+    localStorage.setItem(draftKey, $('#chatText').value);
+    if (!state.chatTaskId) { state.preview=null; state.previewInputs={}; $('#commitBtn').disabled=true; }
+    window.updatePlanUI?.(false);
     localStorage.removeItem('lab-chat-preview');
   });
   $('#chatText').addEventListener('keydown',event=>{
-    if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChatMessage();}
+    if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229&&matchMedia('(min-width:1024px) and (pointer:fine)').matches){event.preventDefault();sendChatMessage();}
   });
   $('#chatFile').addEventListener('change',()=>{
     renderSelectedAttachments();
@@ -1274,6 +1318,8 @@ async function refreshAll() {
   try {
     await Promise.all([loadStats(), loadSearch(), loadAlerts(), loadTransactions(), loadLocations(), loadChat()]);
     await window.refreshWorkflows?.();
+    window.renderTaskOverview?.();
+    if (document.body.dataset.page === 'tasks') await window.loadSharedTasks?.();
   } catch (error) {
     console.error(error);
     toast(error.message || "操作失败");
