@@ -17,6 +17,8 @@ const state = {
   chatPreview: null,
   chatPlanHash: null,
   chatConfirmRequestId: null,
+  chatLoadedConversationId: null,
+  chatLoadedMessages: [],
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -172,6 +174,13 @@ async function selectConversation(id) {
   if (state.chatConversationId) localStorage.setItem('lab-chat-draft-' + state.chatConversationId, $('#chatText').value);
   chatEvents?.close(); chatEvents = null;
   state.chatConversationId = id;
+  state.chatLoadedConversationId = null;
+  state.chatLoadedMessages = [];
+  state.renderedConversationId = null;
+  chatOlderCursor = null;
+  state.chatOlderLoadingConversationId = null;
+  $('#olderMessages').disabled = false;
+  $('#olderMessages').textContent = '查看更早的消息';
   localStorage.setItem('lab-chat-conversation', id);
   $('#chatText').value = localStorage.getItem('lab-chat-draft-' + id) || '';
   window.fitComposer?.();
@@ -190,14 +199,27 @@ async function updateChatSnapshot(id = state.chatConversationId) {
   if (!id) return;
   const snapshot = await chatApi(`/api/chat/conversations/${id}`);
   if (state.chatConversationId !== id) return;
-  state.chatSnapshot = snapshot;
-  renderChatMessages(snapshot.messages || []);
-  restoreChatTask(snapshot.tasks || []);
-  chatOlderCursor = snapshot.next_before;
+  const sameConversation = state.chatLoadedConversationId === id;
+  const previousMessages = sameConversation ? state.chatLoadedMessages : [];
+  const previousSnapshot = sameConversation ? state.chatSnapshot : null;
+  const newerSnapshot = previousSnapshot && Number(previousSnapshot.last_event_id || 0) > Number(snapshot.last_event_id || 0)
+    ? previousSnapshot : snapshot;
+  state.chatLoadedMessages = mergeChatMessages(previousMessages, snapshot.messages || []);
+  state.chatLoadedConversationId = id;
+  state.chatSnapshot = {...newerSnapshot, messages:state.chatLoadedMessages};
+  const newestPageFirstId = Number(snapshot.messages?.[0]?.id || 0);
+  const previouslyLoadedLastId = previousMessages.reduce((maximum, message) => Math.max(maximum, Number(message.id) || 0), 0);
+  if (!sameConversation || snapshot.next_before === null) {
+    chatOlderCursor = snapshot.next_before;
+  } else if (snapshot.next_before && (!previousMessages.length || newestPageFirstId > previouslyLoadedLastId)) {
+    chatOlderCursor = snapshot.next_before;
+  }
+  renderChatMessages(state.chatLoadedMessages);
+  restoreChatTask(state.chatSnapshot.tasks || []);
   $('#olderMessages').hidden = !chatOlderCursor;
-  renderChatRuns(snapshot.runs || []);
+  renderChatRuns(state.chatSnapshot.runs || []);
   if (!chatEvents) {
-    chatEvents = new EventSource(`/api/chat/conversations/${id}/events?after=${snapshot.last_event_id || 0}`);
+    chatEvents = new EventSource(`/api/chat/conversations/${id}/events?after=${state.chatSnapshot.last_event_id || 0}`);
     const refresh = () => {
       clearTimeout(chatRefresh);
       chatRefresh = setTimeout(() => updateChatSnapshot(id).catch(showError), 100);
@@ -205,6 +227,41 @@ async function updateChatSnapshot(id = state.chatConversationId) {
     for (const kind of ['message','run','tool','task']) chatEvents.addEventListener(kind, refresh);
     chatEvents.onopen = () => { $('#chatConnection').textContent = '共享对话已连接'; updateChatSnapshot(id).catch(showError); };
     chatEvents.onerror = () => { $('#chatConnection').textContent = '正在重新连接，显示的是此前保存的内容'; };
+  }
+}
+
+function mergeChatMessages(...pages) {
+  const messages = new Map();
+  for (const page of pages) {
+    for (const message of page || []) messages.set(String(message.id), message);
+  }
+  return [...messages.values()].sort((left, right) => Number(left.id) - Number(right.id));
+}
+
+async function loadOlderMessages() {
+  const id = state.chatConversationId;
+  const cursor = chatOlderCursor;
+  const button = $('#olderMessages');
+  if (!id || !cursor || state.chatOlderLoadingConversationId === id) return;
+  state.chatOlderLoadingConversationId = id;
+  button.disabled = true;
+  button.textContent = '正在加载…';
+  try {
+    const snapshot = await chatApi(`/api/chat/conversations/${id}?before=${encodeURIComponent(cursor)}`);
+    if (state.chatConversationId !== id) return;
+    state.chatLoadedMessages = mergeChatMessages(snapshot.messages || [], state.chatLoadedMessages || []);
+    state.chatSnapshot = {...state.chatSnapshot, messages:state.chatLoadedMessages};
+    chatOlderCursor = snapshot.next_before === cursor ? null : snapshot.next_before;
+    renderChatMessages(state.chatLoadedMessages);
+  } catch (error) {
+    if (state.chatConversationId === id) showError(error);
+  } finally {
+    if (state.chatOlderLoadingConversationId === id) state.chatOlderLoadingConversationId = null;
+    if (state.chatConversationId === id) {
+      button.disabled = false;
+      button.textContent = '查看更早的消息';
+      button.hidden = !chatOlderCursor;
+    }
   }
 }
 
@@ -292,26 +349,69 @@ function restoreChatTask(tasks) {
   window.lucide?.createIcons();
 }
 
+function chatMessageContent(message) {
+  const result = message.result || {};
+  const detail = result.tool_results?.map(entry => renderToolResult(entry)).join('') || '';
+  const completed = result.status === 'completed' ? renderCompletedResult(result.result) : '';
+  const previous = result.previous_preview ? `<details class="chat-result"><summary>查看已失效的原预览，对比当前预览</summary>${businessPreviewHtml(result.previous_preview)}</details>` : '';
+  const attachments = (result.attachments || []).map(file => `<span class="chat-file-chip"><i data-lucide="paperclip" class="icon-sm"></i>${escapeHtml(file.filename)}</span>`).join('');
+  return `<div class="chat-message-role">${message.role === 'user' ? escapeHtml(message.actor || '老师') : '耗材助手'} · ${escapeHtml(formatDate(message.created_at))}</div><div class="chat-message-body">${escapeHtml(message.content || result.reply || '')}</div>${attachments}${detail}${completed}${previous}${result.status === 'pending_confirmation' ? '<div class="chat-result"><p>已生成变更预览，请核对计划中的数量、位置与关联记录。</p></div>' : ''}`;
+}
+
+const chatMessageRenderCache = new WeakMap();
+
 function renderChatMessages(messages) {
   const scroll = $('#threadScroll');
-  const key = state.chatConversationId + ':' + JSON.stringify(messages);
-  if (state.renderedMessageKey === key) return;
+  const container = $('#chatMessages');
   const sameConversation = state.renderedConversationId === state.chatConversationId;
   const nearEnd = !sameConversation || scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 120;
-  const oldHeight = scroll.scrollHeight, oldTop = scroll.scrollTop;
-  const older = sameConversation && messages[0]?.id < (state.firstRenderedMessage || 0);
-  state.renderedMessageKey = key; state.renderedConversationId = state.chatConversationId;
+  const oldHeight = scroll.scrollHeight;
+  const oldTop = scroll.scrollTop;
+  const oldFirst = Number(container.querySelector('[data-message-id]')?.dataset.messageId || 0);
+  const older = sameConversation && Number(messages[0]?.id || 0) < oldFirst;
+  const existing = new Map([...container.querySelectorAll('[data-message-id]')].map(node => [node.dataset.messageId, node]));
+  const wanted = new Set();
+  const nodes = [];
+
+  for (const message of messages) {
+    const id = String(message.id);
+    const signature = JSON.stringify(message);
+    let node = existing.get(id);
+    if (!node) {
+      node = document.createElement('article');
+      node.dataset.messageId = id;
+      node.className = `chat-message ${message.role === 'user' ? 'user' : 'assistant'}`;
+      node.innerHTML = chatMessageContent(message);
+      chatMessageRenderCache.set(node, signature);
+    } else if (chatMessageRenderCache.get(node) !== signature) {
+      const expanded = [...node.querySelectorAll('details')].map(detail => detail.open);
+      node.className = `chat-message ${message.role === 'user' ? 'user' : 'assistant'}`;
+      node.innerHTML = chatMessageContent(message);
+      [...node.querySelectorAll('details')].forEach((detail, index) => { detail.open = expanded[index] ?? false; });
+      chatMessageRenderCache.set(node, signature);
+    }
+    wanted.add(id);
+    nodes.push(node);
+  }
+
+  for (const [id, node] of existing) if (!wanted.has(id)) node.remove();
+  if (!messages.length) {
+    if (!container.querySelector('.chat-empty')) container.innerHTML = window.emptyChatHtml?.() || '<div class="chat-empty">请输入查询或操作内容。</div>';
+  } else {
+    container.querySelector('.chat-empty')?.remove();
+    let next = null;
+    for (let index = nodes.length - 1; index >= 0; index--) {
+      const node = nodes[index];
+      if (node.nextElementSibling !== next) container.insertBefore(node, next);
+      next = node;
+    }
+  }
+
+  state.renderedConversationId = state.chatConversationId;
   state.firstRenderedMessage = messages[0]?.id;
-  $('#chatMessages').innerHTML = messages.map(message => {
-    const result = message.result || {};
-    const detail = result.tool_results?.map(entry => renderToolResult(entry)).join('') || '';
-    const completed = result.status === 'completed' ? renderCompletedResult(result.result) : '';
-    const previous = result.previous_preview ? `<details class="chat-result"><summary>查看已失效的原预览，对比当前预览</summary>${businessPreviewHtml(result.previous_preview)}</details>` : '';
-    const attachments = (result.attachments || []).map(file => `<span class="chat-file-chip"><i data-lucide="paperclip" class="icon-sm"></i>${escapeHtml(file.filename)}</span>`).join('');
-    return `<article class="chat-message ${message.role === 'user' ? 'user' : 'assistant'}"><div class="chat-message-role">${message.role === 'user' ? escapeHtml(message.actor || '老师') : '耗材助手'} · ${escapeHtml(formatDate(message.created_at))}</div><div class="chat-message-body">${escapeHtml(message.content || result.reply || '')}</div>${attachments}${detail}${completed}${previous}${result.status === 'pending_confirmation' ? '<div class="chat-result"><p>已生成变更预览，请核对计划中的数量、位置与关联记录。</p></div>' : ''}</article>`;
-  }).join('') || '<div class="chat-empty">';
-  if (!messages.length) $('#chatMessages').innerHTML = window.emptyChatHtml?.() || '<div class="chat-empty">请输入查询或操作内容。</div>';
-  requestAnimationFrame(() => { scroll.scrollTop = older ? oldTop + scroll.scrollHeight - oldHeight : nearEnd ? scroll.scrollHeight : oldTop; });
+  requestAnimationFrame(() => {
+    scroll.scrollTop = older ? oldTop + scroll.scrollHeight - oldHeight : nearEnd ? scroll.scrollHeight : oldTop;
+  });
   window.lucide?.createIcons();
 }
 
@@ -374,8 +474,8 @@ function renderRecordChanges(records, completed = false) {
   };
   return records.map(record=>{
     const keys = [...new Set([...Object.keys(record.before || {}),...Object.keys(record.after || {})])].filter(key=>!hidden.has(key) && (!record.before || !record.after || JSON.stringify(record.before[key]) !== JSON.stringify(record.after[key])));
-    if (completed) return `<details class="chat-operation-details" open><summary>实际操作结果</summary>${tableHtml(['资料','实际结果'],keys.map(key=>[escapeHtml(labels[key] || key),display(record.after[key])]))}</details>`;
-    return `<details class="chat-operation-details" open><summary>${escapeHtml(tables[record.table] || record.table)}：${record.before ? record.after ? '变更' : '移除' : '新增'}</summary>${tableHtml(['资料','变更前','变更后'],keys.map(key=>[escapeHtml(labels[key] || key),record.before ? display(record.before[key]) : '尚未建立',record.after ? display(record.after[key]) : '移除']))}</details>`;
+    if (completed) return `<details class="chat-operation-details"><summary>实际操作结果</summary>${tableHtml(['资料','实际结果'],keys.map(key=>[escapeHtml(labels[key] || key),display(record.after[key])]))}</details>`;
+    return `<details class="chat-operation-details"><summary>${escapeHtml(tables[record.table] || record.table)}：${record.before ? record.after ? '变更' : '移除' : '新增'}</summary>${tableHtml(['资料','变更前','变更后'],keys.map(key=>[escapeHtml(labels[key] || key),record.before ? display(record.before[key]) : '尚未建立',record.after ? display(record.after[key]) : '移除']))}</details>`;
   }).join('');
 }
 
@@ -1220,6 +1320,7 @@ function bindEvents() {
   $("#categoryFilter").addEventListener("change", loadSearch);
   $("#lowStockFilter").addEventListener("change", loadSearch);
   $("#previewBtn").addEventListener("click", sendChatMessage);
+  $("#olderMessages").addEventListener("click", loadOlderMessages);
   $("#commitBtn").addEventListener("click", commitTransaction);
   $("#prepareBtn").addEventListener("click", preparePreview);
   $("#exportPrepareBtn").addEventListener("click", exportPrepareRows);
