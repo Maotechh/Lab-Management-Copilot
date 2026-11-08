@@ -65,3 +65,5 @@ DSH 通过学校 `deepseek-pro` 的 `POST /v1/responses` 工作，使用 high re
 新的 DSH Linux 构建由服务器的 `lab-dsh-build-a51d6a6-2` 执行。最后可读取的状态已通过 native addon、Host Typert、host compiler 和 Host bundle，不能据此认定整个构建完成。其后学校堡垒机会话失效，尚未获取最终构建结果，也尚未在新运行文件上执行修正后的六十项生命周期检查和三次实际模型历史导出检查。
 
 本节记录的是后续版本开发和验证情况，正式运行版本仍以上文的 `323c239ee4` 和 `013eea6a51` 为准。新版本尚未通过 `deploy/install.sh` 发布，实际设备检查状态也未改变。
+
+补充电脑访问检查：macOS 15.6（24G84）、Chrome 157.0.8103.38。当前网络能够直接访问 HTTP 证书说明页面；下载的公开根证书 SHA-256 指纹与本记录一致，指定该证书的 curl HTTPS 校验和 `/api/config` 请求成功，返回 production。实际 Chrome 访问仍返回 `ERR_CERT_AUTHORITY_INVALID`，因此电脑浏览器证书信任尚未通过。没有绕过证书警告，也没有修改系统信任设置；当前网络是否为校园网或学校 VPN 尚未由用户确认。
