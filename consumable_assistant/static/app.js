@@ -475,7 +475,7 @@ function renderRecordChanges(records, completed = false) {
   return records.map(record=>{
     const keys = [...new Set([...Object.keys(record.before || {}),...Object.keys(record.after || {})])].filter(key=>!hidden.has(key) && (!record.before || !record.after || JSON.stringify(record.before[key]) !== JSON.stringify(record.after[key])));
     if (completed) return `<details class="chat-operation-details"><summary>实际操作结果</summary>${tableHtml(['资料','实际结果'],keys.map(key=>[escapeHtml(labels[key] || key),display(record.after[key])]))}</details>`;
-    return `<details class="chat-operation-details"><summary>${escapeHtml(tables[record.table] || record.table)}：${record.before ? record.after ? '变更' : '移除' : '新增'}</summary>${tableHtml(['资料','变更前','变更后'],keys.map(key=>[escapeHtml(labels[key] || key),record.before ? display(record.before[key]) : '尚未建立',record.after ? display(record.after[key]) : '移除']))}</details>`;
+    return `<details class="chat-operation-details" open><summary>${escapeHtml(tables[record.table] || record.table)}：${record.before ? record.after ? '变更' : '移除' : '新增'}</summary>${tableHtml(['资料','变更前','变更后'],keys.map(key=>[escapeHtml(labels[key] || key),record.before ? display(record.before[key]) : '尚未建立',record.after ? display(record.after[key]) : '移除']))}</details>`;
   }).join('');
 }
 
