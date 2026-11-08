@@ -1,71 +1,56 @@
 # 2026 年 11 月 8 日发布记录
 
-## 运行版本
+## 正式版本
 
-- 正式入口：`https://10.15.21.115`。校园 HTTP 页面返回 200，用于证书安装说明。访问仍限制在校园网及学校 VPN，无登录。
-- 应用分支：`codex/dsh-lab-delivery`，发布提交：`323c239ee4cdc488e6f30a333fd32300fd18179f`。
-- 发布目录：`/opt/lab-management/releases/20261108-323c239ee4`，通过该版本的 `deploy/install.sh` 安装。
-- DSH 分支：`Maotechh/deepseek-harness:codex/lab-copilot`，提交：`013eea6a51f8b1d6bf279c83dfd142c19d775d44`，保留官方基础提交 `fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159` 的历史。
-- Node.js：`24.22.2`；pnpm：`11.28.5`。发布清单验证 36,247 个文件。
-- DSH 源依赖锁文件 SHA-256：`d65a6deb59aaaa61424ea8c832874b8745d09085c8c2ed37a1e8f1aeaa01017e`。部署锁文件 SHA-256：`91931d6d75c9a669ef95abf0f6ef41af830ac4ba08e63f5972df19d47dba5c35`。
-- 网页 `app.js` SHA-256：`bc96f06de5d9ce31262f96b34110d1bd233b389628f43c33c8b933eb4cbd6f75`。完整构建校验值保存在发布目录的 `release-manifest.json`。
+- 正式网址：`https://10.15.21.115`，限制在校园网及学校 VPN 内访问，不要求登录。HTTP 根页面提供证书安装说明。指定实验室 CA 后，HTTPS 正式配置检查通过；电脑 Chrome 的系统证书信任仍未完成。
+- 应用分支和提交：`codex/dsh-lab-delivery`，`1c924fa69dd0f3ca2a83248998ce14f7394ccf3d`。
+- DSH 分支和提交：`Maotechh/deepseek-harness:codex/lab-copilot`，`a51d6a6df84930fb8d4aa0a9daf26523984b7560`，保留官方提交 `fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159` 的历史。两个提交均已推送至各自远程仓库，没有强制推送。
+- 应用发布目录：`/opt/lab-management/releases/20261108-1c924fa69d`，通过该版本的 `deploy/install.sh` 安装。
+- DSH 使用 Node.js `24.22.2` 和 pnpm `11.28.5`。发布清单核对了 36,250 个文件；源依赖锁 SHA-256 为 `d65a6deb59aaaa61424ea8c832874b8745d09085c8c2ed37a1e8f1aeaa01017e`，部署依赖锁 SHA-256 为 `91931d6d75c9a669ef95abf0f6ef41af830ac4ba08e63f5972df19d47dba5c35`。
+- DSH 调用学校 `deepseek-pro` 的 `POST /v1/responses`，使用 high reasoning 和 `store: false`。未配置校外模型备用服务。
 
-## 实际服务与数据
+## 服务和业务数据
 
-DSH 通过学校 `deepseek-pro` 的 `POST /v1/responses` 工作，使用 high reasoning、`store:false`。正式发布后，实际模型查询返回服务器统计的 894 条耗材记录及 24 种单位分组，只调用一次库存工具。共享消息和重复消息编号检查通过。
+正式应用、DSH、隔离分析、通知进程、定时完整备份和 Nginx 均处于运行状态。DSH 以独立低权限账户运行，不能读取正式数据库、配置、TLS 私钥或备份。分析程序在 rootless Podman 中运行。生产网站保留三份原始附件库存尚未经教师核对的提示。
 
-应用、DSH、隔离分析、通知服务及备份定时器均运行。DSH 服务进程不能读取生产数据库、应用配置、备份或 TLS 私钥。分析环境的网络、文件访问、资源限制和终止检查由安装程序实际执行。
+正式数据在发布后的只读比较中保持一致：894 条库存、1,073 条原始业务流水和 1,117 条来源记录，没有重新导入附件或重置数量。发布后的查询通过实际学校 Responses 接口返回 894 条库存记录；第二设备可见共享对话，重复消息编号没有重复执行。查询前后生产业务表的记录数和校验值一致。
 
-原有 894 条库存记录、1,073 条原始业务流水及 1,117 条来源记录保留，没有重新导入原始附件或重置数量。发布后的只读验证比较了库存、借还、采购、预留等业务表，结果保持一致。附件库存尚未经教师核对的提示继续显示。
+独立设备验证网页位于 `https://10.15.21.115/device-validation/`，使用独立模拟数据库，其中有两种测试耗材。其应用与 DSH 现在由持久 systemd 服务管理；更新后模型查询、第二设备读取共享对话和合成语音识别均通过，业务数据比较结果未变化。该模拟服务不能写入正式数据库。
 
-## 验证证据
+## 自动和学校模型验证
 
-- 本地及服务器：`ruff check consumable_assistant scripts tests`、105 项 pytest 测试、`scripts/smoke_test.py`、JavaScript 语法、通知处理测试及 `bash -n deploy/install.sh` 通过。pytest 有一项依赖库的弃用提示。
-- DSH：定制组件测试 3 项通过，包含引用项目的构建与类型检查共 10 项通过，lint 通过。lint 保留一个原有客户端组件的 unused-disable 提示。
-- 实际学校模型：新增库存汇总之前，60 个脱敏业务情境分别重复三次，共 180 次通过。未经确认的业务变更和错误执行数量均为零。新增汇总后的检查见下文，没有将此前结果描述为本次重新执行的结果。
-- 扩展实际模型检查：中文照片进入完整实验准备、修改人数后旧计划失效、未满足需求及采购草案、多工作表和合并单元格、规格不明确时追问、附件中的指令不修改业务数据，均通过。
-- 新增汇总检查：超过一百条记录、小数精度、不同单位、借出、预留、待清洗、时间范围、停用记录及查询无业务写入均通过。生产数据库隔离副本上的两项实际模型汇总查询均返回 894 条记录。
-- 浏览器检查：完整业务页面流程在 1440、390 和 844 像素宽度通过。新增汇总卡片在相同宽度没有页面横向溢出，单位字段经过 HTML 转义。浏览器模拟不作为实际手机证据。
-- 本地 SenseVoice 对合成中文录音返回识别文字。实际手机录音仍需设备验证。
+- 应用检查：`ruff check consumable_assistant scripts tests`、111 项 pytest、`python scripts/smoke_test.py`、JavaScript 语法检查、通知处理检查和 `bash -n deploy/install.sh` 全部通过。pytest 有一项依赖库弃用提示。
+- DSH 定制组件：构建与类型检查十项通过，单元测试三项通过，lint 通过。lint 保留一个既有客户端组件的 unused-disable 提示；构建输出另有关于 Vite 原生 tsconfig 路径解析的建议。
+- Linux 服务器隔离数据库上的学校模型验证：历史导出 3／3，生命周期情境 60／60，常用操作情境 180／180。合计 243 项实际学校模型验证任务。要求重复执行的情境均连续通过三次；未确认的业务变更和错误执行数量均为零。报告另行保留了先前失败结果。
+- 生产只读检查使用实际学校模型查询库存汇总，并检查服务器本地 SenseVoice 对合成音频的识别。合成音频检查仅证明服务器识别服务可用。
 
-上述服务器验证资料已保存至 `/var/backups/lab-management/verification-20261108-323c239ee4`，其中 12 个原始结果文件的大小、原修改时间及 SHA-256 记录在 `evidence-manifest.json`，复制后的校验值全部一致。该目录仅维护者可以访问。资料明确区分此前的集成检查、本次汇总修改检查及实际设备检查，没有将模拟浏览器或合成录音作为实际手机证据。
+完整结果、构建日志和文件校验清单保存在服务器的 `/var/backups/lab-management/verification-20261108-1c924fa69d`，共 28 个证据文件。该目录仅维护者可访问。
 
-## 备份与恢复
+## 备份和恢复验证
 
-发布前已验证备份：`/var/backups/lab-management/release-20261107T191629.422920199Z`，记录上一应用版本 `9665cb0a9616ed75d9d4dc1c1dcc45395133dd74`。原有已验证备份保留。
+- 安装新版本前的完整备份：`/var/backups/lab-management/release-20261108T154344.206968349Z`，安装程序同时在隔离目录恢复并校验该版本备份。
+- 新版本验证备份：`/var/backups/lab-management/verified-dsh-20261108T155649Z`。已恢复到其 `restoration-rehearsal` 独立目录，没有替换正在使用的正式数据。应用、DSH、应用配置、DSH 配置、分析配置、TLS 和部署配置七个目录均通过比较；38 张数据库表、86 个文件及 8 个 DSH 会话文件一致。
+- 独立设备验证数据备份：`/var/backups/lab-management/device-validation-20261108T155633Z`。
 
-新版本完整备份：`/var/backups/lab-management/verified-dsh-20261107T192026Z`。时间名称使用 UTC，对应北京时间 11 月 8 日。该备份已恢复到独立目录，应用状态、DSH 状态、应用配置、DSH 配置、分析配置、TLS 和部署配置七个目录均校验一致，38 张数据库表、82 个文件及 4 个 DSH 文件通过比较。
+可在服务器上查看完整备份清单及恢复结果：
 
-生产恢复命令需要以 root 执行，并保留备份记录的发布目录：
-
-```bash
-/opt/lab-management/current/.venv/bin/python /opt/lab-management/current/scripts/consistent_backup.py restore --snapshot /var/backups/lab-management/verified-dsh-20261107T192026Z
+```text
+/var/backups/lab-management/verification-20261108-1c924fa69d/lab-final-version-restoration-result.json
+/var/backups/lab-management/verification-20261108-1c924fa69d/evidence-manifest.json
 ```
 
-恢复程序验证备份、暂停写入、恢复对应代码和状态、恢复服务配置并恢复运行。隔离演练使用 `scripts/full_backup.py restore --destination-root <独立目录> --services-stopped`，不会切换正式版本。
+恢复到本次验证快照时，以 root 执行协调恢复程序：
 
-## 实际设备验证状态
+```bash
+/opt/lab-management/current/.venv/bin/python /opt/lab-management/current/scripts/consistent_backup.py restore --snapshot /var/backups/lab-management/verified-dsh-20261108T155649Z
+```
 
-用户报告两部手机均正常访问模拟页面，证书没有警告；录音、识别文字先进入可编辑输入框及共享消息也报告正常。尚未获得系统和浏览器版本、逐段识别文字或二十段录音记录。照片、跨设备确认、PWA 安装、锁屏通知及通知详情仍未验证，用户要求手机通知稍后处理。电脑浏览器信任和学校 VPN 也尚未验证。不能据服务器配置、浏览器模拟或概括性的设备报告判定其他项目通过。
+恢复前须确认对应的不可变应用发布目录仍存在。协调程序会校验快照、停止写入服务、恢复七类数据和配置、选择匹配的应用版本，再恢复备份中运行的服务。
 
-临时模拟入口为 `https://10.15.21.115/device-validation/`，使用独立账户与数据库，只有两种测试耗材。业务确认测试在此进行。正式网站用于 PWA 安装及通知检查，通知事件明确标记为测试，不改变实际库存。详细步骤见 `PHONE-VALIDATION.md`。
+## 设备验证状态
 
-共享模拟对话的标题以“设备验证”开头，初始查询未改变模拟库存。此前的临时 8443 端口已停止监听，对应临时防火墙规则已删除；模拟入口统一使用 443 端口下的独立路径。
+用户报告 iPhone 与 Android 均可正常打开模拟网页并完成基本录音、识别文字进入可编辑输入框及共享消息检查。证书无警告也来自用户报告。尚未记录两部手机的系统与浏览器版本，也没有完成二十段录音、照片上传、跨设备业务确认、PWA 安装、锁屏通知和通知点击检查。用户要求通知部分稍后处理，因此没有安排测试通知。学校 VPN 使用情况尚未确认。
 
-本记录证明服务器发布及上述验证结果；完整交付须以实际设备验证完成为条件。实物库存确认、试剂系统实际接入及真实平面图制作继续属于明确排除的内容。
+电脑使用 macOS 15.6、Chrome 157.0.8103.38。指定实验室根证书的命令行 HTTPS 检查通过；Chrome 仍显示 `ERR_CERT_AUTHORITY_INVALID`。没有绕过警告或改变系统证书信任。浏览器信任和实际校园网／学校 VPN 访问仍待验证。证书指纹、手机步骤和录音清单见 [PHONE-VALIDATION.md](PHONE-VALIDATION.md)。
 
-## 后续版本的验证状态
-
-后续应用提交 `07b17fc7720cf0b070e260d48c3c8595d0373e44` 和 DSH 提交 `a51d6a6df84930fb8d4aa0a9daf26523984b7560` 已同步至远程仓库，没有强制推送。应用增加完整历史导出、中文操作名称筛选校验、采购到货重复入库检查，以及新增耗材完整名称说明。DSH 增加受控历史导出工具，并明确采购到货、修改实验准备、取消整项准备及执行已有安排的技能说明。
-
-服务器的 `lab-dsh-build-a51d6a6-2` 已完成 Linux 运行文件构建，退出状态为零。运行文件位于 `/opt/lab-management/build/lab-runtime-a51d6a6`，使用 Node.js `24.22.2` 和 pnpm `11.28.5`。新版本尚未通过 `deploy/install.sh` 发布，不能将构建完成描述为正式部署完成。
-
-历史导出包含全部符合条件的业务记录，不受普通查询的条数限制。新增检查使用 10,001 条隔离记录验证聊天和表单导出；同时检查小数、原始编号、筛选条件和公式样式文字。中文操作名称会转换为相应业务代码；无法识别的操作名称明确返回错误，不生成误导性的空文件。本地 ruff、111 项 pytest、smoke test、JavaScript 语法、通知处理和安装脚本语法检查通过，pytest 有一项依赖库弃用提示。DSH 的五项类型检查、定制组件三项测试及定制组件 lint 已通过。
-
-实际学校模型验证保留历次报告。生命周期首次为 53／60，第二次为 59／60；未通过的预览没有确认，未经确认的业务变更和已执行的错误数量均为零。第二次剩余的问题是模型删改教师明确指定的新耗材名称，应用已增加完整保留名称的说明。实际历史导出检查曾因中文操作名称未转换而得到空文件，修正后重新执行。
-
-本机在隔离数据库中运行 DSH 提交 `a51d6a6df8` 与应用提交 `07b17fc772`，直接调用学校 `deepseek-pro` 的 `/v1/responses`。历史导出三次全部通过，筛选条件、下载 SHA-256、记录编号和精确数量均正确，业务数据保持一致。二十种生命周期情境各重复三次，共 60／60 通过；未经确认的业务变更和已执行的错误数量均为零。原始报告分别保存在维护者本机的 `~/.local/share/lab-management/verification/history-local-final-20261108.json` 和 `lifecycle-local-final-20261108.json`，不提交到仓库。常用操作的六十个情境各重复三次，共 180／180 通过，所有必需情境的三次检查均通过。三组检查共 243 次实际学校模型调用任务，未经确认的业务变更和已执行的错误数量均为零。报告与 SHA-256 清单另存于 `~/.local/share/lab-management/verification/20261108-07b17fc772-local/`。这些报告来自本机隔离实例，不能代替服务器 Linux 运行文件的发布验证。
-
-学校堡垒机曾恢复可用，随后再次在 Ubuntu 横幅之后关闭 SSH 通道。最新修正尚未传至服务器，正式版本仍为本记录前文的 `323c239ee4` 和 `013eea6a51`。恢复连接后须在新 Linux 运行文件上完成验证、重新生成发布清单、通过安装程序部署，并完成发布后与完整恢复检查。此前准备的 `20261108-0105315247` 目录缺少后续修正，不能作为最新版本发布。
-
-补充电脑访问检查：macOS 15.6（24G84）、Chrome 157.0.8103.38。当前网络能够直接访问 HTTP 证书说明页面；下载的公开根证书 SHA-256 指纹与本记录一致，指定该证书的 curl HTTPS 校验和 `/api/config` 请求成功，返回 production。实际 Chrome 访问仍返回 `ERR_CERT_AUTHORITY_INVALID`，因此电脑浏览器证书信任尚未通过。没有绕过证书警告，也没有修改系统信任设置；当前网络是否为校园网或学校 VPN 尚未由用户确认。
+实物库存核对、试剂系统实际接入和真实平面图制作不属于本次发布范围。手机后台通知验证仍未完成，因此本记录证明正式部署及服务器验证完成，不表示所有设备验收项目均已完成。
