@@ -354,7 +354,7 @@ def _run_read_tool(
         filters = {key: args[key] for key in ("q", "actor", "action", "from_date", "to_date") if args.get(key)}
         if args.get("query") and not filters.get("q"):
             filters["q"] = args["query"]
-        rows = history_fn(conn, {**filters, "limit": 10000})
+        rows = history_fn(conn, filters, all_rows=True)
         content = exports.history_workbook(rows, filters)
         return {"type": "export", "row_count": len(rows), "filters": filters,
                 **exports.save(conn, conversation_id, content, "history.xlsx",

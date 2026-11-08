@@ -49,6 +49,15 @@ Restore requires the recorded immutable release directory. The coordinator verif
 
 ## Required actual verification
 
+The additional lifecycle and history-export checks use newly created fixture databases beneath the selected application's `data/acceptance/` directory. They never accept a production URL or reuse an existing database. Run a dedicated DSH instance on loopback 8767 with its callback on 8001, using the same identified runtime as the release. Run these checks sequentially because each creates a temporary application on 8001:
+
+```sh
+python scripts/acceptance_school_lifecycle.py --database data/acceptance/lifecycle-<unique-id>.db --report /var/backups/lab-management/verification/lifecycle-<unique-id>.json
+python scripts/acceptance_history_export.py --database data/acceptance/history-<unique-id>.db --report /var/backups/lab-management/verification/history-<unique-id>.json
+```
+
+Lifecycle checks cover twenty scenarios three times, inspect previews before confirming, compare business-state digests and verify exact quantities and repeated confirmations. The export check repeats three times and verifies filters, the downloaded workbook, exact event identifiers and decimal quantities without changing business data. Preserve failed and successful reports separately.
+
 Installation checks actual school-model availability, loopback DSH, rootless isolation/resource limits and HTTPS from the server. These checks do not establish teacher-device certificate trust, campus/VPN access, microphone permission or background push delivery. Verify those on a computer, iPhone Safari and Android Chrome, recording system/browser versions. Both phones must record, upload a photo, share a conversation, confirm a plan and receive a generic test notification after the page is closed and the screen locked. Verify that clicking the notification displays the campus detail page. iPhone Web Push requires a supported iOS version and installation on the home screen.
 
 The attachment inventory remains awaiting teacher verification. Physical stock confirmation, actual reagent-system integration and actual floorplan production are outside this release's completion conditions. Deployment evidence must distinguish passed checks from work that remains.

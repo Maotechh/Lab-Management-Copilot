@@ -1949,6 +1949,37 @@ def test_chat_history_export_preserves_filters_decimal_values_and_literal_text(d
     assert digest(database) == before
 
 
+def test_history_exports_include_records_beyond_query_limit(db, monkeypatch, tmp_path):
+    import io
+
+    from openpyxl import load_workbook
+
+    from consumable_assistant import chat, server
+
+    monkeypatch.setenv('CONSUMABLE_EXPORT_DIR', str(tmp_path / 'exports'))
+    item = make_item(db)
+    event = operation(db, item, 'consume', '1')['id']
+    db.execute('''WITH RECURSIVE copies(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM copies WHERE n<10000)
+        INSERT INTO stock_events(item_id,action,changes,snapshot,actor,created_at)
+        SELECT item_id,action,changes,snapshot,actor,created_at FROM stock_events,copies WHERE id=?''', (event,))
+    conversation = chat.new_conversation(db, 'history-export-device')['conversation_id']
+    db.commit()
+    assert len(server.history_rows(db, {'limit': 10001})) == 10000
+    result = chat._run_read_tool(db, conversation, 'export_history', {}, [], server.history_rows)
+    assert result['row_count'] == 10001
+    record = db.execute('SELECT path FROM exported_files WHERE id=?', (result['id'],)).fetchone()
+    workbook = load_workbook(io.BytesIO(Path(record['path']).read_bytes()), read_only=True)
+    assert sum(1 for _ in workbook['业务历史'].values) == 10002
+    database = Path(db.execute('PRAGMA database_list').fetchone()[2])
+    db.commit()
+    monkeypatch.setattr(server, 'connect', lambda: connect(database))
+    with TestClient(server.app) as client:
+        direct = client.get('/api/export/history', params={'limit': 1})
+        assert direct.status_code == 200
+        exported = load_workbook(io.BytesIO(direct.content), read_only=True)
+        assert sum(1 for _ in exported['业务历史'].values) == 10002
+
+
 def preparation_data(ids, **extra):
     return {"name": "容量测量", "course": "化学实验", "venue": "实验室",
             "starts_at": "2026-12-01T08:00:00+08:00", "ends_at": "2026-12-01T12:00:00+08:00",

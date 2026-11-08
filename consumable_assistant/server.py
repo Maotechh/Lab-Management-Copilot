@@ -955,7 +955,7 @@ def workflows():
         return result
 
 
-def history_rows(conn: sqlite3.Connection, query: dict) -> list[dict]:
+def history_rows(conn: sqlite3.Connection, query: dict, *, all_rows: bool = False) -> list[dict]:
     result = []
     for row in conn.execute("SELECT * FROM stock_events ORDER BY id DESC"):
         entry = dict(row)
@@ -1025,9 +1025,8 @@ def history_rows(conn: sqlite3.Connection, query: dict) -> list[dict]:
     for row in result:
         row["local_date"] = local_date(row)
     result.sort(key=lambda row: row["created_at"], reverse=True)
-    return [row for row in result if include({**row, "created_at": row["local_date"]})][
-        : min(int(query.get("limit") or 200), 10000)
-    ]
+    filtered = [row for row in result if include({**row, "created_at": row["local_date"]})]
+    return filtered if all_rows else filtered[: min(max(int(query.get("limit") or 200), 1), 10000)]
 
 
 @app.get("/api/transactions")
@@ -1042,7 +1041,7 @@ def export_history(request: Request):
 
     with connect() as conn:
         filters = dict(request.query_params)
-        rows = history_rows(conn, {**filters, "limit": 10000})
+        rows = history_rows(conn, filters, all_rows=True)
     return excel(history_workbook(rows, filters), "history.xlsx")
 
 
