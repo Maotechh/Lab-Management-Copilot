@@ -15,6 +15,7 @@ from . import workflows as flow
 from .chat_contracts import prompt_contracts, validate_payload
 from .services import (
     list_alerts,
+    normalize_history_filters,
     search_items,
 )
 
@@ -30,7 +31,7 @@ inventory_search 的 query 使用教师给出的完整耗材名称，规格可�
 工具说明：
 - inventory_search：query，可选 lab、category、limit、starts_at、ends_at。返回真实物品、位置、状态和可用数量。询问记录总数、位置总数或数量合计时使用 summary=true，服务器统计全部匹配记录并按单位分别计算，不受明细条数限制。统计全部库存时 query 留空，不把“库存”“全部”等描述作为耗材名称搜索。
 - workflow_query：kind 为 loans、schedules、preparations、purchases、templates、counts 或 alerts，可选 query、overdue_only、limit。
-- history_search：可选 q、actor、action、from_date、to_date、limit。
+- history_search：可选 q、actor、action、from_date、to_date、limit。操作类型 action 使用业务代码，例如 consume（消耗）、borrow（借出）、return（归还）、inbound（入库）。export_history 使用相同筛选定义。
 - read_attachment：attachment_id，读取表格及来源。图片由当前消息输入，模糊字段需要教师核对。
 - prepare_attachment：attachment_id 和可选 course，生成清单核对预览，不扣减库存。
 - inventory_import_preview：attachment_id、mode（add 或 overwrite），可选 category，只预览导入。
@@ -352,7 +353,7 @@ def _run_read_tool(
     if name == "export_history":
         from . import exports
 
-        filters = {key: args[key] for key in ("q", "actor", "action", "from_date", "to_date") if args.get(key)}
+        filters = normalize_history_filters({key: args[key] for key in ("q", "actor", "action", "from_date", "to_date") if args.get(key)})
         if args.get("query") and not filters.get("q"):
             filters["q"] = args["query"]
         rows = history_fn(conn, filters, all_rows=True)

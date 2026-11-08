@@ -59,6 +59,19 @@ ACTION_LABELS = {
 }
 
 
+def normalize_history_filters(query: dict) -> dict:
+    filters = dict(query)
+    if filters.get("action"):
+        action = str(filters["action"]).strip()
+        aliases = {label: code for code, label in ACTION_LABELS.items()}
+        aliases["借用"] = "borrow"
+        action = aliases.get(action, action)
+        if action not in ACTION_LABELS:
+            raise ValueError("无法识别业务历史的操作类型，请核对筛选条件")
+        filters["action"] = action
+    return filters
+
+
 UPLOAD_COLUMNS = {
     "category": ["类别", "分类", "category"],
     "lab": ["实验室", "所属实验室", "lab"],

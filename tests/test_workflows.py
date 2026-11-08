@@ -1905,7 +1905,8 @@ def test_responses_health_uses_final_answer_after_reasoning():
     assert extract_text({'output': response['output'][:2]}) is None
 
 
-def test_chat_history_export_preserves_filters_decimal_values_and_literal_text(db, monkeypatch, tmp_path):
+@pytest.mark.parametrize('action', ['consume', '消耗'])
+def test_chat_history_export_preserves_filters_decimal_values_and_literal_text(db, monkeypatch, tmp_path, action):
     import hashlib
     import io
 
@@ -1922,10 +1923,13 @@ def test_chat_history_export_preserves_filters_decimal_values_and_literal_text(d
     db.commit()
     database = Path(db.execute('PRAGMA database_list').fetchone()[2])
     before = digest(database)
-    filters = {'action': 'consume', 'actor': '测试教师', 'from_date': '2026-11-08', 'to_date': '2026-11-08'}
+    filters = {'action': action, 'actor': '测试教师', 'from_date': '2026-11-08', 'to_date': '2026-11-08'}
+    canonical = {**filters, 'action': 'consume'}
     result = chat._run_read_tool(db, conversation, 'export_history', filters, [], server.history_rows)
     db.commit()
-    assert result['row_count'] == 1 and result['filters'] == filters
+    assert result['row_count'] == 1 and result['filters'] == canonical
+    history = chat._run_read_tool(db, conversation, 'history_search', filters, [], server.history_rows)
+    assert [row['id'] for row in history['rows']] == [event]
     record = db.execute('SELECT * FROM exported_files WHERE id=?', (result['id'],)).fetchone()
     content = Path(record['path']).read_bytes()
     assert record['conversation_id'] == conversation
@@ -1937,7 +1941,7 @@ def test_chat_history_export_preserves_filters_decimal_values_and_literal_text(d
     assert row['item_name'] == '=1+1' and row['note'].startswith('=HYPERLINK')
     assert all(cell.data_type != 'f' for sheet in workbook for cells in sheet for cell in cells)
     metadata = dict(list(workbook['导出说明'].values)[1:])
-    assert all(metadata[key] == value for key, value in filters.items())
+    assert all(metadata[key] == value for key, value in canonical.items())
     assert metadata['row_count'] == 1 and metadata['generated_at'].endswith('+08:00')
     monkeypatch.setattr(server, 'connect', lambda: connect(database))
     with TestClient(server.app) as client:
@@ -1947,6 +1951,20 @@ def test_chat_history_export_preserves_filters_decimal_values_and_literal_text(d
         assert direct.status_code == 200
         assert list(load_workbook(io.BytesIO(direct.content))['业务历史'].values) == rows
     assert digest(database) == before
+
+
+def test_history_rejects_unknown_action_instead_of_exporting_empty_results(db, monkeypatch, tmp_path):
+    from consumable_assistant import chat, server
+
+    monkeypatch.setenv('CONSUMABLE_EXPORT_DIR', str(tmp_path / 'exports'))
+    item = make_item(db)
+    operation(db, item, 'consume', '1')
+    conversation = chat.new_conversation(db, 'history-validation')['conversation_id']
+    with pytest.raises(ValueError, match='操作类型'):
+        chat._run_read_tool(db, conversation, 'export_history', {'action': 'unknown'}, [], server.history_rows)
+    assert db.execute('SELECT COUNT(*) FROM exported_files').fetchone()[0] == 0
+    with pytest.raises(ValueError, match='操作类型'):
+        server.history_rows(db, {'action': 'unknown'})
 
 
 def test_history_exports_include_records_beyond_query_limit(db, monkeypatch, tmp_path):

@@ -34,6 +34,7 @@ from .services import (
     get_stats,
     list_alerts,
     list_locations,
+    normalize_history_filters,
     parse_transaction_preview,
     preview_location,
     save_upload_to_temp,
@@ -956,6 +957,7 @@ def workflows():
 
 
 def history_rows(conn: sqlite3.Connection, query: dict, *, all_rows: bool = False) -> list[dict]:
+    query = normalize_history_filters(query)
     result = []
     for row in conn.execute("SELECT * FROM stock_events ORDER BY id DESC"):
         entry = dict(row)
@@ -1040,7 +1042,7 @@ def export_history(request: Request):
     from .exports import history_workbook
 
     with connect() as conn:
-        filters = dict(request.query_params)
+        filters = normalize_history_filters(dict(request.query_params))
         rows = history_rows(conn, filters, all_rows=True)
     return excel(history_workbook(rows, filters), "history.xlsx")
 
