@@ -31,7 +31,7 @@ inventory_search 的 query 使用教师给出的完整耗材名称，规格可�
 工具说明：
 - inventory_search：query，可选 lab、category、limit、starts_at、ends_at。返回真实物品、位置、状态和可用数量。询问记录总数、位置总数或数量合计时使用 summary=true，服务器统计全部匹配记录并按单位分别计算，不受明细条数限制。统计全部库存时 query 留空，不把“库存”“全部”等描述作为耗材名称搜索。
 - workflow_query：kind 为 loans、schedules、preparations、purchases、templates、counts 或 alerts，可选 query、overdue_only、limit。
-- history_search：可选 q、actor、action、from_date、to_date、limit。操作类型 action 使用业务代码，例如 consume（消耗）、borrow（借出）、return（归还）、inbound（入库）。export_history 使用相同筛选定义。
+- history_search：可选 q、actor、action、from_date、to_date、limit。操作类型 action 使用业务代码，例如 consume（消耗）、borrow（借出）、return（归还）、inbound（入库）。export_history 使用相同筛选定义。教师指定耗材名称时，q 必须完整保留该名称及其中的编号、前缀和限定词，不得只使用通用名称。首次调用前核对所有指定筛选条件，不得先导出扩大范围的文件。直接导出请求应一次传入完整筛选条件，生成符合要求的文件后结束，不重复导出。
 - read_attachment：attachment_id，读取表格及来源。图片由当前消息输入，模糊字段需要教师核对。
 - prepare_attachment：attachment_id 和可选 course，生成清单核对预览，不扣减库存。
 - inventory_import_preview：attachment_id、mode（add 或 overwrite），可选 category，只预览导入。
