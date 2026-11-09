@@ -75,7 +75,16 @@ trap rollback ERR
 
 # Finish any previous backup before pausing its schedule and all durable writers.
 systemctl stop consumable-backup.timer || true
-while systemctl is-active --quiet consumable-backup.service; do sleep 1; done
+# A Type=oneshot service remains "activating" throughout its backup. Waiting
+# only for "active" lets installation contend with that backup's release lock.
+backup_wait_deadline=$((SECONDS + 900))
+while [[ "$(systemctl show --property=ActiveState --value consumable-backup.service)" =~ ^(active|activating|reloading|deactivating)$ ]]; do
+    if (( SECONDS >= backup_wait_deadline )); then
+        printf 'The scheduled backup has not finished after 15 minutes. Installation stopped before changing the release.\n' >&2
+        false
+    fi
+    sleep 1
+done
 paused=1
 "$python_bin" "$release_dir/scripts/consistent_backup.py" create --snapshot "$release_backup" --leave-stopped
 exec 9>/run/lab-management-release.lock
