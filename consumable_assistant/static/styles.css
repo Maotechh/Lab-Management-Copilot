@@ -1511,7 +1511,7 @@ dialog::backdrop {
     position: static;
     width: auto;
   }
-  body.keyboard-open .system-notices {
+  body.keyboard-open #profileBanner {
     display: none;
   }
   .conversation-main[data-phase=hero] .hero-content {
@@ -1641,3 +1641,16 @@ dialog::backdrop {
 }
 
 .connection-notice { background:var(--warn-bg); color:var(--dsw-alias-state-warn-label); }
+
+/* Verified query data remains visible with the same table rhythm as DSH. */
+#chatMessages .chat-result .table-wrap { border:0; border-radius:0; overflow-x:auto; }
+#chatMessages .chat-result th,#chatMessages .chat-result td { padding:10px 16px; background:transparent; }
+#chatMessages .chat-result th:first-child,#chatMessages .chat-result td:first-child { padding-left:0; }
+@media(max-width:767px) {
+ #chatMessages .chat-result .responsive-cards table { display:table; min-width:100%; }
+ #chatMessages .chat-result .responsive-cards thead { display:table-header-group; }
+ #chatMessages .chat-result .responsive-cards tbody { display:table-row-group; }
+ #chatMessages .chat-result .responsive-cards tr { display:table-row; border:0; padding:0; margin:0; }
+ #chatMessages .chat-result .responsive-cards td { display:table-cell; min-width:75px; border-bottom:.5px solid var(--line); }
+ #chatMessages .chat-result .responsive-cards td::before { display:none; }
+}

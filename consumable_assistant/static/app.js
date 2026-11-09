@@ -396,14 +396,14 @@ function restoreChatTask(tasks) {
 function chatMessageContent(message) {
   const result = message.result || {};
   const toolResults = result.tool_results?.map(entry => renderToolResult(entry)).join('') || '';
-  const detail = toolResults ? `<details class="chat-tool-process"><summary>查看处理过程与查询结果</summary><div class="chat-tool-details">${toolResults}</div></details>` : '';
+  const detail = toolResults ? `<details class="chat-tool-process"><summary>查看处理过程</summary><div class="chat-tool-details">${result.tool_results.map(entry=>`<p>${escapeHtml(toolActivityLabel(entry.tool||entry.name))}：${entry.result?.error?escapeHtml(entry.result.error):'结果已保存'}</p>`).join('')}</div></details>` : '';
   const completed = result.status === 'completed' ? renderCompletedResult(result.result) : '';
   const previous = result.previous_preview ? `<details class="chat-result"><summary>查看已失效的原预览，对比当前预览</summary>${businessPreviewHtml(result.previous_preview)}</details>` : '';
   const attachments = (result.attachments || []).map(file => `<span class="chat-file-chip"><i data-lucide="paperclip" class="icon-sm"></i>${escapeHtml(file.filename)}</span>`).join('');
   const text=message.content || result.reply || '';
   const body=message.role==='user'?escapeHtml(text):(window.LabMarkdown?.render(text)||escapeHtml(text));
   const actions=message.role==='assistant'?`<div class="chat-message-actions"><button type="button" class="quiet icon-only" data-copy-message="${escapeHtml(message.id)}" aria-label="复制回复" title="复制回复"><svg aria-hidden="true"><use href="/static/dsh/icons.svg#copy-outline"/></svg></button><time>${escapeHtml(formatDate(message.created_at))}</time></div>`:'';
-  return `<div class="chat-message-role">${message.role === 'user' ? escapeHtml(message.actor || '老师') : '耗材助手'} · ${escapeHtml(formatDate(message.created_at))}</div>${attachments}${detail}<div class="chat-message-body ${message.role==='assistant'?'dsh-md-markdown':''}">${body}</div>${completed}${previous}${result.status === 'pending_confirmation' ? '<div class="chat-result"><p>已生成变更预览，请核对计划中的数量、位置与关联记录。</p></div>' : ''}${actions}`;
+  return `<div class="chat-message-role">${message.role === 'user' ? escapeHtml(message.actor || '老师') : '耗材助手'} · ${escapeHtml(formatDate(message.created_at))}</div>${attachments}${detail}<div class="chat-message-body ${message.role==='assistant'?'dsh-md-markdown':''}">${body}</div>${toolResults}${completed}${previous}${result.status === 'pending_confirmation' ? '<div class="chat-result"><p>已生成变更预览，请核对计划中的数量、位置与关联记录。</p></div>' : ''}${actions}`;
 }
 
 const chatMessageRenderCache = new WeakMap();
