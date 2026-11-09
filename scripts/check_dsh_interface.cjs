@@ -19,7 +19,7 @@ const output=process.env.BROWSER_CHECK_OUTPUT||'/private/tmp/lab-dsh-interface';
   let created=0,submitted=0,event=1,runs=[],tasks=[];let delayedSnapshot;
   const markdown='**中文加粗**与正文\n\n| 耗材 | 数量 |\n| --- | --- |\n| 烧杯 | 12 个 |\n\n```python\nprint("烧杯")\n```\n\n<script>window.injected=true</script>\n\n[危险链接](javascript:alert(1))\n\n![清单照片](https://invalid.example/tracker.png)';
   const message=(id,role,content)=>({id,role,content,actor:'验证教师',created_at:'2026-11-09T01:00:00Z',result:null});
-  const answer=message(2,'assistant',markdown);answer.result={tool_results:[{tool:'inventory_search',result:{type:'inventory_summary',item_count:894,lab_count:3,location_count:12,low_stock_count:0,units:[]}}]};
+  const answer=message(2,'assistant',markdown);answer.result={tool_results:[{tool:'inventory_search',result:{type:'inventory_summary',item_count:894,lab_count:3,location_count:12,low_stock_count:0,units:[{unit:'盒',item_count:1,owned_quantity:'300.100000071525578',available_quantity:'300.100000071525578',borrowed_quantity:'0',reserved_quantity:'0',cleaning:'0',repair:'0',quarantine:'0'}]}}]};
   const conversations={empty:[],history:[message(1,'user','查询一百毫升烧杯'),answer]};
   const snapshot=id=>({messages:conversations[id]||[],tasks:id==='history'?tasks:[],runs:id==='history'?runs:[],activities:runs.length?[{run_id:'run-1',name:'inventory_search',error:null}]:[],last_event_id:event,next_before:null});
   const chatRoute=async route=>{
@@ -87,6 +87,9 @@ const output=process.env.BROWSER_CHECK_OUTPUT||'/private/tmp/lab-dsh-interface';
    await page.setViewportSize(size);
    if(size.width<768){await page.locator('#openNavigation').click();await page.locator('#conversationSearch').fill('耗材');await page.locator('[data-conversation=history]').click();await page.locator('#navigationDialog').waitFor({state:'hidden'});await page.locator('#openNavigation').click();await page.locator('#actorButton').click();assert.equal(await page.locator('#navigationDialog').isVisible(),false);await page.locator('[aria-label="关闭设置"]').click();await page.locator('#openNavigation').click();await page.setViewportSize({width:844,height:390});await page.locator('#navigationDialog').waitFor({state:'hidden'});await page.setViewportSize(size);}
    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1),false,`${size.width}px overflow`);
+   const quantities=page.locator('.chat-result td').filter({hasText:/^300\.100000071525578$/});
+   assert.equal(await quantities.count(),2);
+   assert.equal(await quantities.evaluateAll(cells=>cells.every(cell=>{const range=document.createRange();range.selectNodeContents(cell);return range.getClientRects().length===1;})),true,'Exact quantities must not split across lines');
    await page.screenshot({path:`${output}/messages-${size.width}.png`});
   }
   await page.locator('#actorButton').click();await page.locator('#themePreference').selectOption('light');await page.locator('[aria-label="关闭设置"]').click();

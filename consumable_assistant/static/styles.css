@@ -1645,6 +1645,7 @@ dialog::backdrop {
 /* Verified query data remains visible with the same table rhythm as DSH. */
 #chatMessages .chat-result .table-wrap { border:0; border-radius:0; overflow-x:auto; }
 #chatMessages .chat-result th,#chatMessages .chat-result td { padding:10px 16px; background:transparent; }
+#chatMessages .chat-result td { overflow-wrap:normal; word-break:normal; }
 #chatMessages .chat-result th:first-child,#chatMessages .chat-result td:first-child { padding-left:0; }
 @media(max-width:767px) {
  #chatMessages .chat-result .responsive-cards table { display:table; min-width:100%; }
