@@ -2393,3 +2393,36 @@ def test_shared_progress_only_contains_persisted_tool_summaries(db):
     assert db.execute("SELECT COUNT(*) FROM stock_events").fetchone()[0] == 0
     chat_runtime.finish(db, run, {"status": "completed", "reply": "查询完成"})
     assert chat.conversation_view(db, conversation)["activities"] == []
+
+
+def test_conversation_event_cursor_matches_its_read_snapshot(db):
+    from consumable_assistant import chat, chat_runtime
+
+    conversation = chat.new_conversation(db, "desktop")["conversation_id"]
+    path = Path(db.execute("PRAGMA database_list").fetchone()[2])
+    inserted = False
+
+    def concurrent_message(statement):
+        nonlocal inserted
+        if inserted or "SELECT * FROM chat_tasks" not in statement:
+            return
+        inserted = True
+        with connect(path) as writer:
+            writer.execute(
+                "INSERT INTO chat_messages(conversation_id,request_id,role,content) VALUES (?,?,'assistant','另一设备的新消息')",
+                (conversation, uuid.uuid4().hex),
+            )
+            chat_runtime.event(writer, conversation, "message", {"source": "another-device"})
+            writer.commit()
+
+    db.set_trace_callback(concurrent_message)
+    try:
+        view = chat.conversation_view(db, conversation)
+    finally:
+        db.set_trace_callback(None)
+    assert inserted
+    assert view["messages"] == []
+    assert view["last_event_id"] == 0, "Cursor must not skip a message absent from this snapshot"
+    refreshed = chat.conversation_view(db, conversation)
+    assert len(refreshed["messages"]) == 1
+    assert refreshed["last_event_id"] > 0

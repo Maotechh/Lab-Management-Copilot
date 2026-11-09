@@ -105,6 +105,19 @@ def authorize(conn, conversation_id: str, token: str, device_id: str) -> dict:
 
 
 def conversation_view(conn, conversation_id: str, before: int | None = None, limit: int = 100) -> dict:
+    # An event cursor must describe precisely the messages/tasks returned here.
+    # WAL permits other devices to write while this read transaction is open.
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN")
+    try:
+        return _conversation_view(conn, conversation_id, before, limit)
+    finally:
+        if own_transaction:
+            conn.rollback()
+
+
+def _conversation_view(conn, conversation_id: str, before: int | None, limit: int) -> dict:
     messages = []
     for row in conn.execute(
         "SELECT id,request_id,role,content,result_json,actor,device_id,created_at FROM chat_messages WHERE conversation_id=? AND (? IS NULL OR id<?) ORDER BY id DESC LIMIT ?",
