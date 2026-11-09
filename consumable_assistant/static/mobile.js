@@ -42,16 +42,6 @@ $('#composer').addEventListener('drop',event=>{event.preventDefault();setSelecte
 $('#sharedConversation').addEventListener('change', event => selectConversation(event.target.value).catch(showError));
 $('#newConversation').addEventListener('click', () => createSharedConversation().catch(showError));
 $('#moreConversations').addEventListener('click', () => refreshConversationList(true).catch(showError));
-$('#olderMessages').addEventListener('click', async () => {
-  try {
-    const id = state.chatConversationId;
-    const snapshot = await chatApi(`/api/chat/conversations/${id}?before=${chatOlderCursor}`);
-    if (state.chatConversationId !== id) return;
-    state.chatSnapshot.messages = [...snapshot.messages, ...state.chatSnapshot.messages];
-    renderChatMessages(state.chatSnapshot.messages);
-    chatOlderCursor = snapshot.next_before; $('#olderMessages').hidden = !chatOlderCursor;
-  } catch (error) { showError(error); }
-});
 $('#chatRunStatus').addEventListener('click', async event => {
   const button = event.target.closest('[data-cancel-run]');
   if (!button) return;

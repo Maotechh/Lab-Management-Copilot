@@ -402,7 +402,7 @@ function renderChatMessages(messages) {
     let next = null;
     for (let index = nodes.length - 1; index >= 0; index--) {
       const node = nodes[index];
-      if (node.nextElementSibling !== next) container.insertBefore(node, next);
+      if (node.parentNode !== container || node.nextElementSibling !== next) container.insertBefore(node, next);
       next = node;
     }
   }
