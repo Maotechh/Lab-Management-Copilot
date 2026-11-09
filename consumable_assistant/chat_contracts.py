@@ -85,7 +85,9 @@ class Purchase(Payload):
 
 
 class PreparationLine(Payload):
-    item_ids: list[ID] = Field(min_length=1, max_length=100)
+    item_ids: list[ID] = Field(default_factory=list, max_length=100)
+    item_name: Text | None = None
+    spec: Text | None = None
     action: Literal["consume", "borrow"]
     unit: str | None = None
     quantity: Quantity | None = None
@@ -142,6 +144,12 @@ CONTRACTS = {
     "stock": Stock,
     "bulk": contract("Bulk", operations=(list[Stock], Field(min_length=1, max_length=200))),
     "purchase": Purchase,
+    "procurement": contract("Procurement", demand_id=(ID, ...),
+                            action=(Literal["place", "receive", "cancel"], ...),
+                            quantity=(Quantity | None, None), owner=(str | None, None),
+                            expected_at=(str | None, None), note=(str | None, None),
+                            lab=(str | None, None), location_code=(str | None, None),
+                            category=(str | None, None)),
     "schedule": Schedule,
     "preparation": Preparation,
     "preparation_update": contract("PreparationUpdate", preparation_id=(ID, ...),

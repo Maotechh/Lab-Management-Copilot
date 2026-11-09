@@ -477,34 +477,35 @@ def stats():
         return result
 
 
+@app.get("/api/rooms")
+def rooms():
+    from .matching import physical_room
+
+    with connect() as conn:
+        return {"rooms": sorted({physical_room(dict(row)) for row in conn.execute(
+            "SELECT lab,location_code FROM inventory_items") if row["lab"]})}
+
+
 @app.get("/api/items/search")
-def search(
-    q: str = "",
-    category: str | None = None,
-    lab: str | None = None,
-    low_stock: bool = False,
-    limit: int = 80,
-    starts_at: str | None = None,
-    ends_at: str | None = None,
-):
+def search(q: str = "", category: str | None = None, lab: str | None = None,
+           low_stock: bool = False, limit: int = 80, offset: int = 0,
+           starts_at: str | None = None, ends_at: str | None = None):
     with connect() as conn:
         start = stock.moment(starts_at) if starts_at else None
         end = stock.moment(ends_at) if ends_at else None
         if bool(start) != bool(end) or start and start >= end:
             raise ValueError("请填写有效的开始和结束时间")
-        rows = search_items(
-            conn, q, category, lab, low_stock, min(max(limit, 1), 2000), start, end
-        )
+        all_rows = search_items(conn, q, category, lab, low_stock, 1_000_000, start, end)
+        offset, limit = max(offset, 0), min(max(limit, 1), 2000)
+        rows = all_rows[offset:offset + limit]
         units = {}
-        for row in rows:
+        for row in all_rows:
             unit = row.get("unit") or ""
             units[unit] = units.get(unit, Decimal(0)) + stock.number(row["available_quantity"])
-        return {
-            "rows": rows,
-            "row_count": len(rows),
-            "location_count": len({(row["lab"], row["location_code"]) for row in rows}),
-            "quantity_by_unit": {unit: stock.text(value) for unit, value in units.items()},
-        }
+        return {"rows": rows, "row_count": len(all_rows), "displayed_count": len(rows),
+                "offset": offset, "has_more": offset + len(rows) < len(all_rows),
+                "location_count": len({(row["lab"], row["location_code"]) for row in all_rows}),
+                "quantity_by_unit": {unit: stock.text(value) for unit, value in units.items()}}
 
 
 @app.get("/api/items/{item_id}")
@@ -647,6 +648,10 @@ def dispatch(conn: sqlite3.Connection, kind: str, data: dict, actor: str) -> dic
         if selections is None:
             selections = {str(data["row_number"]): data["item_id"]}
         return flow.remap_preparation(conn, {**data, "selections": selections})
+    if kind == "procurement":
+        from .procurement import operate
+
+        return operate(conn, data, actor)
     if kind == "purchase":
         return flow.purchase(conn, data, actor)
     if kind == "schedule":
@@ -1149,6 +1154,27 @@ def notification_config():
         "configured": bool(configured),
         "public_url": os.environ.get("PUBLIC_BASE_URL", ""),
     }
+
+
+@app.get("/api/notifications/device")
+def notification_device(request: Request):
+    device_id = request.headers.get("x-device-id", "")
+    with connect() as conn:
+        rows = [dict(row) for row in conn.execute(
+            "SELECT s.device_id,s.actor,s.active,s.created_at,d.status,d.attempts,d.error,d.next_attempt,e.kind,e.created_at AS event_created_at "
+            "FROM push_subscriptions s LEFT JOIN push_deliveries d ON d.subscription_id=s.id "
+            "LEFT JOIN notification_events e ON e.id=d.event_id WHERE s.device_id=? ORDER BY d.event_id DESC LIMIT 20", (device_id,))]
+        return {"device_id": device_id, "subscribed": any(row["active"] for row in rows), "deliveries": rows}
+
+
+@app.post("/api/notifications/test")
+def notification_test(request: Request):
+    from scripts.check_device_notification import queue
+
+    device_id = request.headers.get("x-device-id", "")
+    with connect() as conn:
+        result = queue(conn, device_id, 0)
+        return result
 
 
 @app.post("/api/notifications/subscribe")

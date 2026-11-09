@@ -129,15 +129,13 @@ def search_items(
     limit: int = 80,
     starts_at: str | None = None,
     ends_at: str | None = None,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     params: list[Any] = []
     where: list[str] = ["1 = 1"]
     if category:
         where.append("category = ?")
         params.append(category)
-    if lab:
-        where.append("lab = ?")
-        params.append(lab)
     rows = rows_to_dicts(
         conn.execute(
             f"""
@@ -150,9 +148,25 @@ def search_items(
         )
     )
     alias_map = load_alias_map(conn)
+    from .matching import physical_room
+
+    # A standalone room number is an exact scope, never a fuzzy quantity query.
+    room_query = re.fullmatch(r"\s*(\d{3})(?:实验室|房间)?\s*", q)
+    requested_room = None
+    if room_query:
+        requested_room = room_query[1]
+        if lab and lab != requested_room:
+            return []
+        lab, q = requested_room, ""
     query = normalize_text(q)
     ranked: list[dict[str, Any]] = []
     for row in rows:
+        room = physical_room(row)
+        if room_query and lab is None and room != requested_room:
+            continue
+        if lab and lab not in {room, row["lab"]}:
+            continue
+        row["physical_room"] = room
         from .ledger import view
 
         details = view(conn, row["id"], starts_at, ends_at)
@@ -160,6 +174,10 @@ def search_items(
             continue
         row.update(details)
         score = score_item(row, query, alias_map.get(row["id"], []))
+        from .matching import same_material
+
+        if query and same_material(q, "", row["item_name"], row.get("spec")):
+            score = 100
         if query and score < 40:
             continue
         row["score"] = round(score, 2)
@@ -186,14 +204,19 @@ def search_items(
         ranked.sort(
             key=lambda item: (item["low_stock"], item["updated_at"]), reverse=True
         )
-    limited = ranked[:limit]
+    limited = ranked[max(offset, 0):max(offset, 0) + limit]
     attach_latest_transactions(conn, limited)
     return limited
 
 
 def exact_item_query(item: dict[str, Any], query: str) -> bool:
     """Match a name or alias, optionally qualified by its specification."""
+    from .matching import same_material
+
+    query = normalize_text(query)
     names = [item.get("item_name"), *(item.get("aliases") or [])]
+    if any(same_material(query, "", name, item.get("spec")) for name in names):
+        return True
     specification = normalize_text(item.get("spec"))
     for name in names:
         normalized = normalize_text(name)
@@ -325,8 +348,6 @@ def score_item(row: dict[str, Any], query: str, aliases: list[str]) -> float:
         row.get("normalized_name") or "",
         normalize_text(row.get("spec")),
         normalize_text(row.get("brand")),
-        normalize_text(row.get("location_code")),
-        normalize_text(row.get("lab")),
         normalize_text(row.get("category")),
         *[normalize_text(alias) for alias in aliases],
     ]
@@ -342,6 +363,9 @@ def score_item(row: dict[str, Any], query: str, aliases: list[str]) -> float:
             best = max(best, 72.0 + min(10.0, len(field) / max(len(query), 1) * 10))
         else:
             best = max(best, SequenceMatcher(None, field, query).ratio() * 70)
+    location = normalize_text(row.get("location_code"))
+    if location and query and (query == location or query in location):
+        best = max(best, 100)
     return best
 
 

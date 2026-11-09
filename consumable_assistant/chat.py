@@ -5,6 +5,7 @@ import json
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from . import ledger as stock
 from . import workflows as flow
 from .chat_contracts import prompt_contracts, validate_payload
+from .matching import physical_room
 from .services import (
     list_alerts,
     normalize_history_filters,
@@ -29,19 +31,19 @@ inventory_search 的 query 使用教师给出的完整耗材名称，规格可�
 操作必须保持教师原意：新增入库使用 stock/inbound；修改备注使用 metadata/remark；阈值使用 stock/threshold；清点使用 stock/count；不能用 adjust 代替备注或入库。preparation 本身自动生成不足数量的采购草案，不要再添加重复 purchase 步骤。没有明确要求的其他业务操作不能加入计划。purchase/order 用于直接登记一笔已订购物品；purchase/place 仅用于将已查询到 order_id 的现有采购草案改为已订购，不能在没有草案编号时使用 place。位置转移保留已查询的实验室名称，明确指定目标柜子编号作为 target_location；目标实验室或柜子含义不明确时追问，不创建猜测的位置。
 每个工具参数使用 arguments 对象。缺少规格、位置、单位、用途、时间或人员时先查询或追问，不自行选择其他规格或猜测包装换算。
 工具说明：
-- inventory_search：query，可选 lab、category、limit、starts_at、ends_at。返回真实物品、位置、状态和可用数量。询问记录总数、位置总数或数量合计时使用 summary=true，服务器统计全部匹配记录并按单位分别计算，不受明细条数限制。统计全部库存时 query 留空，不把“库存”“全部”等描述作为耗材名称搜索。
-- workflow_query：kind 为 loans、schedules、preparations、purchases、templates、counts 或 alerts，可选 query、overdue_only、limit。
+- inventory_search：query，可选 lab、category、limit、offset、starts_at、ends_at。返回 total_count 和 next_offset；需要完整清单时逐页读取直到 next_offset 为空，也可 export_inventory。指定单个房间时不得扩大到合并房间。返回真实物品、位置、状态和可用数量。询问记录总数、位置总数或数量合计时使用 summary=true，服务器统计全部匹配记录并按单位分别计算，不受明细条数限制。统计全部库存时 query 留空，不把“库存”“全部”等描述作为耗材名称搜索。
+- workflow_query：kind 为 loans、schedules、preparations、purchases、procurement、templates、counts 或 alerts，可选 query、overdue_only、limit。
 - history_search：可选 q、actor、action、from_date、to_date、limit。操作类型 action 使用业务代码，例如 consume（消耗）、borrow（借出）、return（归还）、inbound（入库）。export_history 使用相同筛选定义。教师指定耗材名称时，q 必须完整保留该名称及其中的编号、前缀和限定词，不得只使用通用名称。首次调用前核对所有指定筛选条件，不得先导出扩大范围的文件。直接导出请求应一次传入完整筛选条件，生成符合要求的文件后结束，不重复导出。
 - read_attachment：attachment_id，读取表格及来源。图片由当前消息输入，模糊字段需要教师核对。
-- prepare_attachment：attachment_id 和可选 course，生成清单核对预览，不扣减库存。
+- prepare_attachment：attachment_id 和可选 course，生成清单核对预览，不扣减库存。照片必须调用此工具并在 payload.rows 传入识别的全部条目，每行填写 name、spec、unit、required_quantity、action（borrow、consume 或留空）、source_row。表格自动读取，也可通过 payload.rows 整理不规则表格。保留所有未知耗材，不能因为没有匹配库存而省略。清单可在界面修改后重新核对。
 - inventory_import_preview：attachment_id、mode（add 或 overwrite），可选 category，只预览导入。
 - business_preview：kind 和 payload，格式见业务 JSON Schema。编号必须来自当前对话中已查询的记录。一次完整任务使用一个计划，混合操作使用 mixed。
 - analyze_attachments：attachment_ids 和 code（Python 程序），仅分析选定附件，输出文件写入 /output。分析结果不能直接修改业务数据，正式数量由服务器校验。
 - export_inventory：可选 query、lab、category。export_history：可选 q、actor、action、from_date、to_date，导出实际业务历史。export_task：task_id，导出服务器保存的计划和实际结果。
-完整实验准备使用 preparation，按人、按组、固定和备用数量计算，明确消耗或借用。库存不足时仍预留已有数量，保存未满足需求和采购草案。draft 不表示订购，预计到货不表示实际到货。purchase/receive 已经同时登记到货和实际入库，只需要一个 receive 操作，不得再为同一批物品添加 stock/inbound。补充预留使用 preparation_update 的 replenish，必须重新预览确认。取消整项实验准备使用 preparation_update/cancel，它自动解除全部关联预留并取消尚未订购的草案，不得只取消采购而保留原准备。修改人数使用 preparation_update/revise。已有预留的实际取用使用 execute_schedule，不另建重复 stock 操作。
+完整实验准备中无任何匹配库存的新耗材，仍须保留该行：item_ids=[]，填写教师给出的 item_name、spec、unit 和需求；服务器生成独立采购需求。workflow_query/kind=procurement 查询这些需求；使用 procurement（demand_id、action=place/receive/cancel）管理。receive 必须填写实际到货 quantity、lab 和 location_code，服务器建立实际库存，不再添加重复入库。已有库存的采购继续使用 purchase。完整实验准备使用 preparation，按人、按组、固定和备用数量计算，明确消耗或借用。库存不足时仍预留已有数量，保存未满足需求和采购草案。draft 不表示订购，预计到货不表示实际到货。purchase/receive 已经同时登记到货和实际入库，只需要一个 receive 操作，不得再为同一批物品添加 stock/inbound。补充预留使用 preparation_update 的 replenish，必须重新预览确认。取消整项实验准备使用 preparation_update/cancel，它自动解除全部关联预留并取消尚未订购的草案，不得只取消采购而保留原准备。修改人数使用 preparation_update/revise。已有预留的实际取用使用 execute_schedule，不另建重复 stock 操作。
 准备和预留不等于实际取用。归还必须关联原借用记录，明确待清洗、破损或遗失。日期按照上海时区解释，计划显示明确时间和偏移。
 业务预览只能称为待确认。预览后结束本轮，不能声称业务已完成。更正人数、数量、位置或时间后重新查询并生成完整预览。所有教师共享对话，姓名未经身份验证。
-最终回答使用 JSON：{"missing_fields":["spec","quantity"]}。只选择实际缺少的字段；无需追问时使用空数组。允许字段：item_name、spec、unit、quantity、lab、location_code、action、borrower、purpose、destination、due_at、return_state、starts_at、ends_at、people、group_size、course、venue、name、owner、expected_at、note、attachment、scope、conversion、record。界面使用服务器文字和实际工具结果展示查询与状态，不展示模型自行宣称的业务结果。
+最终回答使用 JSON：{"missing_fields":["spec","quantity"],"explanation_topics":[]}。回答概念、数量含义、操作方式或流程问题时，选择 explanation_topics 中相应主题：availability、consume_borrow、preparation、procurement、confirmation、attachments、rooms、notifications、correction。可以同时选择多个主题。服务器展示完整解释；不要把概念问题当作缺少耗材资料。只选择实际缺少的字段；无需追问时使用空数组。允许字段：item_name、spec、unit、quantity、lab、location_code、action、borrower、purpose、destination、due_at、return_state、starts_at、ends_at、people、group_size、course、venue、name、owner、expected_at、note、attachment、scope、conversion、record。界面使用服务器文字和实际工具结果展示查询与状态，不展示模型自行宣称的业务结果。
 """.strip() + prompt_contracts()
 
 
@@ -62,6 +64,7 @@ class ToolArguments(BaseModel):
     lab: str | None = Field(default=None, max_length=50)
     limit: int | None = Field(default=None, ge=1, le=2000)
     summary: bool = False
+    offset: int = Field(default=0, ge=0, le=1000000)
     starts_at: str | None = Field(default=None, max_length=40)
     ends_at: str | None = Field(default=None, max_length=40)
     kind: str | None = Field(default=None, max_length=50)
@@ -200,8 +203,6 @@ def _recent_history(conn, conversation_id: str) -> list[dict]:
 
 
 def _inventory_summary(rows: list[dict]) -> dict:
-    from decimal import Decimal
-
     fields = ("owned_quantity", "ready_quantity", "available_quantity",
               "borrowed_quantity", "reserved_quantity", "cleaning", "repair", "quarantine")
     units = {}
@@ -214,7 +215,7 @@ def _inventory_summary(rows: list[dict]) -> dict:
     return {
         "type": "inventory_summary",
         "item_count": len(rows),
-        "lab_count": len({row["lab"] for row in rows}),
+        "lab_count": len({physical_room(row) for row in rows}),
         "location_count": len({(row["lab"], row["location_code"]) for row in rows}),
         "low_stock_count": sum(bool(row["low_stock"]) for row in rows),
         "units": [{"unit": unit, "item_count": group["item_count"],
@@ -243,11 +244,15 @@ def _run_read_tool(
                 conn, query, category, lab, limit=1_000_000,
                 starts_at=starts_at, ends_at=ends_at,
             ))
-        rows = search_items(
-            conn, query, category, lab, limit=limit,
-            starts_at=starts_at, ends_at=ends_at,
-        )
-        result = {"type": "inventory", "rows": rows}
+        all_rows = search_items(conn, query, category, lab, limit=1_000_000,
+                                starts_at=starts_at, ends_at=ends_at)
+        offset = max(int(args.get("offset") or 0), 0)
+        rows = all_rows[offset:offset + limit]
+        result = {"type": "inventory", "rows": rows, "total_count": len(all_rows),
+                  "offset": offset, "next_offset": offset + len(rows) if offset + len(rows) < len(all_rows) else None,
+                  "summary": _inventory_summary(all_rows),
+                  "search": {"q": query, "category": category, "lab": lab,
+                             "starts_at": starts_at, "ends_at": ends_at}}
         if not rows and args.get("lab"):
             result["available_labs"] = [row[0] for row in conn.execute("SELECT DISTINCT lab FROM inventory_items WHERE lab IS NOT NULL ORDER BY lab")]
             # A tool argument can accidentally combine a real laboratory name
@@ -292,6 +297,7 @@ def _run_read_tool(
             "templates": ("lesson_templates", None),
             "counts": ("stock_counts", "item_id"),
             "preparations": ("preparations", None),
+            "procurement": ("procurement_demands", None),
         }
         limit = min(max(int(args.get("limit") or 40), 1), 100)
         needle = str(args.get("query") or "").casefold()
@@ -346,7 +352,10 @@ def _run_read_tool(
         attachment = _find_attachment(attachments, str(args.get("attachment_id") or ""))
         if not attachment:
             raise ValueError("附件不存在，请选择此对话中的附件")
-        data = tables(Path(attachment["path"]))
+        if attachment["content_type"].startswith("image/"):
+            return {"type": "image_attachment", "attachment_id": attachment["id"], "filename": attachment["filename"],
+                    "instruction": "使用当前图片输入识别完整清单，调用 prepare_attachment，payload.rows 填写 name、spec、unit、required_quantity、action、source_row。无法看清的字段必须询问教师，不猜测。"}
+        data = tables(Path(attachment["path"]), arithmetic=True)
         encoded = json_text(data)
         if len(encoded.encode()) > 500_000:
             raise ValueError("表格内容过多，请选择较小的工作表，或使用临时分析程序整理")
@@ -357,7 +366,12 @@ def _run_read_tool(
             raise ValueError("请先在此对话附加 Excel 文件")
         path = Path(attachment["path"])
         if name == "prepare_attachment":
-            result = flow.preparation(conn, path, str(args.get("course") or ""), commit=False)
+            if attachment["content_type"].startswith("image/") or (args.get("payload") or {}).get("rows"):
+                result = flow.checklist(conn, (args.get("payload") or {}).get("rows") or [],
+                                        attachment["filename"], attachment_id=attachment["id"])
+            else:
+                result = flow.preparation(conn, path, str(args.get("course") or ""), commit=False)
+                result["attachment_id"] = attachment["id"]
             return {"type": "preparation", **result}
         mode = str(args.get("mode") or "add")
         if mode not in ("add", "overwrite"):
@@ -430,6 +444,7 @@ def _business_task(
         "stock",
         "bulk",
         "purchase",
+        "procurement",
         "schedule",
         "preparation",
         "preparation_update",
@@ -720,6 +735,7 @@ BUSINESS_TABLES = (
     "schedules", "reservations", "lesson_templates", "stock_counts",
     "location_details", "alert_states", "preparations",
     "preparation_schedules", "preparation_purchases", "preparation_revisions",
+    "procurement_demands", "procurement_receipts",
     "stock_events", "inventory_transactions", "source_rows", "item_aliases",
     "import_jobs", "upload_previews", "notification_events",
 )
@@ -778,8 +794,18 @@ def _item_ids(conn, kind: str, payload: dict) -> list[int]:
             values.extend(int(value) for value in line["item_ids"])
         row = conn.execute("SELECT lines FROM preparations WHERE id=?", (payload["preparation_id"],)).fetchone()
         if row:
-            for line in json.loads(row["lines"]):
+            lines = json.loads(row["lines"])
+            for line in lines:
                 values.extend(int(value) for value in line["item_ids"])
+                demand_id = line.get("procurement_demand_id")
+                if demand_id:
+                    values.extend(
+                        int(receipt[0])
+                        for receipt in conn.execute(
+                            "SELECT DISTINCT item_id FROM procurement_receipts WHERE demand_id=?",
+                            (demand_id,),
+                        )
+                    )
     elif kind == "bulk":
         values.extend(int(row["item_id"]) for row in payload.get("operations", []))
     else:
@@ -842,6 +868,12 @@ def _fill_versions(conn, kind: str, payload: dict) -> dict:
     if kind == "mixed":
         for step in payload["operations"]:
             step["payload"] = _fill_versions(conn, step["kind"], step["payload"])
+        return payload
+    if kind == "procurement":
+        demand = conn.execute("SELECT version FROM procurement_demands WHERE id=?", (payload["demand_id"],)).fetchone()
+        if not demand:
+            raise ValueError("采购需求不存在")
+        payload["version"] = demand["version"]
         return payload
     if kind in {"preparation", "preparation_update"}:
         payload["item_versions"] = {str(value): stock.ensure_balance(conn, value)["version"] for value in _item_ids(conn, kind, payload)}
@@ -907,6 +939,7 @@ def _validate_record_references(conn, conversation_id: str, kind: str, payload: 
         "item_id": {"inventory_search", "workflow_query"},
         "loan_id": {"workflow_query"},
         "order_id": {"workflow_query"},
+        "demand_id": {"workflow_query"},
         "schedule_id": {"workflow_query"},
         "preparation_id": {"workflow_query"},
         "template_id": {"workflow_query"},
@@ -955,7 +988,7 @@ def _collect_refs(value: Any, tool_name: str, surfaced: dict[str, set[str]]) -> 
                     surfaced["item_id"].add(str(row["id"]))
         if tool_name == "workflow_query":
             kind = value.get("type")
-            key = {"loans": "loan_id", "purchases": "order_id", "schedules": "schedule_id", "templates": "template_id", "preparations": "preparation_id", "alerts": "event_id"}.get(kind)
+            key = {"loans": "loan_id", "purchases": "order_id", "procurement": "demand_id", "schedules": "schedule_id", "templates": "template_id", "preparations": "preparation_id", "alerts": "event_id"}.get(kind)
             for row in value.get("rows", []):
                 record_id = row.get("event_id") if kind == "alerts" else row.get("id")
                 if key and record_id is not None:
@@ -1209,6 +1242,13 @@ def _context_hash(conn, kind: str, payload: dict) -> str:
         if step["kind"] == "alert":
             row = conn.execute("SELECT * FROM alert_states WHERE item_id=?", (data.get("item_id"),)).fetchone()
             state.append(dict(row) if row else None)
+        if step["kind"] == "procurement":
+            row = conn.execute("SELECT * FROM procurement_demands WHERE id=?", (data["demand_id"],)).fetchone()
+            state.append(dict(row) if row else None)
+            if data.get("lab") and data.get("location_code"):
+                state.append([stock.view(conn, row[0]) for row in conn.execute(
+                    "SELECT id FROM inventory_items WHERE lab=? AND location_code=? ORDER BY id",
+                    (data["lab"], data["location_code"]))])
         if step["kind"] == "preparation_update":
             from .preparations import view
 

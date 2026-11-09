@@ -23,14 +23,39 @@ def _allocate(conn, data: dict, sources: list[dict]) -> tuple[list, list]:
     for source in sources:
         items = [stock.ensure_balance(conn, int(value))
                  for value in dict.fromkeys(source["item_ids"])]
+        if source.get("procurement_demand_id"):
+            received_items = [stock.ensure_balance(conn, row[0]) for row in conn.execute(
+                "SELECT DISTINCT item_id FROM procurement_receipts WHERE demand_id=? ORDER BY item_id",
+                (source["procurement_demand_id"],))]
+            items = list({item["item_id"]: item for item in items + received_items}.values())
+            source = {**source, "item_ids": [item["item_id"] for item in items]}
         if not items:
-            raise ValueError("每个需求至少需要一个明确的物品编号")
+            for field in ("item_name", "spec", "unit"):
+                stock.required(source, field)
+            required = stock.number(source["unmet_quantity"]) if "unmet_quantity" in source else stock.number(
+                flow.template_lines({**data, "lines": [{**source, "item_id": 1}]})[0]["quantity"])
+            demands.append({**source, "required_quantity": source.get("required_quantity", stock.text(required)),
+                            "reserved_quantity": source.get("reserved_quantity", "0"),
+                            "unmet_quantity": stock.text(required), "available_quantity": "0", "locations": []})
+            continue
         first = items[0]
+        from .matching import same_material
+        from .services import exact_item_query
+
         for item in items:
             stock.check_version(item, versions.get(str(item["item_id"])))
-            if any((item.get(key) or "") != (first.get(key) or "")
-                   for key in ("normalized_name", "spec", "brand", "unit")):
+            if not same_material(first["item_name"], first["spec"], item["item_name"], item["spec"]) or any(
+                (item.get(key) or "") != (first.get(key) or "") for key in ("brand", "unit")):
                 raise ValueError("同一条目只能分配名称、规格、品牌和单位相同的物品")
+            requested_name = str(source.get("item_name") or "").strip()
+            requested_spec = str(source.get("spec") or "").strip()
+            if requested_name:
+                aliases = [row[0] for row in conn.execute(
+                    "SELECT alias FROM item_aliases WHERE item_id=? ORDER BY alias", (item["item_id"],))]
+                query = " ".join(part for part in (requested_name, requested_spec) if part)
+                candidate = {**item, "aliases": aliases}
+                if not exact_item_query(candidate, query):
+                    raise ValueError("需求名称或规格与选定物品不一致，请重新查询并核对")
         if "unmet_quantity" in source:
             required = stock.number(source["unmet_quantity"])
         else:
@@ -64,6 +89,7 @@ def _allocate(conn, data: dict, sources: list[dict]) -> tuple[list, list]:
                         "required_quantity": source.get("required_quantity", stock.text(required)),
                         "reserved_quantity": stock.text(prior + required - remaining),
                         "unmet_quantity": stock.text(remaining),
+                        "available_quantity": stock.text(sum((stock.number(row["available_quantity"]) for row in located), Decimal(0))),
                         "locations": source.get("locations", []) + located})
     return allocations, demands
 
@@ -75,6 +101,13 @@ def _schedule(conn, data, allocations, actor):
 
 
 def _draft(conn, line, data, actor, quantity=None):
+    if not line["item_ids"]:
+        line["procurement_demand_id"] = conn.execute(
+            "INSERT INTO procurement_demands(preparation_id,item_name,spec,unit,quantity,actor,note) VALUES (?,?,?,?,?,?,?)",
+            (data.get("id"), line["item_name"], line["spec"], line["unit"], quantity or line["unmet_quantity"], actor,
+             f"实验准备：{data['name']}"),
+        ).lastrowid
+        return
     item = stock.ensure_balance(conn, line["item_ids"][0])
     result = flow.purchase(conn, {
         "action": "draft", "item_id": item["item_id"],
@@ -102,6 +135,9 @@ def create(conn, data: dict, actor: str) -> dict:
         (data["name"], data["course"], data["venue"], start, end, data.get("people", 0),
          data.get("group_size", 1), json.dumps(demands, ensure_ascii=False), schedule_id, actor, status),
     ).lastrowid
+    for line in demands:
+        if line.get("procurement_demand_id"):
+            conn.execute("UPDATE procurement_demands SET preparation_id=? WHERE id=?", (preparation_id, line["procurement_demand_id"]))
     if schedule_id:
         conn.execute("INSERT INTO preparation_schedules(preparation_id,schedule_id) VALUES (?,?)", (preparation_id, schedule_id))
     for line in demands:
@@ -124,6 +160,8 @@ def view(conn, preparation_id):
     result["purchases"] = [dict(order) for order in conn.execute(
         "SELECT o.* FROM purchase_orders o JOIN preparation_purchases p ON p.order_id=o.id "
         "WHERE p.preparation_id=? ORDER BY o.id", (preparation_id,))]
+    result["procurement_demands"] = [dict(row) for row in conn.execute(
+        "SELECT * FROM procurement_demands WHERE preparation_id=? ORDER BY id", (preparation_id,))]
     return {"ok": True, "type": "preparation", **result}
 
 
@@ -148,16 +186,39 @@ def _sync_drafts(conn, current, demands, actor, note):
             item = stock.ensure_balance(conn, order["item_id"])
             key = tuple(item.get(field) or "" for field in ("normalized_name", "spec", "brand", "unit"))
             pending[key] = pending.get(key, Decimal(0)) + stock.number(order["quantity"]) - stock.number(order["received"])
+    from .matching import same_material
+
+    unknown_pending = []
+    for demand in current.get("procurement_demands", []):
+        if demand["status"] == "draft":
+            conn.execute("UPDATE procurement_demands SET status='cancelled',version=version+1 WHERE id=?", (demand["id"],))
+        elif demand["status"] == "ordered":
+            unknown_pending.append({**demand, "pending": stock.number(demand["quantity"]) - stock.number(demand["received"])})
     for line in demands:
         line.pop("purchase_draft_id", None)
+        line.pop("procurement_demand_id", None)
+        unmet = stock.number(line["unmet_quantity"])
+        procurement_pending = Decimal(0)
+        for demand in unknown_pending:
+            if line["unit"] == demand["unit"] and same_material(line["item_name"], line["spec"], demand["item_name"], demand["spec"]):
+                use = min(unmet, demand["pending"])
+                unmet -= use
+                demand["pending"] -= use
+                procurement_pending += use
+                line["procurement_demand_id"] = demand["id"]
+        line["procurement_pending_quantity"] = stock.text(procurement_pending)
+        if not line["item_ids"]:
+            if unmet:
+                _draft(conn, line, current, actor, stock.text(unmet))
+            continue
         item = stock.ensure_balance(conn, line["item_ids"][0])
         key = tuple(item.get(field) or "" for field in ("normalized_name", "spec", "brand", "unit"))
-        unmet = stock.number(line["unmet_quantity"])
-        ordered = min(unmet, pending.get(key, Decimal(0)))
+        to_order = stock.number(line["unmet_quantity"]) - procurement_pending
+        ordered = min(to_order, pending.get(key, Decimal(0)))
         pending[key] = pending.get(key, Decimal(0)) - ordered
         line["ordered_pending_quantity"] = stock.text(ordered)
-        if unmet > ordered:
-            _draft(conn, line, current, actor, stock.text(unmet - ordered))
+        if to_order > ordered:
+            _draft(conn, line, current, actor, stock.text(to_order - ordered))
             conn.execute("INSERT INTO preparation_purchases VALUES (?,?)", (current["id"], line["purchase_draft_id"]))
 
 
@@ -180,7 +241,8 @@ def update(conn, data: dict, actor: str) -> dict:
             if order["status"] == "draft":
                 flow.purchase(conn, {"action": "cancel", "order_id": order["id"],
                                      "order_version": order["version"], "note": note}, actor)
-        conn.execute("UPDATE preparations SET status='cancelled',version=version+1 WHERE id=?", (current["id"],))
+        conn.execute("UPDATE procurement_demands SET status='cancelled',version=version+1 WHERE preparation_id=? AND status='draft'", (current["id"],))
+        conn.execute("UPDATE preparations SET status='cancelled' ,version=version+1 WHERE id=?", (current["id"],))
     elif data["action"] == "replenish":
         if any(row["status"] == "cancelled" and not row["retired"] for row in current["schedules"]):
             raise ValueError("有关联预留已被取消，请重新建立包含完整需求的准备计划")
@@ -203,7 +265,7 @@ def update(conn, data: dict, actor: str) -> dict:
         revised["ends_at"] = stock.moment(revised["ends_at"])
         if revised["starts_at"] >= revised["ends_at"]:
             raise ValueError("结束时间必须晚于开始时间")
-        fields = {"item_ids", "action", "unit", "quantity", "per_person", "per_group", "fixed", "spare", "source"}
+        fields = {"item_name", "spec", "item_ids", "procurement_demand_id", "action", "unit", "quantity", "per_person", "per_group", "fixed", "spare", "source"}
         sources = [{key: value for key, value in line.items() if key in fields}
                    for line in revised["lines"]]
         if "lines" not in data:

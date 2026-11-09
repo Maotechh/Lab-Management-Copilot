@@ -35,6 +35,7 @@
             <div class="page-intro"><span class="eyebrow">库存与位置</span><h2>找到耗材，再处理需要的事情</h2><p>按名称、规格、房间或柜子查询。选择耗材可查看详情并登记操作。</p></div><div class="surface">
               <div class="toolbar">
                 <input aria-label="耗材名称、规格或位置" id="searchInput" type="search" placeholder="名称、规格、实验室、位置" />
+                <select id="roomFilter" aria-label="实验室房间"><option value="">全部房间</option></select>
                 <select id="categoryFilter" aria-label="耗材类别">
                   <option value="">全部类别</option>
                   <option value="普通化学">普通化学</option>
@@ -44,6 +45,7 @@
                 <label class="inline-check"><input id="lowStockFilter" type="checkbox" />只看预警</label>
                 <button id="searchBtn"><i data-lucide="search" class="icon-sm"></i>查询</button>
               </div>
+              <button id="searchMore" type="button" class="secondary" hidden>显示下一页</button>
               <div id="searchSummary" class="summary-strip muted">输入耗材名称、规格或位置开始查询。</div>
               <details class="advanced-filter"><summary>按实验时间检查可用数量</summary><div class="form-grid"><label>分配开始时间（上海时间）<input id="searchStart" type="datetime-local" /></label><label>分配结束时间（上海时间）<input id="searchEnd" type="datetime-local" /></label><button id="applyTimeFilter" type="button">应用时间范围</button></div></details>
               <div class="table-wrap responsive-cards">

@@ -1,10 +1,12 @@
 """Bounded spreadsheet and image decoding. Uploaded code and formulas never run."""
 from __future__ import annotations
 
+import ast
 import base64
 import csv
 import io
 import zipfile
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 import pandas as pd
@@ -19,7 +21,7 @@ ALIASES = {
 }
 
 
-def tables(path: Path) -> list[dict]:
+def tables(path: Path, *, arithmetic: bool = False) -> list[dict]:
     """Read all sheets and source coordinates with no office subprocess."""
     suffix = path.suffix.lower()
     sheets = []
@@ -58,7 +60,13 @@ def tables(path: Path) -> list[dict]:
                     for cell in row:
                         if cell.data_type == "f":
                             formulas.append(cell.coordinate)
-                            rows[cell.row - 1][cell.column - 1] = None
+                            try:
+                                value = arithmetic_value(sheet, cell.coordinate) if arithmetic else None
+                            except ValueError:
+                                value = None
+                            rows[cell.row - 1][cell.column - 1] = value
+                            if value is not None:
+                                formulas.pop()
                 # Text merged headings repeat; numeric merged quantities require review.
                 for merged in sheet.merged_cells.ranges:
                     value = rows[merged.min_row - 1][merged.min_col - 1]
@@ -99,9 +107,9 @@ def tables(path: Path) -> list[dict]:
     return output
 
 
-def uploaded_frame(path: Path) -> pd.DataFrame:
+def uploaded_frame(path: Path, *, arithmetic: bool = False) -> pd.DataFrame:
     records, sources = [], []
-    for sheet in tables(path):
+    for sheet in tables(path, arithmetic=arithmetic):
         if sheet["formulas"]:
             raise ValueError(f"工作表 {sheet['sheet']} 包含公式（{'、'.join(sheet['formulas'][:10])}），请核对并改为明确数值后上传")
         if sheet["header_row"] is None:
@@ -137,3 +145,54 @@ def image_payload(path: Path, name: str) -> dict:
         output = io.BytesIO()
         image.save(output, format="JPEG", quality=85)
     return {"name": name, "data": base64.b64encode(output.getvalue()).decode("ascii")}
+
+
+def arithmetic_value(sheet, coordinate, trail=()):
+    """Evaluate only bounded decimal arithmetic and same-sheet cell references."""
+    if coordinate in trail or len(trail) > 20:
+        raise ValueError("公式存在循环或超过计算限制")
+    value = sheet[coordinate].value
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        result = Decimal(str(value))
+    elif isinstance(value, str) and value.startswith("=") and len(value) <= 200:
+        import re
+
+        expression = re.sub(
+            r"(?<![A-Za-z0-9_])\$?([A-Za-z]{1,3})\$?([1-9][0-9]{0,5})(?![A-Za-z0-9_])",
+            r"\1\2",
+            value[1:],
+        )
+        try:
+            tree = ast.parse(expression, mode="eval")
+        except SyntaxError as exc:
+            raise ValueError("需要核对公式") from exc
+        if sum(1 for _ in ast.walk(tree)) > 60:
+            raise ValueError("公式超过计算限制")
+        def calculate(node):
+            if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+                return Decimal(ast.get_source_segment(expression, node))
+            if isinstance(node, ast.Name) and re.fullmatch(r"[A-Za-z]{1,3}[1-9][0-9]{0,5}", node.id):
+                return Decimal(str(arithmetic_value(sheet, node.id, (*trail, coordinate))))
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd | ast.USub):
+                return calculate(node.operand) * (-1 if isinstance(node.op, ast.USub) else 1)
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add | ast.Sub | ast.Mult | ast.Div):
+                left, right = calculate(node.left), calculate(node.right)
+                if isinstance(node.op, ast.Add):
+                    return left + right
+                if isinstance(node.op, ast.Sub):
+                    return left - right
+                if isinstance(node.op, ast.Mult):
+                    return left * right
+                return left / right
+            raise ValueError("仅支持明确数值、同一工作表单元格和加减乘除")
+        try:
+            with localcontext() as context:
+                context.prec = 50
+                result = calculate(tree.body)
+        except ArithmeticError as exc:
+            raise ValueError("公式数值无效") from exc
+    else:
+        raise ValueError("公式引用不是明确数值")
+    if not result.is_finite() or abs(result) > Decimal("1e12"):
+        raise ValueError("公式数值超出限制")
+    return result

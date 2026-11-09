@@ -89,6 +89,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         migrate_shared_runtime(conn)
         migrate_exports(conn)
         migrate_preparation_history(conn)
+        migrate_procurement(conn)
         return
     database = conn.execute("PRAGMA database_list").fetchone()[2]
     if database:
@@ -120,6 +121,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         migrate_shared_runtime(conn)
         migrate_exports(conn)
         migrate_preparation_history(conn)
+        migrate_procurement(conn)
     except Exception:
         conn.rollback()
         raise
@@ -432,3 +434,12 @@ def migrate_preparation_history(conn: sqlite3.Connection) -> None:
     except Exception:
         conn.rollback()
         raise
+
+
+def migrate_procurement(conn: sqlite3.Connection) -> None:
+    if conn.execute("SELECT 1 FROM schema_migrations WHERE version=9").fetchone():
+        return
+    with conn:
+        conn.execute("CREATE TABLE procurement_demands (id INTEGER PRIMARY KEY AUTOINCREMENT, preparation_id INTEGER REFERENCES preparations(id), item_name TEXT NOT NULL, spec TEXT NOT NULL, unit TEXT NOT NULL, quantity TEXT NOT NULL, received TEXT NOT NULL DEFAULT '0', actor TEXT NOT NULL, expected_at TEXT, note TEXT, status TEXT NOT NULL DEFAULT 'draft', version INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+        conn.execute("CREATE TABLE procurement_receipts (id INTEGER PRIMARY KEY AUTOINCREMENT, demand_id INTEGER NOT NULL REFERENCES procurement_demands(id), item_id INTEGER NOT NULL REFERENCES inventory_items(id), quantity TEXT NOT NULL, event_id INTEGER NOT NULL REFERENCES stock_events(id), created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+        conn.execute("INSERT INTO schema_migrations(version,report) VALUES (9,?)", (json.dumps({"unregistered_material_procurement": True}),))

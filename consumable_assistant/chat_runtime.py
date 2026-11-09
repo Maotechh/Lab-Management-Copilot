@@ -237,6 +237,19 @@ CLARIFICATION_FIELDS = {
 }
 
 
+EXPLANATIONS = {
+    "availability": "总拥有数量包括可用状态、借出、待清洗、维修和待核对的物品。可用数量从可用状态数量中扣除相关预留；借出、待清洗、维修和待核对的物品不能直接分配。指定实验时间后，服务器按该时间段检查预留。清单的可用数量表示全部可用库存，本次分配数量表示本次需求实际占用的部分，两者可能不同。",
+    "consume_borrow": "消耗会减少总拥有数量。借用只把数量从可用状态转为借出，总拥有数量不变。归还必须关联原借用记录，可以部分归还，并注明可用、待清洗、破损或遗失。待清洗物品完成清洗并确认状态变更后才重新可用。",
+    "preparation": "上传实验清单，或者说明人数、每组人数及每人、每组、固定和备用用量。核对名称、规格、单位、消耗或借用方式及实验时间后，系统显示各位置的可用数量和分配，生成一次确认的完整计划。不足时保留已有预留、未满足需求和采购草案。预留不等于实际取用，实验执行时需要另外确认消耗或借用。",
+    "procurement": "采购草案仅记录需求，不表示已经订购，也不增加库存。确认订购后可以登记部分到货，每次到货只增加实际数量。新耗材需要填写实际存放房间和位置，实际到货确认后才建立库存记录。到货不会自动预留，需要重新预览并确认补充预留。",
+    "confirmation": "查询直接执行。库存、预留、采购和资料变更均先显示完整预览，确认后才执行。每个完整计划确认一次，重复确认返回原结果。预览有效期为三十分钟，内容或相关数据变化后需要重新预览和确认。",
+    "attachments": "可以上传表格或清单照片。系统保留原文件和条目来源，照片识别结果先形成可修改的清单。请核对名称、规格、数量、单位和使用方式，模糊内容需要补充。表格只读取数据和有限的加减乘除计算，不执行宏或外部代码。清单核对本身不会修改库存。",
+    "rooms": "房间和柜子分别筛选。来源表将多个房间合并时，只有位置编码明确注明房间的记录才属于其中的具体房间；无法确定的记录保留合并名称，等待核对。查询结果和导出保留原始来源记录。",
+    "notifications": "在使用设置中允许通知，并检查当前设备是否已订阅。iPhone 需要将网站添加至主屏幕并从主屏幕进入；Android 可以通过 Chrome 安装网站应用。使用测试通知检查关闭页面和锁定屏幕后是否仍能收到。通知只显示通用提醒，详情需要校园网或学校 VPN。",
+    "correction": "修改人数、数量、时间、位置或处理范围后，原计划不能继续确认，需要生成新的完整预览。已经执行的操作保留历史；允许撤销的库存流水可预览撤销，已有后续依赖时服务器会说明原因。已经实际取用的实验准备不能直接取消或改写原需求。",
+}
+
+
 def verified_reply(model_text: str, tools: list[dict]) -> str:
     """Only server-owned wording can assert a business outcome or quantity.
 
@@ -245,10 +258,14 @@ def verified_reply(model_text: str, tools: list[dict]) -> str:
     """
     try:
         value = json.loads(model_text.removeprefix("```json").removesuffix("```").strip())
+        topics = value.get("explanation_topics", []) if isinstance(value, dict) else []
         fields = value.get("missing_fields", []) if isinstance(value, dict) else []
         fields = list(dict.fromkeys(field for field in fields if isinstance(field, str) and field in CLARIFICATION_FIELDS)) if isinstance(fields, list) else []
     except (ValueError, TypeError):
-        fields = []
+        fields, topics = [], []
+    explanations = [EXPLANATIONS[topic] for topic in dict.fromkeys(topic for topic in topics if isinstance(topic, str)) if topic in EXPLANATIONS] if isinstance(topics, list) else []
+    if explanations:
+        return "\n\n".join(explanations) + ("\n\n请补充：" + "、".join(CLARIFICATION_FIELDS[field] for field in fields) + "。" if fields else "")
     if fields:
         return "请补充以下资料：" + "、".join(CLARIFICATION_FIELDS[field] for field in fields) + "。当前没有执行新的业务变更。"
     if tools:

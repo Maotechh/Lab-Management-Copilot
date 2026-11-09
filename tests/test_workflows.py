@@ -173,6 +173,57 @@ def test_inventory_summary_aggregate_can_exceed_single_item_quantity_limit(db):
     assert result["units"][0]["owned_quantity"] == "2000000000000"
 
 
+def test_inventory_query_pages_keep_total_and_exhaust_without_duplicates(db):
+    from consumable_assistant.chat import _run_read_tool
+
+    expected = {
+        make_item(db, name="分页测试耗材", quantity=index + 1, location=f"P{index}")
+        for index in range(5)
+    }
+    pages = [
+        _run_read_tool(
+            db,
+            "unused",
+            "inventory_search",
+            {"query": "分页测试耗材", "limit": 2, "offset": offset},
+            [],
+            None,
+        )
+        for offset in (0, 2, 4)
+    ]
+    assert [len(page["rows"]) for page in pages] == [2, 2, 1]
+    assert all(page["total_count"] == 5 for page in pages)
+    assert [page["next_offset"] for page in pages] == [2, 4, None]
+    actual = [row["id"] for page in pages for row in page["rows"]]
+    assert set(actual) == expected
+    assert len(actual) == len(set(actual))
+
+
+def test_shared_conversation_message_pages_follow_descending_cursor(db):
+    from consumable_assistant import chat
+
+    conversation_id = chat.new_conversation(db, "desktop")["conversation_id"]
+    message_ids = []
+    for index in range(5):
+        cursor = db.execute(
+            "INSERT INTO chat_messages(conversation_id,request_id,role,content) VALUES (?,?,?,?)",
+            (conversation_id, uuid.uuid4().hex, "user", f"消息 {index}"),
+        )
+        message_ids.append(cursor.lastrowid)
+    db.commit()
+
+    latest = chat.conversation_view(db, conversation_id, limit=2)
+    older = chat.conversation_view(db, conversation_id, before=latest["next_before"], limit=2)
+    oldest = chat.conversation_view(db, conversation_id, before=older["next_before"], limit=2)
+
+    assert [row["id"] for row in latest["messages"]] == message_ids[-2:]
+    assert [row["id"] for row in older["messages"]] == message_ids[1:3]
+    assert [row["id"] for row in oldest["messages"]] == message_ids[:1]
+    assert latest["next_before"] == message_ids[-2]
+    assert older["next_before"] == message_ids[1]
+    assert oldest["next_before"] is None
+
+
 def test_inventory_query_reports_actual_lab_names_without_guessing(db):
     from consumable_assistant.chat import _run_read_tool
 
@@ -202,6 +253,140 @@ def test_inventory_query_separates_unique_lab_and_location_suffix(db):
         "source": "exact_database_name_and_location_match",
     }
     assert "query_guidance" not in result
+
+
+def test_combined_organic_lab_room_prefixes_resolve_to_individual_rooms(db):
+    from consumable_assistant.chat import _run_read_tool
+    from consumable_assistant.matching import physical_room
+    from consumable_assistant.services import search_items
+
+    room_307 = make_item(db, name="有机材料", location="07-Ac2")
+    room_310 = make_item(db, name="有机材料", location="10-Ea1")
+    room_314 = make_item(db, name="物化材料", location="14-Ac4")
+    for item_id in (room_307, room_310):
+        db.execute("UPDATE inventory_items SET lab='307/310' WHERE id=?", (item_id,))
+    db.execute("UPDATE inventory_items SET lab='314' WHERE id=?", (room_314,))
+    db.commit()
+
+    assert physical_room({"lab": "307/310", "location_code": "07-Ac2"}) == "307"
+    assert physical_room({"lab": "307/310", "location_code": "10-Ea1"}) == "310"
+    assert physical_room({"lab": "314", "location_code": "14-Ac4"}) == "314"
+    assert {row["id"] for row in search_items(db, lab="307")} == {room_307}
+    assert {row["id"] for row in search_items(db, lab="310")} == {room_310}
+    result = _run_read_tool(db, "unused", "inventory_search", {"lab": "310", "limit": 10}, [], None)
+    assert [row["id"] for row in result["rows"]] == [room_310]
+
+
+def test_unmatched_preparation_receipts_replenish_without_duplicate_orders(db):
+    from consumable_assistant.chat import _fill_versions
+    from consumable_assistant.preparations import view
+
+    preparation = write(db, "preparation", _fill_versions(db, "preparation", preparation_data([], lines=[{
+        "item_ids": [], "item_name": "新型刻度吸管", "spec": "15 mL", "unit": "支",
+        "action": "consume", "quantity": "10",
+    }])))
+    demand_id = preparation["procurement_demands"][0]["id"]
+    assert preparation["status"] == "awaiting_procurement"
+    assert preparation["lines"][0]["unmet_quantity"] == "10"
+    assert db.execute("SELECT COUNT(*) FROM purchase_orders").fetchone()[0] == 0
+
+
+    write(db, "procurement", _fill_versions(db, "procurement", {
+        "demand_id": demand_id, "action": "place", "owner": "采购教师",
+        "expected_at": "2026-11-30T12:00:00+08:00",
+    }))
+    write(db, "procurement", _fill_versions(db, "procurement", {
+        "demand_id": demand_id, "action": "receive", "quantity": "4",
+        "lab": "307", "location_code": "07-Ac2",
+    }))
+
+    current = view(db, preparation["id"])
+    replenished = write(db, "preparation_update", _fill_versions(db, "preparation_update", {
+        "preparation_id": current["id"], "action": "replenish", "note": "部分到货后补充预留",
+    }))
+    assert replenished["lines"][0]["reserved_quantity"] == "4"
+    assert replenished["lines"][0]["unmet_quantity"] == "6"
+    assert replenished["lines"][0]["procurement_pending_quantity"] == "6"
+    assert db.execute("SELECT COUNT(*) FROM purchase_orders").fetchone()[0] == 0
+
+    write(db, "procurement", _fill_versions(db, "procurement", {
+        "demand_id": demand_id, "action": "receive", "quantity": "6",
+        "lab": "307", "location_code": "07-Ac2",
+    }))
+    updated = write(db, "preparation_update", _fill_versions(db, "preparation_update", {
+        "preparation_id": replenished["id"], "action": "replenish", "note": "余量到货后补充预留",
+    }))
+    assert updated["status"] == "reserved"
+    assert updated["lines"][0]["reserved_quantity"] == "10"
+    assert updated["lines"][0]["unmet_quantity"] == "0"
+    assert db.execute("SELECT status FROM procurement_demands WHERE id=?", (demand_id,)).fetchone()[0] == "received"
+    assert db.execute("SELECT COUNT(*) FROM purchase_orders").fetchone()[0] == 0
+
+
+def test_revising_unmatched_preparation_preserves_one_linked_procurement_need(db):
+    from consumable_assistant.chat import _fill_versions
+
+    original = write(
+        db,
+        "preparation",
+        _fill_versions(
+            db,
+            "preparation",
+            preparation_data(
+                [],
+                lines=[{
+                    "item_ids": [], "item_name": "实验专用聚合物滴管", "spec": "3 mL",
+                    "unit": "支", "action": "consume", "quantity": "10",
+                }],
+            ),
+        ),
+    )
+    original_demand = original["procurement_demands"][0]
+
+    revised = write(
+        db,
+        "preparation_update",
+        _fill_versions(
+            db,
+            "preparation_update",
+            {"preparation_id": original["id"], "action": "revise", "people": 6, "note": "更新实验人数"},
+        ),
+    )
+    revised_demands = revised["procurement_demands"]
+    assert len(revised_demands) == 2
+    assert revised_demands[0]["id"] == original_demand["id"]
+    assert revised_demands[0]["status"] == "cancelled"
+    active = [demand for demand in revised_demands if demand["status"] == "draft"]
+    assert len(active) == 1
+    assert active[0]["id"] == revised["lines"][0]["procurement_demand_id"]
+    assert active[0]["preparation_id"] == revised["id"]
+    assert active[0]["quantity"] == "10"
+
+    write(
+        db,
+        "procurement",
+        _fill_versions(
+            db,
+            "procurement",
+            {"demand_id": active[0]["id"], "action": "place", "owner": "采购教师",
+             "expected_at": "2026-11-30T12:00:00+08:00"},
+        ),
+    )
+    next_revision = write(
+        db,
+        "preparation_update",
+        _fill_versions(
+            db,
+            "preparation_update",
+            {"preparation_id": revised["id"], "action": "revise", "people": 7, "note": "再次更新人数"},
+        ),
+    )
+    pending = [demand for demand in next_revision["procurement_demands"] if demand["status"] == "ordered"]
+    assert len(pending) == 1
+    assert pending[0]["id"] == active[0]["id"]
+    assert next_revision["lines"][0]["procurement_demand_id"] == active[0]["id"]
+    assert db.execute("SELECT COUNT(*) FROM procurement_demands WHERE preparation_id=? AND status='draft'",
+                      (original["id"],)).fetchone()[0] == 0
 
 
 @pytest.mark.parametrize(
@@ -536,6 +721,137 @@ def test_chat_preparation_attachment_is_committed_with_its_tool_record(db, monke
     assert db.execute("SELECT COUNT(*) FROM chat_tool_calls WHERE name='prepare_attachment'").fetchone()[0] == 1
 
 
+def test_photo_checklist_keeps_unmatched_rows_and_source_coordinates(db, tmp_path):
+    from PIL import Image
+
+    from consumable_assistant.chat import _run_read_tool
+
+    known_item = make_item(db, quantity=2, name="照片核对烧杯")
+    from consumable_assistant import chat
+
+    conversation_id = chat.new_conversation(db, "photo-device")["conversation_id"]
+    image_path = tmp_path / "清单.png"
+    Image.new("RGB", (32, 32), "white").save(image_path)
+    attachment_id = uuid.uuid4().hex
+    attachment = {
+        "id": attachment_id,
+        "filename": image_path.name,
+        "content_type": "image/png",
+        "path": str(image_path),
+    }
+    db.execute(
+        "INSERT INTO chat_attachments(id,conversation_id,filename,content_type,size,sha256,path) VALUES (?,?,?,?,?,?,?)",
+        (attachment_id, conversation_id, image_path.name, "image/png", image_path.stat().st_size, "photo-test", str(image_path)),
+    )
+    db.commit()
+
+    result = _run_read_tool(
+        db,
+        conversation_id,
+        "prepare_attachment",
+        {
+            "attachment_id": attachment_id,
+            "payload": {
+                "rows": [
+                    {"name": "照片核对烧杯", "spec": "100mL", "unit": "个", "required_quantity": "2", "action": "borrow", "source_row": 3},
+                    {"name": "無库存的新型耗材", "spec": "25mL", "unit": "支", "required_quantity": "4", "action": "", "source_row": 4},
+                ]
+            },
+        },
+        [attachment],
+        None,
+    )
+
+    assert result["type"] == "preparation"
+    assert result["row_count"] == 2
+    known, unmatched = result["rows"]
+    assert known["name"] == "照片核对烧杯"
+    assert known["source_row"] == 3
+    assert known["locations"][0]["item_id"] == known_item
+    assert known["locations"][0]["allocated_quantity"] == "2"
+    assert unmatched["name"] == "無库存的新型耗材"
+    assert unmatched["source_row"] == 4
+    assert unmatched["locations"] == []
+    assert unmatched["status"] == "需要确认匹配"
+    assert stock.view(db, known_item)["ready"] == "2"
+
+
+def test_procurement_partial_receipt_cancel_and_quantity_boundaries(db):
+    from consumable_assistant.chat import _fill_versions
+
+    preparation = write(
+        db,
+        "preparation",
+        _fill_versions(
+            db,
+            "preparation",
+            preparation_data(
+                [],
+                lines=[
+                    {
+                        "item_ids": [],
+                        "item_name": "待采购滤纸",
+                        "spec": "中速",
+                        "unit": "盒",
+                        "action": "consume",
+                        "quantity": "10",
+                    }
+                ],
+            ),
+        ),
+    )
+    demand_id = preparation["procurement_demands"][0]["id"]
+    from consumable_assistant.chat import _run_read_tool
+
+    listed = _run_read_tool(db, "unused", "workflow_query", {"kind": "procurement"}, [], None)
+    assert listed["type"] == "procurement"
+    assert [row["id"] for row in listed["rows"]] == [demand_id]
+    write(
+        db,
+        "procurement",
+        _fill_versions(
+            db,
+            "procurement",
+            {"demand_id": demand_id, "action": "place", "owner": "采购教师", "expected_at": "2026-11-30T12:00:00+08:00"},
+        ),
+    )
+    demand = db.execute("SELECT * FROM procurement_demands WHERE id=?", (demand_id,)).fetchone()
+    for quantity in ("0", "11"):
+        with pytest.raises(ValueError):
+            write(
+                db,
+                "procurement",
+                {"demand_id": demand_id, "version": demand["version"], "action": "receive",
+                 "quantity": quantity, "lab": "307", "location_code": "07-Ac2"},
+            )
+    assert db.execute("SELECT received FROM procurement_demands WHERE id=?", (demand_id,)).fetchone()[0] == "0"
+    receipt = write(
+        db,
+        "procurement",
+        _fill_versions(db, "procurement", {
+            "demand_id": demand_id, "action": "receive", "quantity": "4", "lab": "307", "location_code": "07-Ac2"
+        }),
+    )
+    item_id = db.execute("SELECT item_id FROM procurement_receipts WHERE demand_id=?", (demand_id,)).fetchone()[0]
+    assert receipt["received"] == "4"
+    assert stock.view(db, item_id)["ready"] == "4"
+    cancelled = write(
+        db,
+        "procurement",
+        _fill_versions(db, "procurement", {"demand_id": demand_id, "action": "cancel", "note": "取消未到货余量"}),
+    )
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["received"] == "4"
+    with pytest.raises(stock.Conflict):
+        write(
+            db,
+            "procurement",
+            {"demand_id": demand_id, "version": cancelled["version"], "action": "receive",
+             "quantity": "1", "lab": "307", "location_code": "07-Ac2"},
+        )
+    assert stock.view(db, item_id)["ready"] == "4"
+
+
 def test_chat_business_contract_rejects_missing_loan_and_purchase_fields():
     from consumable_assistant.chat_contracts import validate_payload
 
@@ -605,6 +921,39 @@ def test_upload_preview_duplicate_and_history(db, tmp_path):
         },
     )
     assert stock.view(db, item)["ready"] == "20"
+
+
+def test_multisheet_import_preserves_original_source_coordinates(db, tmp_path):
+    path = tmp_path / "多工作表库存.xlsx"
+    workbook = Workbook()
+    first = workbook.active
+    first.title = "第一间实验室"
+    first.append(["2026 年库存"])
+    first.append(["耗材名称", "数量", "单位", "实验室", "位置"])
+    first.append(["第一间烧杯", 3, "个", "实验室", "A1"])
+    second = workbook.create_sheet("第二间实验室")
+    second.append(["备注"])
+    second.append([])
+    second.append(["物品名称", "数量", "单位", "实验室", "位置"])
+    second.append(["第二间烧杯", 4, "个", "实验室", "B2"])
+    workbook.save(path)
+    workbook.close()
+
+    preview = flow.preview_import(db, path, path.name, "add")
+    assert [(row["source_sheet"], row["source_row"]) for row in preview["rows"]] == [
+        ("第一间实验室", 3), ("第二间实验室", 4)
+    ]
+    write(db, "import", {"preview_id": preview["preview_id"]})
+
+    source_rows = list(
+        db.execute("SELECT source_sheet,source_row_number FROM source_rows ORDER BY id")
+    )
+    assert [(row["source_sheet"], row["source_row_number"]) for row in source_rows] == [
+        ("第一间实验室", 3), ("第二间实验室", 4)
+    ]
+    notes = [row[0] for row in db.execute("SELECT note FROM stock_events ORDER BY id")]
+    assert "第一间实验室 第 3 行" in notes[0]
+    assert "第二间实验室 第 4 行" in notes[1]
 
 
 def schedule_payload(conn, item, start, end, quantity=8, action="borrow"):
@@ -1737,6 +2086,66 @@ def test_manual_preparation_match_reallocates_whole_list(db, tmp_path):
     assert (
         stock.view(db, small)["ready"] == "1" and stock.view(db, large)["ready"] == "5"
     )
+
+
+def test_manual_preparation_selection_rejects_unrelated_item_name(db, tmp_path):
+    selected = make_item(db, name="玻璃烧杯", spec="100mL")
+    path = tmp_path / "mismatched-selection.xlsx"
+    sheet(
+        path,
+        ["耗材名称", "规格", "需求数量", "单位", "使用方式"],
+        [["塑料量筒", "100mL", 1, "个", "借用"]],
+    )
+    preview = flow.preparation(db, path)
+    with pytest.raises(ValueError, match="名称或规格"):
+        write(
+            db,
+            "prepare_remap",
+            {"preview_id": preview["preview_id"], "selections": {"2": selected}},
+        )
+    assert stock.view(db, selected)["ready"] == "100"
+    assert db.execute("SELECT committed FROM upload_previews WHERE id=?", (preview["preview_id"],)).fetchone()[0] == 0
+
+
+def test_checklist_row_numbers_use_validated_integers_and_keep_source_coordinates(db):
+    item_id = make_item(db, quantity=2, name="行号核对烧杯", spec="100mL")
+    preview = flow.checklist(
+        db,
+        [
+            {
+                "name": "行号核对烧杯", "spec": "100mL", "unit": "个",
+                "required_quantity": "1", "action": "consume", "row_number": "7",
+                "source_sheet": "第一张", "source_row": 8,
+            },
+            {
+                "name": "没有库存的新耗材", "spec": "25mL", "unit": "支",
+                "required_quantity": "1", "action": "", "row_number": 8,
+                "source_sheet": "第二张", "source_row": 8,
+            },
+        ],
+        "多工作表清单.xlsx",
+    )
+
+    assert [row["row_number"] for row in preview["rows"]] == [7, 8]
+    assert all(isinstance(row["row_number"], int) for row in preview["rows"])
+    assert [(row["source_sheet"], row["source_row"]) for row in preview["rows"]] == [
+        ("第一张", 8), ("第二张", 8)
+    ]
+    result = flow.consume_preparation(
+        db, {"preview_id": preview["preview_id"], "selected_rows": [7]}, "清单教师"
+    )
+    assert result["transaction_count"] == 1
+    assert stock.view(db, item_id)["ready"] == "1"
+
+    with pytest.raises(ValueError, match="行号不能重复"):
+        flow.checklist(
+            db,
+            [
+                {"name": "行号核对烧杯", "required_quantity": 1, "row_number": 9},
+                {"name": "另一项耗材", "required_quantity": 1, "row_number": "9"},
+            ],
+            "重复行号.xlsx",
+        )
 
 
 def test_failed_import_preserves_every_row(db, tmp_path):

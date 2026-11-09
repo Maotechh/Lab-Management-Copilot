@@ -19,6 +19,8 @@ const state = {
   chatConfirmRequestId: null,
   chatLoadedConversationId: null,
   chatLoadedMessages: [],
+  searchOffset: 0,
+  searchFilters: "",
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -666,18 +668,30 @@ async function loadStats() {
   setStatus(`已载入 ${data.item_count} 个库存条目`);
 }
 
-async function loadSearch() {
+async function loadSearch(append = false) {
   const params = new URLSearchParams();
   params.set("q", $("#searchInput").value.trim());
   params.set("category", $("#categoryFilter").value);
+  params.set("lab", $("#roomFilter").value);
   params.set("low_stock", $("#lowStockFilter").checked ? "true" : "false");
-  const start=$('#searchStart').value,end=$('#searchEnd').value;
+  const start=$("#searchStart").value,end=$("#searchEnd").value;
   if(start&&end){params.set('starts_at',shanghaiTime(start));params.set('ends_at',shanghaiTime(end));}
-  const data = await api(`/api/items/search?${params.toString()}`);
-  state.inventoryRows = data.rows;
-  $("#searchRows").innerHTML = data.rows.map(renderInventoryRow).join("") || emptyRow(8, "没有匹配结果");
+  const filters=params.toString();
+  if(!append||filters!==state.searchFilters){state.searchOffset=0;state.searchFilters=filters;state.inventoryRows=[];}
+  params.set("offset",String(state.searchOffset));params.set("limit","80");
+  const data = await api("/api/items/search?" + params.toString());
+  state.inventoryRows = append ? [...state.inventoryRows,...data.rows] : data.rows;
+  state.searchOffset += data.displayed_count;
+  $("#searchRows").innerHTML = state.inventoryRows.map(renderInventoryRow).join("") || emptyRow(8, "没有匹配结果");
+  $("#searchMore").hidden=!data.has_more;
   renderSearchSummary(data);
   if (window.lucide) window.lucide.createIcons();
+}
+
+async function loadRooms(){
+  const data=await api('/api/rooms');const select=$('#roomFilter');
+  select.replaceChildren(new Option('全部房间',''));
+  for(const room of data.rooms||[]){const option=document.createElement('option');option.value=room;option.textContent=room+' 房间';select.append(option);}
 }
 
 function renderSearchSummary(data) {
@@ -687,7 +701,7 @@ function renderSearchSummary(data) {
     .join("、");
   const total = units || "数量单位不一致";
   $("#searchSummary").textContent = data.row_count
-    ? `找到 ${data.location_count} 个位置，当前数量：${total}。结果同时显示实验室、位置、规格和预警。`
+    ? `共 ${data.row_count} 条记录、${data.location_count} 个位置；可用数量合计：${total}。当前显示 ${Math.min(state.searchOffset,data.row_count)} 条。结果同时显示实验室、位置、规格和预警。`
     : "没有匹配结果，请尝试名称、规格、实验室或位置编码。";
 }
 
@@ -697,7 +711,7 @@ function renderInventoryRow(row) {
   return `
     <tr>
       <td data-label="类别">${escapeHtml(row.category)}</td>
-      <td data-label="实验室">${escapeHtml(row.lab)}</td>
+      <td data-label="实验室">${escapeHtml(row.physical_room || row.lab)}</td>
       <td data-label="耗材" class="name-cell"><button type="button" class="item-link" data-item-detail="${row.id}">${escapeHtml(row.item_name)}</button>${renderAliases(row.aliases)}</td>
       <td data-label="规格">${spec}</td>
       <td data-label="位置"><strong>${escapeHtml(row.location_code)}</strong></td>
@@ -1103,22 +1117,25 @@ function renderPrepareRows(rows) {
   const sortedRows = [...sourceRows].sort((a, b) => Number(b.missing_quantity || 0) - Number(a.missing_quantity || 0));
   renderPrepareSummary(rows);
   $("#prepareRows").innerHTML = sortedRows.map((row) => {
-    const visibleLocations = (row.locations || []).slice(0, 4);
+    const visibleLocations = (row.locations || []);
     const locations = visibleLocations.map((item) =>
       `${escapeHtml(item.lab || "")} ${escapeHtml(item.location_code || "")} ${formatQuantity(item.quantity, item.unit)}`
     ).join("<br>") + ((row.locations || []).length > 4 ? `<br><span class="muted">还有 ${(row.locations || []).length - 4} 个位置</span>` : "");
     const statusClass = row.status === "足够" ? "ok" : "danger";
     const enough = Number(row.missing_quantity || 0) <= 0;
     const selected = state.prepareSelectedRows.has(String(row.row_number));
+    const source = row.source_sheet && row.source_row
+      ? `${row.source_file ? `${row.source_file} · ` : ""}${row.source_sheet} 第 ${row.source_row} 行`
+      : "";
     return `
       <tr>
         <td data-label="选择"><input class="prepare-select" type="checkbox" data-prepare-row="${escapeHtml(row.row_number)}" ${selected ? "checked" : ""} ${enough ? "" : "disabled"} /></td>
         <td data-label="课程/实验"><strong>${escapeHtml(row.course || "")}</strong><div class="muted">${escapeHtml(row.experiment || "")}</div></td>
-        <td data-label="耗材" class="name-cell"><strong>${escapeHtml(row.name)}</strong></td>
+        <td data-label="耗材" class="name-cell"><strong>${escapeHtml(row.name)}</strong>${source ? `<div class="muted small-text">${escapeHtml(source)}</div>` : ""}</td>
         <td data-label="规格">${escapeHtml(row.spec || "")}</td>
         <td data-label="需求">${formatQuantity(row.required_quantity, row.unit)}</td>
         <td data-label="使用方式"><select data-prepare-action="${row.row_number}" aria-label="${escapeHtml(row.name)}使用方式"><option value="">请选择</option><option value="consume" ${(state.prepareActions[row.row_number]||row.action)==='consume'?'selected':''}>消耗</option><option value="borrow" ${(state.prepareActions[row.row_number]||row.action)==='borrow'?'selected':''}>借用</option></select></td>
-        <td data-label="可用">${formatQuantity(row.available_quantity, row.unit)}</td>
+        <td data-label="可用">${formatQuantity(row.available_quantity, row.unit)}<div class="muted small-text">本次分配 ${formatQuantity(row.allocated_quantity || 0, row.unit)}</div></td>
         <td data-label="还需采购">${formatQuantity(row.missing_quantity, row.unit)}</td>
         <td data-label="建议采购">${formatQuantity(row.purchase_quantity, row.purchase_unit)}</td>
         <td data-label="位置">${locations || '<span class="muted">无匹配位置</span>'}${row.status==='需要确认匹配'||row.selected_item_id?`<select data-prepare-match="${row.row_number}" aria-label="${escapeHtml(row.name)}匹配物品"><option value="">选择具体物品</option>${(row.candidates||[]).map(item=>`<option value="${item.id}" ${item.id===row.selected_item_id?'selected':''}>${escapeHtml(item.item_name)} ${escapeHtml(item.spec)} · ${escapeHtml(item.lab)} ${escapeHtml(item.location_code)} · ${escapeHtml(item.unit)}</option>`).join('')}</select>`:''}</td>
@@ -1317,7 +1334,8 @@ async function batchUploadInventory() {
   try {
     const result = await api("/api/import/upload", { method: "POST", body: form });
     window.importPreview = result;
-    $('#batchUploadLog').textContent = `${result.rows.length} 行，${result.errors.length} 行错误${result.duplicate_file ? '，这份表格已经导入过' : ''}\n` + result.rows.map(row=>`第 ${row.row_number} 行：${row.item_name}，原数量 ${row.before}，表格数量 ${row.quantity}${row.unit}，${row.item_id?'已有物品':'新增物品'}${row.duplicate_row?'，表内重复行将忽略':''}`).join('\n') + '\n' + result.errors.map(row=>`第 ${row.row_number} 行：${row.error}`).join('\n');
+    const sourcePosition = row => `${row.source_sheet ? `${row.source_sheet} ` : ""}第 ${row.source_row ?? row.row_number} 行`;
+    $('#batchUploadLog').textContent = `${result.rows.length} 行，${result.errors.length} 行错误${result.duplicate_file ? '，这份表格已经导入过' : ''}\n` + result.rows.map(row=>`${sourcePosition(row)}：${row.item_name}，原数量 ${row.before}，表格数量 ${row.quantity}${row.unit}，${row.item_id?'已有物品':'新增物品'}${row.duplicate_row?'，表内重复行将忽略':''}`).join('\n') + '\n' + result.errors.map(row=>`${sourcePosition(row)}：${row.error}`).join('\n');
     $('#confirmImportBtn').disabled = !result.rows.length || !!result.errors.length;
     toast('库存表预览已生成，请核对后确认');
   } catch (err) {
@@ -1364,12 +1382,14 @@ function bindEvents() {
     if (button) window.navigateTo?.(button.dataset.tab);
   });
   $("#refreshAllBtn").addEventListener("click", refreshAll);
-  $("#searchBtn").addEventListener("click", loadSearch);
+  $("#searchBtn").addEventListener("click", () => loadSearch(false));
+  $("#searchMore").addEventListener("click", () => loadSearch(true));
+  $("#roomFilter").addEventListener("change", () => loadSearch(false));
   $("#searchInput").addEventListener("keydown", (event) => {
     if (event.key === "Enter") loadSearch();
   });
-  $("#categoryFilter").addEventListener("change", loadSearch);
-  $("#lowStockFilter").addEventListener("change", loadSearch);
+  $("#categoryFilter").addEventListener("change", () => loadSearch(false));
+  $("#lowStockFilter").addEventListener("change", () => loadSearch(false));
   $("#previewBtn").addEventListener("click", sendChatMessage);
   $("#olderMessages").addEventListener("click", loadOlderMessages);
   $("#commitBtn").addEventListener("click", commitTransaction);
@@ -1468,7 +1488,7 @@ $('#prepareFile').addEventListener('change',()=>{state.prepareRows=[];state.prep
 
 async function refreshAll() {
   try {
-    await Promise.all([loadStats(), loadSearch(), loadAlerts(), loadTransactions(), loadLocations(), loadChat()]);
+    await Promise.all([loadStats(), loadRooms(), loadSearch(), loadAlerts(), loadTransactions(), loadLocations(), loadChat()]);
     await window.refreshWorkflows?.();
     window.renderTaskOverview?.();
     if (document.body.dataset.page === 'tasks') await window.loadSharedTasks?.();

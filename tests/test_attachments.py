@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import zipfile
+from decimal import Decimal
 
 import pytest
 from openpyxl import Workbook
 from PIL import Image
 
-from consumable_assistant.attachments import image_payload, tables, uploaded_frame
+from consumable_assistant.attachments import (
+    arithmetic_value,
+    image_payload,
+    tables,
+    uploaded_frame,
+)
 
 
 def test_all_sheets_keep_original_rows_and_merged_text(tmp_path):
@@ -44,6 +50,42 @@ def test_formula_cannot_become_inventory_quantity(tmp_path):
     assert parsed["records"][0]["values"]["数量"] is None
     with pytest.raises(ValueError, match="包含公式"):
         uploaded_frame(path)
+
+
+def test_bounded_formula_evaluation_keeps_decimal_precision_and_rejects_unsupported_forms(tmp_path):
+    path = tmp_path / "精确公式.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.append(["名称", "数量", "计算", "除零", "函数", "文本引用"])
+    sheet.append([
+        "烧杯",
+        "=0.123456789123456789+0.000000000000000001",
+        "=B2*3",
+        "=1/0",
+        "=SUM(B2:B2)",
+        "=A2+1",
+    ])
+    book.save(path)
+
+    parsed = tables(path, arithmetic=True)[0]
+    values = parsed["records"][0]["values"]
+    assert values["数量"] == Decimal("0.123456789123456790")
+    assert values["计算"] == Decimal("0.370370367370370370")
+    assert values["除零"] is None
+    assert parsed["formulas"] == ["D2", "E2", "F2"]
+    with pytest.raises(ValueError, match="包含公式"):
+        uploaded_frame(path, arithmetic=True)
+
+
+def test_bounded_formula_evaluation_rejects_cycles():
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet["A1"] = "=B1+1"
+    sheet["B1"] = "=A1+1"
+    with pytest.raises(ValueError, match="循环"):
+        arithmetic_value(sheet, "A1")
 
 
 def test_duplicate_headers_and_unknown_nonempty_sheets_require_review(tmp_path):

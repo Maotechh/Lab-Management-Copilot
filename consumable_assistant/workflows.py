@@ -219,10 +219,11 @@ def preview_import(
         raise ValueError("上传方式无效")
     from .attachments import uploaded_frame
 
-    df = uploaded_frame(path).dropna(how="all")
+    df = uploaded_frame(path, arithmetic=True).dropna(how="all")
     df.columns = [str(col).strip() for col in df.columns]
     rows, errors, seen = [], [], set()
     for index, row in df.iterrows():
+        source = df.attrs["sources"][int(index)]
         try:
             mapped = map_upload_row(row.to_dict(), list(df.columns), category)
             if not mapped:
@@ -244,7 +245,7 @@ def preview_import(
             mapped.update(
                 {
                     "row_number": int(index) + 2,
-                    **df.attrs["sources"][int(index)],
+                    **source,
                     "duplicate_row": signature in seen,
                     "item_id": old["id"] if old else None,
                     "version": balance["version"] if balance else None,
@@ -254,7 +255,7 @@ def preview_import(
             seen.add(signature)
             rows.append(mapped)
         except ValueError as exc:
-            errors.append({"row_number": int(index) + 2, "error": str(exc)})
+            errors.append({"row_number": int(index) + 2, **source, "error": str(exc)})
     token = uuid.uuid4().hex
     file_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     normalized = [
@@ -334,7 +335,10 @@ def commit_import(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
                 "action": "inbound" if preview["mode"] == "add" else "count",
                 "quantity": row["quantity"],
                 "unit": row["unit"],
-                "note": f"库存表 {preview['filename']} 第 {row['row_number']} 行；{data.get('note') or ''}",
+                "note": (
+                    f"库存表 {preview['filename']} {row.get('source_sheet') or ''} "
+                    f"第 {row.get('source_row', row['row_number'])} 行；{data.get('note') or ''}"
+                ),
             },
             actor,
         )
@@ -358,7 +362,7 @@ def commit_import(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
                 f"{preview['id']}:{row['row_number']}",
                 preview["filename"],
                 row.get("source_sheet"),
-                row["row_number"],
+                row.get("source_row", row["row_number"]),
                 row.get("category"), row.get("lab"), row.get("location_code"),
                 row["item_name"],
                 row["normalized_name"],
@@ -382,29 +386,15 @@ def capacities(value: str) -> list[str]:
 def strict_matches(
     conn: sqlite3.Connection, name: str, spec: str | None, unit: str | None
 ) -> tuple[list[dict], list[dict]]:
+    from .matching import same_material
     from .services import search_items
 
-    candidates = search_items(
-        conn, " ".join(part for part in (name, spec) if part), limit=500
-    )
+    candidates = search_items(conn, " ".join(part for part in (name, spec) if part), limit=1_000_000)
     matches = []
     for candidate in candidates:
         item = stock.view(conn, candidate["id"])
-        names = [
-            normalize_text(item["item_name"]),
-            *[normalize_text(alias) for alias in candidate.get("aliases", [])],
-        ]
-        query = normalize_text(name)
-        if query not in names:
-            continue
-        requested = normalize_text(spec)
-        if (
-            requested
-            and requested != normalize_text(item["spec"])
-            and requested not in normalize_text(item["item_name"])
-        ):
-            continue
-        if capacities(name) and capacities(name) != capacities(item["item_name"]):
+        if not any(same_material(name, spec, candidate_name, item["spec"])
+                   for candidate_name in [item["item_name"], *candidate.get("aliases", [])]):
             continue
         try:
             stock.convert(item, 1, unit)
@@ -439,16 +429,27 @@ def allocate_preparation(
             item = stock.view(conn, int(chosen))
             if not item["active"] or item["review_reason"]:
                 raise ValueError("选定物品需要清点或已经停用")
+            from .matching import same_material
+            from .services import exact_item_query
+
+            query = " ".join(part for part in (row["name"], row["spec"]) if part)
+            candidate = next(
+                (value for value in candidates if int(value["id"]) == item["item_id"]),
+                None,
+            )
+            names = [item["item_name"], *(candidate or {}).get("aliases", [])]
             if (
-                row["spec"]
-                and normalize_text(row["spec"]) != normalize_text(item["spec"])
-                and normalize_text(row["spec"]) not in normalize_text(item["item_name"])
+                candidate is None
+                or not exact_item_query(candidate, query)
+                or (
+                    row["spec"]
+                    and not any(
+                        same_material(row["name"], row["spec"], name, item["spec"])
+                        for name in names
+                    )
+                )
             ):
-                raise ValueError("选定物品与清单规格不一致")
-            if capacities(row["name"]) and capacities(row["name"]) != capacities(
-                item["item_name"]
-            ):
-                raise ValueError("选定物品与清单容量或型号不一致")
+                raise ValueError("选定物品名称或规格与清单不一致")
             stock.convert(item, 1, row["unit"])
             matches = [item]
             row["selected_item_id"] = item["item_id"]
@@ -456,6 +457,7 @@ def allocate_preparation(
         amount = remaining = stock.number(row["required_quantity"])
         locations = []
         outstanding = Decimal(0)
+        total_available = Decimal(0)
         for item in matches:
             item_id = item["item_id"]
             factor = stock.convert(item, 1, row["unit"])
@@ -465,6 +467,7 @@ def allocate_preparation(
                 - allocated.get(item_id, Decimal(0)),
                 0,
             )
+            total_available += ready / factor
             take = min(ready, remaining * factor)
             locations.append(
                 {
@@ -499,7 +502,8 @@ def allocate_preparation(
             purchased[item_id] = purchased.get(item_id, Decimal(0)) + use
         row.update(
             {
-                "available_quantity": stock.text(amount - remaining),
+                "available_quantity": stock.text(total_available),
+                "allocated_quantity": stock.text(amount - remaining),
                 "missing_quantity": stock.text(remaining),
                 "purchase_quantity": stock.text(max(remaining - outstanding, 0)),
                 "purchase_unit": row["unit"],
@@ -586,19 +590,52 @@ def preparation(
         )
         row["action"] = action if action in ("consume", "borrow") else ""
         rows.append(row)
-    rows = allocate_preparation(conn, rows)
+    return checklist(conn, rows, path.name, commit=commit)
+
+
+def checklist(conn, rows: list[dict], filename: str, *, commit=False, attachment_id=None, replaces=None):
+    from pydantic import BaseModel, ConfigDict, Field
+
+    class ChecklistRow(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+        name: str = Field(min_length=1, max_length=300)
+        spec: str | None = Field(default=None, max_length=300)
+        unit: str | None = Field(default=None, max_length=50)
+        required_quantity: str | int | float
+        action: str = ""
+        course: str = "未命名课程"
+        experiment: str = "未命名实验"
+        source_sheet: str = "照片"
+        source_row: int = Field(default=1, ge=1)
+        row_number: int = Field(default=1, ge=1)
+
+    if not rows or len(rows) > 200:
+        raise ValueError("清单需要一至二百个条目")
+    prepared = []
+    for index, value in enumerate(rows):
+        row = ChecklistRow.model_validate(value).model_dump()
+        amount = stock.number(row["required_quantity"])
+        if amount <= 0:
+            raise ValueError(f"第 {index + 1} 项需求数量必须大于零")
+        if row["action"] not in ("", "borrow", "consume"):
+            raise ValueError("使用方式请选择借用或消耗")
+        row.update(row_number=index + 1 if attachment_id else row["row_number"],
+                   required_quantity=stock.text(amount), source_file=filename, attachment_id=attachment_id)
+        prepared.append(row)
+    if len({row["row_number"] for row in prepared}) != len(prepared):
+        raise ValueError("清单行号不能重复")
+    prepared = allocate_preparation(conn, prepared)
     token = uuid.uuid4().hex
     conn.execute(
         "INSERT INTO upload_previews(id,file_hash,content_hash,filename,mode,rows,errors) VALUES (?,'','',?,'prepare',?,'[]')",
-        (token, path.name, json.dumps(rows, ensure_ascii=False)),
+        (token, filename, json.dumps(prepared, ensure_ascii=False)),
     )
+    if replaces:
+        conn.execute("UPDATE upload_previews SET committed=1 WHERE id=?", (replaces,))
     if commit:
         conn.commit()
-    groups = [
-        {"course": a, "experiment": b}
-        for a, b in sorted({(row["course"], row["experiment"]) for row in rows})
-    ]
-    return {"preview_id": token, "rows": rows, "groups": groups, "row_count": len(rows)}
+    return {"preview_id": token, "rows": prepared, "row_count": len(prepared), "attachment_id": attachment_id,
+            "groups": [{"course": a, "experiment": b} for a, b in sorted({(row["course"], row["experiment"]) for row in prepared})]}
 
 
 def consume_preparation(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
