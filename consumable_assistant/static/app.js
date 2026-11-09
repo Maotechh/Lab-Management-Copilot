@@ -169,11 +169,20 @@ async function refreshConversationList(append = false) {
 }
 
 async function selectConversation(id) {
+  if (state.chatSending) throw new Error('消息正在保存，请稍后切换对话');
+  if (state.voicePhase && state.voicePhase!=='idle') throw new Error('请先结束录音或语音识别，再切换对话');
   if (localStorage.getItem('lab-chat-pending')) throw new Error('请先重试尚未确认结果的原消息，再切换对话');
   if ($('#chatFile').files.length) throw new Error('请先发送或移除附件，再切换对话');
   if (state.chatConversationId) localStorage.setItem('lab-chat-draft-' + state.chatConversationId, $('#chatText').value);
   chatEvents?.close(); chatEvents = null;
   state.chatConversationId = id;
+  state.chatSnapshot = null;
+  state.chatConnected = undefined;
+  state.activeChatRun = null;
+  $('#chatRunStatus').replaceChildren();
+  state.chatTaskId = null;
+  state.chatPhase = null;
+  clearTimeout(chatRefresh);
   state.chatLoadedConversationId = null;
   state.chatLoadedMessages = [];
   state.renderedConversationId = null;
@@ -183,16 +192,26 @@ async function selectConversation(id) {
   $('#olderMessages').textContent = '查看更早的消息';
   localStorage.setItem('lab-chat-conversation', id);
   $('#chatText').value = localStorage.getItem('lab-chat-draft-' + id) || '';
+  renderChatMessages([]);
+  restoreChatTask([]);
+  window.updateConversationPhase?.('loading');
   window.fitComposer?.();
   await updateChatSnapshot(id);
   await refreshConversationList();
 }
 
 async function createSharedConversation() {
-  if (localStorage.getItem('lab-chat-pending') || $('#chatFile').files.length) throw new Error('请先发送或处理当前消息，再新建对话');
-  const created = await chatApi('/api/chat/conversations', {method:'POST'});
-  await selectConversation(created.conversation_id);
-  window.navigateTo?.('chat');
+  if (state.creatingConversation) return;
+  if (state.voicePhase && state.voicePhase!=='idle') throw new Error('请先结束录音或语音识别，再新建对话');
+  if (state.chatSending || localStorage.getItem('lab-chat-pending') || $('#chatFile').files.length) throw new Error('请先发送或处理当前消息，再新建对话');
+  state.creatingConversation = true;
+  $('#newConversation').disabled = true;
+  try {
+    const created = await chatApi('/api/chat/conversations', {method:'POST'});
+    await selectConversation(created.conversation_id);
+    window.navigateTo?.('chat');
+    $('#chatText').focus();
+  } finally { state.creatingConversation = false; $('#newConversation').disabled = false; window.updateComposerState?.(); }
 }
 
 async function updateChatSnapshot(id = state.chatConversationId) {
@@ -202,11 +221,10 @@ async function updateChatSnapshot(id = state.chatConversationId) {
   const sameConversation = state.chatLoadedConversationId === id;
   const previousMessages = sameConversation ? state.chatLoadedMessages : [];
   const previousSnapshot = sameConversation ? state.chatSnapshot : null;
-  const newerSnapshot = previousSnapshot && Number(previousSnapshot.last_event_id || 0) > Number(snapshot.last_event_id || 0)
-    ? previousSnapshot : snapshot;
+  if (previousSnapshot && Number(previousSnapshot.last_event_id || 0) > Number(snapshot.last_event_id || 0)) return;
   state.chatLoadedMessages = mergeChatMessages(previousMessages, snapshot.messages || []);
   state.chatLoadedConversationId = id;
-  state.chatSnapshot = {...newerSnapshot, messages:state.chatLoadedMessages};
+  state.chatSnapshot = {...snapshot, messages:state.chatLoadedMessages};
   const newestPageFirstId = Number(snapshot.messages?.[0]?.id || 0);
   const previouslyLoadedLastId = previousMessages.reduce((maximum, message) => Math.max(maximum, Number(message.id) || 0), 0);
   if (!sameConversation || snapshot.next_before === null) {
@@ -214,10 +232,11 @@ async function updateChatSnapshot(id = state.chatConversationId) {
   } else if (snapshot.next_before && (!previousMessages.length || newestPageFirstId > previouslyLoadedLastId)) {
     chatOlderCursor = snapshot.next_before;
   }
+  window.updateConversationPhase?.(state.chatLoadedMessages.length ? 'active' : 'hero');
   renderChatMessages(state.chatLoadedMessages);
   restoreChatTask(state.chatSnapshot.tasks || []);
   $('#olderMessages').hidden = !chatOlderCursor;
-  renderChatRuns(state.chatSnapshot.runs || []);
+  renderChatRuns(state.chatSnapshot.runs || [], state.chatSnapshot.activities || []);
   if (!chatEvents) {
     chatEvents = new EventSource(`/api/chat/conversations/${id}/events?after=${state.chatSnapshot.last_event_id || 0}`);
     const refresh = () => {
@@ -225,8 +244,20 @@ async function updateChatSnapshot(id = state.chatConversationId) {
       chatRefresh = setTimeout(() => updateChatSnapshot(id).catch(showError), 100);
     };
     for (const kind of ['message','run','tool','task']) chatEvents.addEventListener(kind, refresh);
-    chatEvents.onopen = () => { $('#chatConnection').textContent = '共享对话已连接'; updateChatSnapshot(id).catch(showError); };
-    chatEvents.onerror = () => { $('#chatConnection').textContent = '正在重新连接，显示的是此前保存的内容'; };
+    const stream=chatEvents;
+    let connectionRevision=0;
+    chatEvents.onopen = async () => {
+      if(state.chatConversationId!==id||chatEvents!==stream)return;
+      const revision=++connectionRevision;
+      state.chatConnected=false; window.updatePlanUI?.(false);
+      try {
+        await updateChatSnapshot(id);
+        if(state.chatConversationId!==id||chatEvents!==stream||connectionRevision!==revision)return;
+        state.chatConnected=true; $('#chatConnection').textContent='共享对话已连接';
+      } catch(error) { showError(error); }
+      window.updatePlanUI?.(false);
+    };
+    chatEvents.onerror = () => { if(state.chatConversationId!==id||chatEvents!==stream)return; ++connectionRevision; state.chatConnected=false; $('#chatConnection').textContent = '正在重新连接，显示的是此前保存的内容'; window.updatePlanUI?.(false); };
   }
 }
 
@@ -274,14 +305,27 @@ async function ensureChatConversationOnce() {
     localStorage.setItem('lab-chat-conversation', state.chatConversationId);
   }
   chatSnapshotPromise ||= updateChatSnapshot().finally(() => { chatSnapshotPromise = null; });
-  await chatSnapshotPromise;
+  try { await chatSnapshotPromise; }
+  catch(error) {
+    if(error.status!==404)throw error;
+    const listing=await chatApi('/api/chat/conversations');
+    const replacement=listing.conversations?.[0]?.id || (await chatApi('/api/chat/conversations',{method:'POST'})).conversation_id;
+    state.chatConversationId=replacement; localStorage.setItem('lab-chat-conversation',replacement);
+    await updateChatSnapshot(replacement);
+  }
   await refreshConversationList();
 }
 
-function renderChatRuns(runs) {
+function renderChatRuns(runs, activities = []) {
   const labels = {queued:'排队中',running:'正在处理',failed:'处理失败',cancelled:'已取消',completed:'已完成'};
   $('#chatRunStatus').innerHTML = runs.filter(run => ['queued','running','failed','cancelled'].includes(run.status)).slice(0,8).map(run =>
-    `<div class="run-status">${escapeHtml(run.actor)}：${labels[run.status]}${run.error ? `，${escapeHtml(run.error)}` : ''}${['queued','running'].includes(run.status) ? `<button type="button" data-cancel-run="${escapeHtml(run.run_id)}">取消运行</button>` : ''}</div>`).join('');
+    `<div class="run-status" data-status="${escapeHtml(run.status)}"><span>${escapeHtml(run.actor)}：${run.cancel_requested?'正在取消':labels[run.status]}${run.error ? `，${escapeHtml(run.error)}` : ''}</span>${['queued','running'].includes(run.status) ? `<button type="button" data-cancel-run="${escapeHtml(run.run_id)}" ${run.cancel_requested?'disabled':''}>取消运行</button>` : ''}</div>${activities.filter(entry=>entry.run_id===run.run_id).map(entry=>`<details class="chat-tool-process"><summary>${escapeHtml(toolActivityLabel(entry.name))}</summary><div class="chat-tool-details">${entry.error?escapeHtml(entry.error):run.status==='running'?'工具已经返回结果，助手正在继续处理':'工具结果已经保存'}</div></details>`).join('')}`).join('');
+  state.activeChatRun = runs.find(run=>['running','queued'].includes(run.status));
+  window.updateComposerState?.();
+}
+
+function toolActivityLabel(name) {
+  return {inventory_search:'查询耗材',workflow_query:'查询业务记录',history_search:'查询历史',prepare_attachment:'核对实验清单',inventory_import_preview:'预览表格导入',business_preview:'生成业务预览',export_inventory:'导出库存',read_attachment:'读取附件',analyze_attachments:'分析附件',export_task:'导出任务',export_history:'导出历史'}[name] || '处理资料';
 }
 
 async function showPlanConfirmation(result) {
@@ -351,11 +395,15 @@ function restoreChatTask(tasks) {
 
 function chatMessageContent(message) {
   const result = message.result || {};
-  const detail = result.tool_results?.map(entry => renderToolResult(entry)).join('') || '';
+  const toolResults = result.tool_results?.map(entry => renderToolResult(entry)).join('') || '';
+  const detail = toolResults ? `<details class="chat-tool-process"><summary>查看处理过程与查询结果</summary><div class="chat-tool-details">${toolResults}</div></details>` : '';
   const completed = result.status === 'completed' ? renderCompletedResult(result.result) : '';
   const previous = result.previous_preview ? `<details class="chat-result"><summary>查看已失效的原预览，对比当前预览</summary>${businessPreviewHtml(result.previous_preview)}</details>` : '';
   const attachments = (result.attachments || []).map(file => `<span class="chat-file-chip"><i data-lucide="paperclip" class="icon-sm"></i>${escapeHtml(file.filename)}</span>`).join('');
-  return `<div class="chat-message-role">${message.role === 'user' ? escapeHtml(message.actor || '老师') : '耗材助手'} · ${escapeHtml(formatDate(message.created_at))}</div><div class="chat-message-body">${escapeHtml(message.content || result.reply || '')}</div>${attachments}${detail}${completed}${previous}${result.status === 'pending_confirmation' ? '<div class="chat-result"><p>已生成变更预览，请核对计划中的数量、位置与关联记录。</p></div>' : ''}`;
+  const text=message.content || result.reply || '';
+  const body=message.role==='user'?escapeHtml(text):(window.LabMarkdown?.render(text)||escapeHtml(text));
+  const actions=message.role==='assistant'?`<div class="chat-message-actions"><button type="button" class="quiet icon-only" data-copy-message="${escapeHtml(message.id)}" aria-label="复制回复" title="复制回复"><svg aria-hidden="true"><use href="/static/dsh/icons.svg#copy-outline"/></svg></button><time>${escapeHtml(formatDate(message.created_at))}</time></div>`:'';
+  return `<div class="chat-message-role">${message.role === 'user' ? escapeHtml(message.actor || '老师') : '耗材助手'} · ${escapeHtml(formatDate(message.created_at))}</div>${attachments}${detail}<div class="chat-message-body ${message.role==='assistant'?'dsh-md-markdown':''}">${body}</div>${completed}${previous}${result.status === 'pending_confirmation' ? '<div class="chat-result"><p>已生成变更预览，请核对计划中的数量、位置与关联记录。</p></div>' : ''}${actions}`;
 }
 
 const chatMessageRenderCache = new WeakMap();
@@ -369,7 +417,7 @@ function renderChatMessages(messages) {
   const oldTop = scroll.scrollTop;
   const oldFirst = Number(container.querySelector('[data-message-id]')?.dataset.messageId || 0);
   const older = sameConversation && Number(messages[0]?.id || 0) < oldFirst;
-  const existing = new Map([...container.querySelectorAll('[data-message-id]')].map(node => [node.dataset.messageId, node]));
+  const existing = new Map([...container.children].filter(node=>node.dataset.messageId).map(node => [node.dataset.messageId, node]));
   const wanted = new Set();
   const nodes = [];
 
@@ -411,6 +459,7 @@ function renderChatMessages(messages) {
   state.firstRenderedMessage = messages[0]?.id;
   requestAnimationFrame(() => {
     scroll.scrollTop = older ? oldTop + scroll.scrollHeight - oldHeight : nearEnd ? scroll.scrollHeight : oldTop;
+    window.updateTailControl?.();
   });
   window.lucide?.createIcons();
 }
@@ -528,14 +577,16 @@ async function cancelChatTask() {
 }
 
 async function sendChatMessage() {
-  if (state.chatSending) return;
+  if (state.chatSending || (state.voicePhase && state.voicePhase!=='idle')) return;
   const text = $('#chatText').value.trim();
   const files = [...$('#chatFile').files];
   if (!text && !files.length && !localStorage.getItem('lab-chat-pending')) { toast('请输入消息或附加文件'); return; }
   if (files.length > 8 || files.some(file => file.size > 20 * 1024 * 1024)) { showError(new Error('每条消息最多八个附件，单个附件最多 20 MB')); return; }
   state.chatSending = true;
+  window.updateComposerState?.();
   $('#previewBtn').disabled = true;
-  $('#previewBtn').textContent = files.length ? '上传中…' : '发送中…';
+  $('#previewBtn').innerHTML = '<i data-lucide="loader-circle" aria-hidden="true"></i>';
+  window.lucide?.createIcons();
   try {
     await ensureChatConversation();
     let pending = JSON.parse(localStorage.getItem('lab-chat-pending') || 'null');
@@ -565,8 +616,8 @@ async function sendChatMessage() {
   } catch (error) { showError(error); }
   finally {
     state.chatSending = false;
-    $('#previewBtn').disabled = Boolean(state.voicePhase && state.voicePhase !== 'idle');
-    $('#previewBtn').innerHTML = '<span>发送</span><i data-lucide="arrow-up" aria-hidden="true"></i>';
+    $('#previewBtn').innerHTML = '<svg aria-hidden="true"><use href="/static/dsh/icons.svg#send-outline"/></svg>';
+    window.updateComposerState?.();
     window.lucide?.createIcons();
   }
 }

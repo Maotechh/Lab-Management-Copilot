@@ -1,0 +1,17 @@
+{
+  "repository": "https://github.com/deepseek-ai/deepseek-harness",
+  "commit": "fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159",
+  "files": {
+    "packages/client/ui-theme/src/styles/base.css": "803926ce39f5ea48b652021d06b6ca65c4acc7be2c5c4e19bd904ab1dabf0b67",
+    "packages/client/ui-theme/src/styles/design-platform.css": "82304058425df7a6c1cf1afa4bb00ee6efeb394aa7515226b69063495f12e475",
+    "packages/client/ui-theme/src/styles/gradient-shadow-text.css": "b6e1e8387edbfa60ec03bb29aad7c01245c0adbd22229d5a6f2916caa7e7b427",
+    "packages/client/ui-theme/src/styles/corner-shape.css": "d94f82e1332b6d37e8345aafe1b6b4129faed65891edd3861c00b88940ec4d3f",
+    "packages/client/ui-theme/src/styles/scrollbar.css": "d83797aa96625e8ec77412bfc5649469cd5834d3cb0f7f6a1f3db8a59e1f4530",
+    "LICENSE": "ebb4f09972aee8608be255debaf78451a68e95c290f55c240dec2ecfa16ea6be",
+    "packages/client/ui-primitives/src/icons/artwork.ts": "9116550d1fe745f8b10414699b08428c8c22ce8196b131a284eff4da1b43a7bb",
+    "packages/client/ui-primitives/src/markdown/MarkdownText.module.css": "4c0680b3966e71b4ee7df38bc9c93efda240c05d2ea4c0174252e25f41488f24",
+    "packages/client/ui-primitives/src/markdown/cjkFriendlyStrong.ts": "bc4adf3183f7d0feea17e3a176e7c4b1db5bdddc29e7fc87261f627ff8a39b53",
+    "packages/client/ui-primitives/src/markdown/CodeBlock.module.css": "2c02318e7f43d24c1acd0400221b63e9ba85b6bffc004ed9b212e994f2535677"
+  },
+  "adaptation": "Markdown classes prefixed; selected original icon geometry exported as SVG symbols."
+}

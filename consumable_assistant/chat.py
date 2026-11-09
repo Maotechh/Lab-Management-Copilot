@@ -138,9 +138,23 @@ def conversation_view(conn, conversation_id: str, before: int | None = None, lim
     from .chat_runtime import run_view
 
     runs = [run_view(row) for row in conn.execute("SELECT * FROM chat_runs WHERE conversation_id=? ORDER BY message_id DESC LIMIT 100", (conversation_id,))]
+    # Only persisted tool completions are shown as progress. Arguments and full
+    # results stay on the server; the UI receives a bounded, read-only summary.
+    active_ids = [run["run_id"] for run in runs if run["status"] in {"queued", "running", "failed", "cancelled"}][:8]
+    activities = []
+    if active_ids:
+        placeholders = ",".join("?" for _ in active_ids)
+        for row in conn.execute(
+            f"SELECT id,run_id,name,result_json,created_at FROM chat_tool_calls WHERE conversation_id=? AND run_id IN ({placeholders}) ORDER BY id DESC LIMIT 40",
+            (conversation_id, *active_ids),
+        ):
+            result = json.loads(row["result_json"] or "{}")
+            activities.append({"id": row["id"], "run_id": row["run_id"], "name": row["name"],
+                               "created_at": row["created_at"], "error": result.get("error")})
+        activities.reverse()
     attachments = [dict(row) for row in conn.execute("SELECT id,filename,content_type,size,sha256,created_at FROM chat_attachments WHERE conversation_id=? ORDER BY created_at", (conversation_id,))]
     last_event = conn.execute("SELECT COALESCE(MAX(id),0) FROM chat_events WHERE conversation_id=?", (conversation_id,)).fetchone()[0]
-    return {"messages": messages, "tasks": tasks, "runs": runs, "attachments": attachments, "last_event_id": last_event, "next_before": messages[0]["id"] if has_more else None}
+    return {"messages": messages, "tasks": tasks, "runs": runs, "activities": activities, "attachments": attachments, "last_event_id": last_event, "next_before": messages[0]["id"] if has_more else None}
 
 
 def process_message(conn, conversation_id, request, actor, device_id, dispatch_fn, history_fn):

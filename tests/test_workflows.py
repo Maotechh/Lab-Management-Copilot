@@ -2371,3 +2371,25 @@ def test_shared_task_list_is_read_only_paginated_and_cross_device(db, monkeypatc
         assert [row['id'] for row in second['tasks']] == ['ui-task-1']
         assert second['next_before'] is None
         assert database_digest(database) == before
+
+
+def test_shared_progress_only_contains_persisted_tool_summaries(db):
+    from consumable_assistant import chat, chat_runtime
+    from consumable_assistant.server import dispatch, history_rows
+
+    conversation = chat.new_conversation(db, "desktop")["conversation_id"]
+    request = chat.ChatMessageRequest(message_id=uuid.uuid4().hex, text="查询烧杯")
+    queued = chat_runtime.enqueue(db, conversation, request, "教师", "desktop")
+    run = chat_runtime.claim(db, queued["run_id"])
+    assert chat.conversation_view(db, conversation)["activities"] == []
+    chat_runtime.execute_tool(db, run["id"], run["callback_token"], "inventory_search",
+                              {"q": "烧杯"}, dispatch, history_rows)
+    view = chat.conversation_view(db, conversation)
+    activity, = view["activities"]
+    assert activity["run_id"] == run["id"]
+    assert activity["name"] == "inventory_search"
+    assert activity["error"] is None
+    assert set(activity) == {"id", "run_id", "name", "created_at", "error"}
+    assert db.execute("SELECT COUNT(*) FROM stock_events").fetchone()[0] == 0
+    chat_runtime.finish(db, run, {"status": "completed", "reply": "查询完成"})
+    assert chat.conversation_view(db, conversation)["activities"] == []

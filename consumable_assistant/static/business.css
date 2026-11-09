@@ -1,0 +1,479 @@
+/* Laboratory adaptation of the pinned DSH web UI. See dsh/source.json. */
+.page-intro {
+  padding: 0 0 24px;
+}
+.page-intro h2 {
+  margin: 8px 0;
+}
+.page-intro p {
+  color: var(--muted);
+  margin: 0;
+  max-width: 700px;
+}
+.surface {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  margin-bottom: 20px;
+  padding: 22px;
+  min-width: 0;
+}
+.surface h2 {
+  font-size: 18px;
+}
+.surface .section-heading {
+  margin-bottom: 14px;
+}
+.section-tabs {
+  display: flex;
+  gap: 5px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 28px;
+  overflow-x: auto;
+  padding-bottom: 12px;
+}
+.section-tabs .tab {
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.section-tabs .tab.active {
+  background: var(--primary-soft);
+  color: var(--link);
+}
+.section-back {
+  margin: -12px 0 16px -12px;
+}
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 24px;
+}
+.metric {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px 20px;
+  background: var(--surface);
+}
+.metric span {
+  font-size: 12px;
+  color: var(--muted);
+}
+.metric strong {
+  font-size: 25px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  margin-top: 4px;
+}
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.file-picker {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.file-picker input {
+  max-width: 100%;
+}
+.toolbar.compact {
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.toolbar input[type=search] {
+  flex: 1;
+  min-width: 180px;
+}
+.toolbar select {
+  max-width: 100%;
+}
+.toolbar label,
+.field-label {
+  color: var(--muted);
+  font-size: 13px;
+}
+.field-label {
+  display: block;
+  margin-bottom: 6px;
+}
+.inline-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  cursor: pointer;
+}
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr));
+  gap: 18px;
+  align-items: end;
+  margin: 18px 0;
+}
+.form-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  min-width: 0;
+}
+.form-grid input,
+.form-grid select,
+.form-grid textarea {
+  width: 100%;
+}
+.two-column {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 22px;
+}
+.workflow-section {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 24px;
+  margin-bottom: 22px;
+  min-width: 0;
+}
+.workflow-section h2 {
+  font-size: 18px;
+  margin-bottom: 18px;
+}
+.lesson-line {
+  grid-template-columns: minmax(180px, 2fr) repeat(5, minmax(75px, 1fr)) 44px;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--line);
+}
+.summary-strip {
+  margin: 12px 0;
+  font-size: 13px;
+}
+.advanced-filter {
+  border-top: 1px solid var(--line);
+  margin: 16px 0;
+  padding-top: 12px;
+  font-size: 13px;
+  color: var(--muted);
+}
+summary {
+  cursor: pointer;
+  padding: 8px 0;
+}
+.table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  text-align: left;
+}
+th {
+  padding: 12px 14px;
+  background: var(--sidebar);
+  color: var(--muted);
+  font-weight: 500;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--line);
+}
+td {
+  padding: 15px 14px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  overflow-wrap: anywhere;
+  min-width: 75px;
+}
+tbody tr:last-child td {
+  border-bottom: 0;
+}
+tbody tr:hover {
+  background: var(--sidebar);
+}
+.name-cell {
+  min-width: 140px;
+}
+.name-cell strong {
+  font-size: 14px;
+}
+.item-link {
+  border: 0;
+  background: transparent;
+  color: var(--link);
+  text-align: left;
+  justify-content: flex-start;
+  padding: 0;
+  min-height: 44px;
+  font-weight: 500;
+}
+.inline-edit {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.number-input {
+  width: 90px;
+}
+.badge {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 5px;
+  background: var(--surface-soft);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.badge.ok {
+  background: var(--ok-bg);
+  color: var(--ok);
+}
+.badge.warn {
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+.badge.danger {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--muted);
+}
+.empty-state svg {
+  width: 26px;
+  height: 26px;
+}
+.empty-state p {
+  margin: 0;
+}
+.chat-confirm-preview {
+  margin: 0;
+  padding-top: 0;
+  border: 0;
+}
+.chat-confirm-preview > h2 {
+  font-size: 14px;
+  margin: 6px 0 12px;
+}
+.chat-record-change {
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+.chat-record-change h3 {
+  margin: 0 0 8px;
+}
+.chat-confirm-preview dl,
+.chat-result dl {
+  margin: 10px 0;
+  font-size: 12px;
+}
+.chat-confirm-preview dl > div,
+.chat-result dl > div {
+  display: grid;
+  grid-template-columns: minmax(80px, 32%) minmax(0, 1fr);
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+}
+dt {
+  color: var(--muted);
+}
+dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.chat-operation-details {
+  font-size: 13px;
+}
+.chat-operation-details summary {
+  font-weight: 500;
+}
+.plan-panel .responsive-cards table,
+.plan-panel .responsive-cards tbody,
+.plan-panel .responsive-cards tr,
+.plan-panel .responsive-cards td {
+  display: block;
+  width: 100%;
+}
+.plan-panel .responsive-cards thead {
+  display: none;
+}
+.plan-panel .responsive-cards tr {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.plan-panel .responsive-cards td {
+  border: 0;
+  padding: 5px 0;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  text-align: right;
+}
+.plan-panel .responsive-cards td::before {
+  content: attr(data-label);
+  color: var(--muted);
+  text-align: left;
+  flex-shrink: 0;
+}
+.candidate {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 12px;
+  margin-bottom: 8px;
+}
+.candidate span {
+  min-width: 0;
+}
+.candidate > span:nth-child(2) {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+.candidate:has(input:checked) {
+  background: var(--primary-soft);
+  border-color: var(--accent);
+}
+.candidate .number-input {
+  width: 70px;
+}
+.tool-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  max-width: 1000px;
+}
+.tool-card {
+  display: flex;
+  align-items: center;
+  text-align: left;
+  gap: 16px;
+  padding: 20px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  min-height: 104px;
+  color: var(--text);
+}
+.tool-card > svg:first-child {
+  color: var(--accent);
+  width: 23px;
+  height: 23px;
+}
+.tool-card > span {
+  flex: 1;
+  min-width: 0;
+}
+.tool-card strong,
+.tool-card small {
+  display: block;
+}
+.tool-card small {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 400;
+}
+.tool-card > svg:last-child {
+  color: var(--muted);
+  width: 16px;
+}
+.task-overview {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  margin-bottom: 26px;
+}
+.task-stat {
+  display: block;
+  border-color: var(--line);
+  background: var(--surface);
+  text-align: left;
+  padding: 18px;
+}
+.task-stat strong {
+  display: block;
+  font-size: 27px;
+  font-weight: 500;
+  margin: 8px 0 0;
+  font-variant-numeric: tabular-nums;
+}
+.task-stat span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.shared-task {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  padding: 18px 0;
+  text-align: left;
+  gap: 16px;
+}
+.shared-task > span {
+  min-width: 0;
+}
+.shared-task strong {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+  font-weight: 500;
+}
+.shared-task small {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+  margin-top: 6px;
+}
+#batchUploadLog,
+#adminLog {
+  white-space: pre-wrap;
+  max-height: 350px;
+  overflow: auto;
+  font-size: 12px;
+}
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+#locationPhotos {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+}
+#locationPhotos figure {
+  margin: 0;
+}
+#locationPhotos img {
+  max-width: 100%;
+  max-height: 280px;
+  object-fit: contain;
+}

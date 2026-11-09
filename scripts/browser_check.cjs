@@ -14,14 +14,15 @@ let runningPage;
  await page.goto(url);await page.waitForFunction(()=>document.querySelector('#loanItem')?.options.length>2);
  await page.locator('#actorButton').click();await page.locator('#operatorName').fill('验证教师');await page.locator('#saveActor').click();
  const tab=async name=>{
+   if(await page.locator('#openNavigation').isVisible()&&!await page.locator('#navigationDialog').isVisible()&&!await page.locator(`.tab[data-tab="${name}"]:visible`).count())await page.locator('#openNavigation').click();
    const visible=page.locator(`.tab[data-tab="${name}"]:visible`).first();
    if(await visible.count()){await visible.click();return;}
    if(['loans','lessons','purchases','alerts'].includes(name)){
-     await page.locator('.tab[data-tab="tasks"]:visible').first().click();
+     await page.locator('#sidebar .tab[data-tab="tasks"]:visible').first().click();
      await page.locator(`#taskNavigation .tab[data-tab="${name}"]`).click();
      return;
    }
-   await page.locator('.tab[data-tab="more"]:visible').first().click();
+   await page.locator('#sidebar .tab[data-tab="more"]:visible').first().click();
    await page.locator(`.tool-card.tab[data-tab="${name}"]`).click();
  };
  const pollJson=async(path,ready)=>{
@@ -134,7 +135,7 @@ let runningPage;
  await page.reload();await page.waitForFunction(id=>localStorage.getItem('lab-chat-conversation')===id&&document.querySelectorAll('#chatMessages .chat-message').length>=2,conversation);
  const phone=await browser.newPage({viewport:{width:390,height:844}});
  await phone.addInitScript(id=>{localStorage.setItem('lab-chat-conversation',id);localStorage.setItem('lab-actor','共享验证教师');},conversation);
- await phone.goto(url);await phone.locator('.tab[data-tab="chat"]:visible').click();
+ await phone.goto(url);await phone.locator('#openNavigation').click();await phone.locator('.tab[data-tab="chat"]:visible').click();
  await phone.waitForFunction(name=>document.querySelector('#chatMessages').textContent.includes(name),name);
  assert.equal(await phone.evaluate(()=>localStorage.getItem('lab-chat-conversation')),conversation);
  await phone.close();

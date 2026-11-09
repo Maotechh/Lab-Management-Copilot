@@ -71,10 +71,14 @@ python scripts/smoke_test.py
 node --check consumable_assistant/static/app.js
 node --check consumable_assistant/static/operations.js
 node --check consumable_assistant/static/mobile.js
+node --check consumable_assistant/static/interface.js
+node --check consumable_assistant/static/theme.js
 bash -n deploy/install.sh
 ```
 
-`scripts/browser_check.cjs` 使用 Playwright 检查电脑和手机流程，应仅连接独立测试环境。正式 AI 接口的实际请求需要另行验证。
+网页直接复用指定 DSH 网页版本的主题、图标与 Markdown 排版，构建和来源参见 [frontend/README.md](frontend/README.md)。
+
+`scripts/check_dsh_interface.cjs` 检查聊天界面状态和手机导航，`scripts/check_chat_history.cjs` 检查历史分页。`scripts/browser_check.cjs` 使用 Playwright 检查电脑和手机流程，应仅连接独立测试环境。正式 AI 接口的实际请求需要另行验证。
 
 ## 部署与维护
 

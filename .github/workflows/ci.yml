@@ -18,6 +18,19 @@ jobs:
         python-version: "3.11"
         cache: "pip"
         
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "24.22.2"
+        cache: "npm"
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Verify browser bundle
+      run: |
+        npm ci --prefix frontend --ignore-scripts --no-audit --no-fund
+        npm run build --prefix frontend
+        git diff --exit-code -- consumable_assistant/static/dsh/markdown.js consumable_assistant/static/dsh/THIRD-PARTY-LICENSES.txt
+
     - name: Install LibreOffice (for .xls parsing)
       run: |
         sudo apt-get update
@@ -45,5 +58,5 @@ jobs:
 
     - name: Check JavaScript and installer syntax
       run: |
-        for file in consumable_assistant/static/*.js; do node --check "$file"; done
+        find consumable_assistant/static -name '*.js' -exec node --check {} \;
         bash -n deploy/install.sh

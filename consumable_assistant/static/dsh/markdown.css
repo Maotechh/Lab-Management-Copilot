@@ -1,0 +1,638 @@
+/* Visual baseline: deepsuite `@deepseek/md` markdown.dsh-md-css, adapted to CSS
+   Modules. Cite pills and header anchors are absent (no matching DOM).
+   Token names match that sheet. */
+
+.dsh-md-markdown {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font: var(--dsw-font-markdown-base);
+  color: var(--dsw-alias-label-primary);
+}
+
+.dsh-md-markdown strong {
+  font-weight: 600;
+}
+
+.dsh-md-markdown h1 {
+  font: var(--dsw-font-markdown-h1);
+  margin: 32px 0 16px;
+}
+
+.dsh-md-markdown h2 {
+  font: var(--dsw-font-markdown-h2);
+  margin: 32px 0 16px;
+}
+
+.dsh-md-markdown h3 {
+  font: var(--dsw-font-markdown-h3);
+  margin: 32px 0 16px;
+}
+
+.dsh-md-markdown h4 {
+  font: var(--dsw-font-markdown-h4);
+  margin: 16px 0;
+}
+
+.dsh-md-markdown :where(h5, h6) {
+  font: var(--dsw-font-markdown-base-strong);
+  margin: 16px 0;
+}
+
+.dsh-md-markdown :where(h1, h2, h3, h4, h5, h6) strong {
+  font-weight: inherit;
+}
+
+.dsh-md-markdown p {
+  margin: 16px 0;
+}
+
+/* Tighten h4–h6 against a following list (design: 8px gap). */
+.dsh-md-markdown :where(h4, h5, h6) + :where(ul, ol) {
+  margin-top: 8px;
+}
+
+.dsh-md-markdown :where(h4, h5, h6):has(+ :where(ul, ol)) {
+  margin-bottom: 8px;
+}
+
+.dsh-md-markdown a,
+.dsh-md-markdown .dsh-md-fileLink {
+  /* deepsuite markdown.dsh-md-css uses brand-text (blue in newDesign); this sheet
+     keeps design-platform brand-text as near-black, so links use the
+     dedicated link alias instead. */
+  color: var(--dsw-alias-link);
+  font-weight: 500;
+  transition: box-shadow var(--ds-transition-duration) var(--ds-ease-in-out);
+  position: relative;
+  text-decoration: none;
+  /* Transparent hit-area padding; literal zero-alpha only (no painted color). */
+  border-left: 3px solid rgb(255 255 255 / 0);
+  border-right: 3px solid rgb(255 255 255 / 0);
+  border-top: 2px solid rgb(255 255 255 / 0);
+  border-bottom: 2px solid rgb(255 255 255 / 0);
+  margin-left: -3px;
+  margin-right: -3px;
+}
+
+.dsh-md-markdown a:focus {
+  outline: none;
+  text-decoration: underline dotted var(--dsw-alias-link);
+  text-underline-offset: 3px;
+}
+
+@media (hover: hover) {
+  .dsh-md-markdown a:hover {
+    outline: none;
+    text-decoration: underline dotted var(--dsw-alias-link);
+    text-underline-offset: 3px;
+  }
+}
+
+.dsh-md-markdown a:focus-visible,
+.dsh-md-fileMention:focus-visible {
+  box-shadow: 0 0 0 2px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+}
+
+/* Leading link-category glyph inside anchors, file mentions, and
+   URL-promoted inline code: outline glyphs ride the link's currentColor.
+   1.1em keeps the glyph proportional to the surrounding text's size (it
+   shrinks with the code chip's 0.875em); the small negative offset seats
+   its optical center on the cap height. */
+.dsh-md-linkIcon {
+  flex: none;
+  width: 1.1em;
+  height: 1.1em;
+  vertical-align: -0.25em;
+  margin-right: 5px;
+}
+
+.dsh-md-markdown :where(ul, ol) {
+  margin: 16px 0;
+  padding-left: 18px;
+}
+
+.dsh-md-markdown li:not(:first-child) {
+  margin-top: 6px;
+}
+
+.dsh-md-markdown li > :where(ul, ol) {
+  margin-top: 4px;
+}
+
+.dsh-md-markdown li::marker {
+  line-height: 24px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+/* Nested ol under ul/ol: markers inside (models sometimes emit this shape). */
+.dsh-md-markdown :where(ul, ol) ol {
+  list-style-position: inside;
+  padding-left: 0;
+}
+
+.dsh-md-markdown :where(ul, ol) ol li p {
+  display: inline;
+}
+
+.dsh-md-markdown li > p {
+  margin: 8px 0;
+}
+
+.dsh-md-markdown li > *:first-child {
+  margin-top: 0;
+}
+
+/* Keep list-nested code-block vertical margins (design: +4px vs other last children). */
+.dsh-md-markdown li > *:last-child:not(.dsh-md-md-code-block) {
+  margin-bottom: 0;
+}
+
+.dsh-md-markdown hr {
+  display: block;
+  border: none;
+  height: 0.5px;
+  margin: 32px 0;
+  background: var(--dsw-alias-border-l2);
+}
+
+.dsh-md-markdown blockquote {
+  border-left: 2px solid var(--dsw-alias-label-caption);
+  margin: 16px 0 0;
+  padding-left: 14px;
+}
+
+.dsh-md-markdown pre {
+  margin: 16px 0;
+  font-family: var(--ds-font-family-code);
+  overflow: auto;
+}
+
+.dsh-md-markdown :not(pre) > code {
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  font: var(--dsw-font-markdown-code);
+  font-family: var(--ds-font-family-code);
+  font-size: 0.875em !important;
+  background-color: var(--dsw-alias-markdown-inline-code);
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: var(--dsw-radius-sm);
+  padding: 0 5px;
+}
+
+.dsh-md-markdown :where(h1, h2, h3, h4, h5, h6) code {
+  font: inherit;
+  font-family: var(--ds-font-family-code);
+}
+
+.dsh-md-markdown .dsh-md-katex-display {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.dsh-md-markdown input[type='checkbox'] {
+  margin: 0 8px 0 0;
+  accent-color: var(--dsw-alias-label-secondary);
+}
+
+.dsh-md-tableScroll {
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+/* Hover-capable inputs reveal a wide table's bar on hover or keyboard focus.
+   Other inputs keep native horizontal scrolling. Chromium never repaints state-conditioned
+   scrollbar STYLES (neither hover-conditioned `::-webkit-scrollbar*` rules
+   nor a :hover `scrollbar-color` change reaches the painted bar), so the
+   toggle is `overflow-x` itself — a layout change repaints reliably. The
+   resting padding matches the themed bar's height on the WebKit scrollbar
+   path. There, `scroll` reserves that height even when the table fits.
+   Other engines and overlay scrollbars may reserve a different height.
+   Wheel and trackpad scrolling need the pointer over the table, which is
+   already the hover that re-enables scrolling. */
+.dsh-md-tableScroll.dsh-md-md-table-wide:focus-visible {
+  overflow-x: scroll;
+  padding-bottom: 0;
+}
+
+@media (hover: hover) {
+  .dsh-md-tableScroll.dsh-md-md-table-wide {
+    overflow-x: hidden;
+    padding-bottom: var(--dsh-scrollbar-width, 5px);
+  }
+
+  .dsh-md-tableScroll.dsh-md-md-table-wide:hover {
+    overflow-x: scroll;
+    padding-bottom: 0;
+  }
+}
+
+/* Chromium keyboard-focuses scrollable containers by default; the ring uses
+   the sheet's link focus color. */
+.dsh-md-tableScroll:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+}
+
+/* Many-column tables (the renderer's `md-table-wide` hook) keep their
+   natural width and scroll inside the wrapper; a hosting layout may widen
+   the wrapper through the hook (deepsuite chat TableWrapper parity). */
+.dsh-md-tableScroll table {
+  border-collapse: collapse;
+  width: max-content;
+  max-width: max-content;
+}
+
+/* Tables under four columns, and any table inside a blockquote, fill the
+   column instead: cells wrap down to their minimum readable width, and the
+   wrapper's scroll only remains for the below-floor case (deepsuite chat
+   parity: `.dsh-md-wrapper:not(:has(th:nth-child(4), td:nth-child(4)))`). */
+.dsh-md-tableFill table {
+  width: 100%;
+  max-width: none;
+}
+
+.dsh-md-tableScroll th {
+  text-align: start;
+  padding: 10px 16px;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l3);
+  border-top: none;
+  font: var(--dsw-font-markdown-table-head);
+  max-width: 320px;
+  max-width: min(30vw, 320px);
+  min-width: 100px;
+}
+
+.dsh-md-tableScroll td {
+  padding: 10px 16px;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
+  font: var(--dsw-font-markdown-table);
+  max-width: 320px;
+  max-width: min(30vw, 320px);
+  min-width: 100px;
+}
+
+.dsh-md-tableScroll th:first-child,
+.dsh-md-tableScroll td:first-child {
+  padding-left: 0;
+}
+
+.dsh-md-tableScroll td:last-child {
+  padding-right: 0;
+}
+
+.dsh-md-tableScroll table code {
+  font-size: 11px;
+}
+
+.dsh-md-markdown > *:first-child,
+.dsh-md-markdown p:first-child {
+  margin-top: 0 !important;
+}
+
+.dsh-md-markdown > *:last-child,
+.dsh-md-markdown p:last-child {
+  margin-bottom: 0 !important;
+}
+
+.dsh-md-imageAlt {
+  color: var(--dsw-alias-label-tertiary);
+  font-style: italic;
+}
+
+.dsh-md-image {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  margin: 0;
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-base);
+  object-fit: contain;
+}
+
+/* Inline file mention: the same link language this sheet gives anchors (and
+   thereby URL-promoted inline code) — link-blue at rest, dotted underline only
+   on hover/focus. An underline at rest reads badly inside the code chip, where
+   it collides with monospace descenders and the pill background. */
+.dsh-md-fileMention {
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  font-weight: 500;
+  color: var(--dsw-alias-link);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.dsh-md-fileLink {
+  max-width: 100%;
+  text-align: inherit;
+}
+
+.dsh-md-fileMention:focus {
+  outline: none;
+  text-decoration: underline dotted var(--dsw-alias-link);
+  text-underline-offset: 3px;
+}
+
+@media (hover: hover) {
+  .dsh-md-fileMention:hover {
+    outline: none;
+    text-decoration: underline dotted var(--dsw-alias-link);
+    text-underline-offset: 3px;
+  }
+}
+
+.dsh-md-compact {
+  max-width: 100%;
+  font-size: var(--dsh-content-font-size-secondary, 13px);
+  line-height: calc(20px + var(--dsh-content-font-delta-secondary, 0px));
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.dsh-md-compact :is(h1, h2, h3, h4, h5, h6) {
+  margin: 8px 0 4px;
+  font: inherit;
+  font-weight: 600;
+  color: inherit;
+}
+
+.dsh-md-compact :is(p, ul, ol, blockquote) {
+  margin: 4px 0;
+}
+
+.dsh-md-compact li:not(:first-child) {
+  margin-top: 2px;
+}
+
+.dsh-md-compact li > p {
+  margin: 4px 0;
+}
+
+.dsh-md-compact li::marker {
+  line-height: inherit;
+  color: inherit;
+}
+
+.dsh-md-compact blockquote {
+  padding-left: 8px;
+}
+
+.dsh-md-compact hr {
+  margin: 8px 0;
+}
+
+.dsh-md-compact a,
+.dsh-md-compact .dsh-md-fileMention {
+  font-weight: inherit;
+  color: inherit;
+  text-decoration: underline dotted;
+}
+
+.dsh-md-compact a:focus,
+.dsh-md-compact .dsh-md-fileMention:focus {
+  text-decoration-color: currentColor;
+}
+
+@media (hover: hover) {
+  .dsh-md-compact a:hover,
+  .dsh-md-compact .dsh-md-fileMention:hover {
+    text-decoration-color: currentColor;
+  }
+}
+
+.dsh-md-compact :not(pre) > code {
+  display: inline;
+  font: inherit;
+  font-family: var(--ds-font-family-code);
+  font-size: 1em !important;
+  border-radius: var(--dsw-radius-xs);
+  padding: 0 3px;
+  box-decoration-break: clone;
+}
+
+.dsh-md-markdown.dsh-md-compact .dsh-md-md-code-block {
+  margin: 4px 0;
+  color: inherit;
+}
+
+.dsh-md-compact .dsh-md-md-code-block > :has(> [data-code-block-banner]) {
+  position: static;
+  z-index: auto;
+}
+
+/* Shiki writes token colors inline; compact code uses the surrounding text color. */
+.dsh-md-compact pre,
+.dsh-md-compact pre :is(code, span) {
+  color: inherit !important;
+}
+
+.dsh-md-markdown.dsh-md-compact .dsh-md-tableScroll {
+  width: 100%;
+  max-width: 100%;
+  margin: 4px 0;
+  padding-left: 0;
+}
+
+.dsh-md-markdown.dsh-md-compact .dsh-md-tableScroll > table {
+  z-index: auto;
+}
+
+.dsh-md-compact :is(th, td) {
+  padding: 4px 8px;
+  font: inherit;
+}
+
+.dsh-md-compact th {
+  font-weight: 600;
+}
+
+.dsh-md-compact .dsh-md-katex {
+  font-size: 1em;
+}
+
+/* Keep KaTeX's inline baseline and scroll the containing block only when needed. */
+.dsh-md-compact :is(p, h1, h2, h3, h4, h5, h6, ul, ol):has(.dsh-md-katex) {
+  overflow-x: auto;
+  overflow-y: hidden;
+  /* KaTeX descenders can paint one pixel below a fractional line-box edge. */
+  padding-bottom: 1px;
+}
+
+.dsh-md-compact .dsh-md-katex-display {
+  margin: 4px 0;
+}
+
+.dsh-md-imageButton {
+  display: inline-block;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: var(--dsw-radius-sm);
+  background: transparent;
+  vertical-align: middle;
+  cursor: zoom-in;
+}
+.dsh-md-imageButton .dsh-md-image { max-width: min(100%, 640px); max-height: 360px; }
+.dsh-md-imageButton:focus-visible { outline: var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary)); outline-offset: 3px; }
+.dsh-md-previewName {
+  display: block;
+  margin-top: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+/* Visual baseline: deepsuite `@deepseek/md` code-block.dsh-code-css. Highlight colors
+   stay on the existing shiki `--shiki-*` sheet (not Prism highlight.dsh-code-css). */
+
+.dsh-code-block {
+  --dsl-code-block-banner-background-color: var(--dsw-alias-markdown-code-block-banner);
+  --dsl-code-block-border-radius: var(--dsw-radius-lg);
+  /* Local 11/18 instead of the shared --dsw-font-xs-13: the banner scales
+     with the markdown 0.875 ladder without shrinking every other xs-13 use. */
+  --dsl-code-block-banner-font: 11px/18px var(--dsw-font-family);
+  --dsl-code-block-content-font: var(--dsw-font-markdown-code-block);
+  --dsl-code-block-background: var(--dsw-alias-markdown-code-block);
+
+  position: relative;
+  margin: 16px 0;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsl-code-block-background);
+  border-radius: var(--dsl-code-block-border-radius);
+}
+
+.dsh-code-block:not(:last-child) {
+  margin-bottom: 11px;
+}
+
+.dsh-code-bannerWrap {
+  position: sticky;
+  top: 0;
+  z-index: 6;
+  background-color: var(--dsw-alias-bg-base);
+  border-top-left-radius: var(--dsl-code-block-border-radius);
+  border-top-right-radius: var(--dsl-code-block-border-radius);
+}
+
+.dsh-code-banner {
+  background: var(--dsl-code-block-banner-background-color);
+  padding: 9px 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  font: var(--dsl-code-block-banner-font);
+  border-top-left-radius: var(--dsl-code-block-border-radius);
+  border-top-right-radius: var(--dsl-code-block-border-radius);
+}
+
+.dsh-code-infostring {
+  color: var(--dsw-alias-label-primary);
+  font-family: var(--ds-font-family-code);
+  font-size: 11px;
+  line-height: 18px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dsh-code-action {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.dsh-code-copyButton {
+  background-color: rgb(255 255 255 / 0);
+  border: none;
+  padding: 0;
+  margin: 0;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+
+/* Consumers may turn the stable content node into a viewport without changing
+   the default CodeBlock layout. */
+.dsh-code-content {
+  display: contents;
+}
+
+.dsh-code-block :where(pre) {
+  font: var(--dsl-code-block-content-font);
+  padding: 16px;
+  margin: 0 !important;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: var(--dsl-code-block-background);
+  /* Bottom radii live on <pre>: overflow:hidden on .dsh-code-block would kill the
+     sticky banner, and this opaque fill otherwise squares off the wrapper. */
+  border-bottom-left-radius: var(--dsl-code-block-border-radius);
+  border-bottom-right-radius: var(--dsl-code-block-border-radius);
+}
+
+/* Shiki inlines its theme background var; route it to the repo token. */
+.dsh-code-block :where(pre.dsh-code-shiki) {
+  background: var(--dsl-code-block-background) !important;
+}
+
+.dsh-code-block :where(pre) code {
+  font: inherit;
+  background: none;
+  padding: 0;
+}
+
+.dsh-code-plain {
+  color: var(--dsw-alias-label-primary);
+}
+
+.dsh-code-card :where(pre) {
+  padding: 6px 22px 20px;
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+
+.dsh-code-card[data-code-wrap='false'] {
+  --dsl-code-block-line-white-space: pre;
+}
+
+.dsh-code-card[data-code-wrap='false'] :where(pre) {
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+.dsh-code-numbered :where(pre) code {
+  display: block;
+  counter-reset: source-line;
+  white-space: normal;
+}
+
+.dsh-code-numbered :where(pre) code > .dsh-code-line {
+  position: relative;
+  display: block;
+  min-height: 1lh;
+  padding-inline-start: calc(var(--dsl-code-block-line-number-width) + 12px);
+  counter-increment: source-line;
+  white-space: var(--dsl-code-block-line-white-space, pre-wrap);
+}
+
+.dsh-code-numbered :where(pre) code > .dsh-code-line::before {
+  position: absolute;
+  inset-inline-start: 0;
+  width: var(--dsl-code-block-line-number-width);
+  color: var(--dsw-alias-label-tertiary);
+  text-align: end;
+  content: counter(source-line);
+  user-select: none;
+}

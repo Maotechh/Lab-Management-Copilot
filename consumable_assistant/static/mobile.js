@@ -2,7 +2,7 @@
 let selectedImageUrls = [];
 let attachmentSelection = [];
 function setSelectedFiles(files) {
-  let problem = '';
+  let problem = state.chatSending ? '附件正在上传，请稍候' : '';
   if (localStorage.getItem('lab-chat-pending')) problem = '请先重试原消息，再修改附件';
   if (files.length > 8 || files.some(file => file.size > 20 * 1024 * 1024)) {
     problem = '每条消息最多八个附件，单个附件最多 20 MB';
@@ -35,6 +35,8 @@ function renderSelectedAttachments() {
     figure.append(caption,remove); $('#attachmentPreviews').append(figure);
   }
   window.lucide?.createIcons();
+  window.updateComposerState?.();
+  window.updatePlanUI?.(false);
 }
 $('.attachment-button').addEventListener('keydown', event => { if(event.key==='Enter'||event.key===' '){event.preventDefault();$('#chatFile').click();} });
 $('#composer').addEventListener('dragover',event=>{if([...event.dataTransfer.types].includes('Files'))event.preventDefault();});
@@ -63,7 +65,7 @@ function voiceControls(phase, message) {
   $('#cancelVoice').hidden = phase === 'idle';
   $('#voiceStatus').textContent = message;
   $('#composer').classList.toggle('recording',phase==='recording');
-  $('#previewBtn').disabled=phase!=='idle'||Boolean(state.chatSending);
+  window.updateComposerState?.();
   $('#recordVoice').setAttribute('aria-pressed',String(phase==='recording'));
   recordingTime.hidden=phase!=='recording';
   if(phase==='recording'){
