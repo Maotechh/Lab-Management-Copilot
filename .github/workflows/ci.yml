@@ -2,9 +2,17 @@ name: CI
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [ master, main, codex/dsh-lab-delivery ]
   pull_request:
-    branches: [ master, main ]
+    branches: [ master, main, codex/dsh-lab-delivery ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -58,5 +66,23 @@ jobs:
 
     - name: Check JavaScript and installer syntax
       run: |
-        find consumable_assistant/static -name '*.js' -exec node --check {} \;
-        bash -n deploy/install.sh
+        set -euo pipefail
+        while IFS= read -r -d '' file; do node --check "$file"; done < <(find consumable_assistant/static -name '*.js' -print0)
+        node scripts/check_notification_worker.cjs
+        for file in deploy/*.sh; do bash -n "$file"; done
+
+  publish-deployment:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/codex/dsh-lab-delivery'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+    - name: Publish immutable deployment authorization
+      env:
+        DEPLOY_COMMIT: ${{ github.sha }}
+        DEPLOY_BRANCH: codex/dsh-lab-delivery
+        DEPLOY_REPOSITORY: ${{ github.repository }}
+        DEPLOY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: bash deploy/publish-ci-release.sh

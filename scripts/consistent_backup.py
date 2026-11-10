@@ -23,10 +23,13 @@ ROOTS = {
     'analysis_configuration': Path('/etc/lab-analysis'),
     'tls': Path('/etc/lab-management-tls'),
     'deployment': Path('/var/lib/lab-release-configuration'),
+    'autoupdate_configuration': Path('/etc/lab-management-autoupdate'),
+    'autoupdate_program': Path('/usr/local/lib/lab-management-autoupdate'),
 }
 UNITS = tuple(f'consumable-{name}.{suffix}' for name, suffix in (
     ('assistant', 'service'), ('notifications', 'service'), ('dsh', 'service'),
     ('analysis', 'service'), ('backup', 'service'), ('backup', 'timer'),
+    ('autoupdate', 'service'), ('autoupdate', 'timer'),
 ))
 
 

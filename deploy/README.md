@@ -22,6 +22,8 @@ The manifest records both commits, the exact Node.js and pnpm versions, lockfile
 
 ## Install
 
+For automatic deployments after GitHub checks pass, see [AUTOUPDATE.md](AUTOUPDATE.md). The configured production branch is `codex/dsh-lab-delivery`; the server polls every five minutes and continues to use this installer, full backups and restoration.
+
 Ubuntu requires Python with venv support, Nginx, rootless Podman, `uidmap`, systemd user sessions and cgroup v2. Install the private-IP server certificate, server key and public root certificate as `/etc/lab-management-tls/server.crt`, `server.key` and `lab-root-ca.crt`. Keep the CA signing key outside the server and preserve it encrypted under the maintainer's control. The CA signing key is not an application backup input.
 
 Extract the identified application and runtime into `/opt/lab-management/releases/<release-id>`. For a first installation only, provide the existing inventory and environment under `bootstrap/`; never reimport the original three attachments. Run:

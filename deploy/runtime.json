@@ -1,0 +1,8 @@
+{
+  "dsh_commit": "a51d6a6df84930fb8d4aa0a9daf26523984b7560",
+  "node": "v24.22.2",
+  "pnpm": "11.28.5",
+  "platform": "linux-x64",
+  "source_lock_sha256": "d65a6deb59aaaa61424ea8c832874b8745d09085c8c2ed37a1e8f1aeaa01017e",
+  "deployment_lock_sha256": "91931d6d75c9a669ef95abf0f6ef41af830ac4ba08e63f5972df19d47dba5c35"
+}

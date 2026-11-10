@@ -200,6 +200,9 @@ curl --fail --silent --show-error --max-time 120 -X POST http://127.0.0.1:8000/a
 systemctl restart consumable-notifications
 systemctl reload-or-restart nginx
 curl --fail --silent --show-error --cacert /etc/lab-management-tls/lab-root-ca.crt https://10.15.21.115/api/stats > "$release_backup/health-https.json"
+if [[ -f /etc/lab-management-autoupdate/config.json ]]; then
+    bash "$release_dir/deploy/install-autoupdate.sh"
+fi
 flock -u 9
 "$python_bin" "$release_dir/scripts/consistent_backup.py" create --snapshot "$release_backup/installed-snapshot"
 systemctl restart consumable-backup.timer
