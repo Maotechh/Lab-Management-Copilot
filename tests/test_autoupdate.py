@@ -150,6 +150,22 @@ def test_insufficient_storage_preserves_existing_backups(updater, monkeypatch):
     assert backup.read_text() == 'retained'
 
 
+def test_failed_staging_removes_only_its_uninstalled_candidate(updater, monkeypatch):
+    existing = updater.releases / 'previous-installed-release'
+    existing.mkdir()
+    (existing / 'retained').write_text('previous version')
+    monkeypatch.setattr(updater, 'space_check', lambda **kwargs: None)
+    def prepare(release, commit):
+        release.mkdir()
+        (release / 'partial-runtime').write_text('incomplete')
+        raise OSError('registry unavailable')
+    monkeypatch.setattr(updater, 'prepare', prepare)
+    with pytest.raises(OSError, match='registry unavailable'):
+        updater.stage(COMMIT)
+    assert list(updater.releases.iterdir()) == [existing]
+    assert (existing / 'retained').read_text() == 'previous version'
+
+
 def test_publish_script_creates_idempotent_annotated_authorization(tmp_path):
     """Exercise the actual CI publishing script against a local bare repository."""
     import os

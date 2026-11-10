@@ -1,4 +1,5 @@
 [Unit]
+RequiresMountsFor=/opt/lab-management/releases /var/backups/lab-management
 Description=Consistent inventory, shared chat, attachments and configuration backup
 
 [Service]

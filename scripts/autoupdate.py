@@ -110,12 +110,22 @@ class Updater:
                 raise OSError(f'Insufficient free disk space: {path}. Existing releases and backups were retained.')
 
     def stage(self, commit: str) -> Path:
-        # A failed attempt is retained. Retrying always uses a new directory.
         stamp = datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')
         release = self.releases / f'auto-{stamp}-{commit[:12]}'
         runtime_size = sum(path.stat().st_size for path in (self.current / 'runtime').rglob('*')
                            if path.is_file() and not path.is_symlink())
         self.space_check(staging_bytes=runtime_size + 512 * 1024**2)
+        try:
+            self.prepare(release, commit)
+        except Exception:
+            # No installer has run. Remove only this incomplete attempt so a
+            # retried registry/network failure cannot fill the release disk.
+            if release.exists():
+                shutil.rmtree(release)
+            raise
+        return release
+
+    def prepare(self, release: Path, commit: str) -> None:
         run(['git', 'clone', '--no-hardlinks', '--no-checkout', str(self.cache / 'repository.git'), str(release)])
         run(['git', 'checkout', '--detach', commit], cwd=release)
         expected = read_json(release / 'deploy/runtime.json')
@@ -131,7 +141,6 @@ class Updater:
             raise ValueError('Runtime build identity differs from deploy/runtime.json')
         run(['python3', 'scripts/release_manifest.py', 'create', '--root', str(release)], cwd=release)
         self.space_check()
-        return release
 
     def build_runtime(self, release: Path, expected: dict) -> None:
         # Node/pnpm changes require deliberately provisioning the matching toolchain.
@@ -173,6 +182,8 @@ class Updater:
             release = self.stage(commit)
             # Skip a superseded commit without pausing production writers.
             if self.fetch_head() != commit:
+                if release.exists():
+                    shutil.rmtree(release)
                 return self.record('superseded', commit=commit, release=str(release))
             self.record('installing', commit=commit, release=str(release), ci=authorization)
             self.install(release)

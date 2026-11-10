@@ -2,6 +2,7 @@
 Description=Restricted campus laboratory DSH and official local SenseVoice
 Wants=network-online.target
 After=network-online.target
+RequiresMountsFor=/opt/lab-management/releases
 
 [Service]
 Type=simple

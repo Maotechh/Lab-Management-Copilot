@@ -1,4 +1,5 @@
 [Unit]
+RequiresMountsFor=/opt/lab-management/releases
 Description=Lab inventory notifications and AI health checks
 After=network-online.target consumable-assistant.service
 Requires=consumable-assistant.service

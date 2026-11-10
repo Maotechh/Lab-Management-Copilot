@@ -2,6 +2,7 @@
 Description=Lab Management Copilot
 Wants=network-online.target
 After=network-online.target
+RequiresMountsFor=/opt/lab-management/releases
 
 [Service]
 Type=simple

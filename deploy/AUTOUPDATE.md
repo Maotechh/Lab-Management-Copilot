@@ -8,7 +8,7 @@ The server stages an identified immutable release and verifies the complete curr
 
 Immediately before installing, the coordinator checks that the candidate is still the latest branch commit. It invokes `deploy/install.sh`, which preserves a complete verified previous snapshot, rehearses restoration, migrates an isolated copy, installs, checks the actual school model and HTTPS, and restores the previous matching code and data on failure. Existing immutable releases and backups are retained. At least 2 GiB of free disk space must remain after staging. Insufficient disk space stops the attempt before production writes pause.
 
-Only one automatic updater runs at a time. An unsuccessful production installation is not repeated every five minutes: a new commit or an explicit retry is required. Network, disk or preparation failures can retry on the next scheduled check. A superseded commit does not install. The timer does not cancel an installation when another commit appears; it processes the latest commit on its next check. A successful repeat poll makes no changes.
+Only one automatic updater runs at a time. An unsuccessful production installation is not repeated every five minutes: a new commit or an explicit retry is required. Network, disk or preparation failures can retry on the next scheduled check. Incomplete staging directories and superseded candidates are removed before any production installation; previously installed releases and backups are retained. A superseded commit does not install. The timer does not cancel an installation when another commit appears; it processes the latest commit on its next check. A successful repeat poll makes no changes.
 
 ## One-time setup
 
