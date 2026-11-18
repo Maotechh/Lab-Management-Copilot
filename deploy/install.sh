@@ -38,6 +38,7 @@ fi
 if [[ ! -f /etc/lab-management/environment ]]; then
     install -m 0640 -o root -g "$service_user" "$release_dir/bootstrap/environment" /etc/lab-management/environment
 fi
+python3 "$release_dir/scripts/configure_environment.py" /etc/lab-management/environment --preflight
 [[ -e "$release_dir/data" ]] || ln -s "$state_dir" "$release_dir/data"
 python3 -m venv "$release_dir/.venv"
 python_bin="$release_dir/.venv/bin/python"
@@ -110,6 +111,11 @@ fi
 usermod -a -G lab-analysis-client "$service_user"
 install -d -m 0750 -o lab-dsh -g lab-dsh /var/lib/lab-dsh
 install -d -m 0750 -o root -g lab-dsh /etc/lab-dsh
+if [[ ! -s /etc/lab-dsh/model-relay.env ]]; then
+    (umask 0077; printf 'LAB_DSH_RELAY_TOKEN=%s\n' "$(openssl rand -hex 32)" > /etc/lab-dsh/model-relay.env)
+fi
+chown root:root /etc/lab-dsh/model-relay.env
+chmod 0600 /etc/lab-dsh/model-relay.env
 install -d -m 0700 -o lab-analysis -g lab-analysis-client /var/lib/lab-analysis
 install -d -m 0750 -o root -g lab-analysis-client /etc/lab-analysis
 analysis_uid="$(id -u lab-analysis)"
@@ -196,6 +202,7 @@ systemctl restart consumable-assistant
 curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:8000/api/stats > "$release_backup/health-stats.json"
 curl --fail --silent --show-error --max-time 120 -X POST http://127.0.0.1:8000/api/ai/check > "$release_backup/health-ai.json"
 "$python_bin" -c 'import json,sys; assert json.load(open(sys.argv[1]))["status"] == "available", "School model unavailable"' "$release_backup/health-ai.json"
+"$python_bin" "$release_dir/scripts/verify_school_chat.py" "$state_dir/consumables.db" > "$release_backup/health-school-chat.json"
 "$python_bin" "$release_dir/scripts/verify_analysis_sandbox.py" --report "$release_backup/analysis-verification.json"
 systemctl restart consumable-notifications
 systemctl reload-or-restart nginx

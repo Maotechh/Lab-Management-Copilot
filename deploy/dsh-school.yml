@@ -1,0 +1,15 @@
+- id: school-model
+  config:
+    providers:
+      school:
+        baseURL: !!js (process.env.LAB_CALLBACK_URL ?? 'http://127.0.0.1:8000') + '/api/internal/school'
+        headers:
+          Authorization: !!js |
+            'Bearer ' + process.env.LAB_DSH_RELAY_TOKEN
+        models:
+          - id: deepseek-pro
+            input: [text, image]
+            contextWindow: 1048576
+            maxTokens: 1000
+            reasoningEfforts:
+              high: high

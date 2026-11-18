@@ -27,6 +27,7 @@ from . import ledger as stock
 from . import workflows as flow
 from .database import connect, init_db, inventory_is_empty
 from .importer import import_all_sources
+from .school_relay import router as school_router
 from .services import (
     ACTION_LABELS,
     export_inventory_workbook,
@@ -106,6 +107,7 @@ async def chat_worker(stopping: asyncio.Event) -> None:
 
 
 app = FastAPI(title="耗材智能管理助手", version="0.2.0", lifespan=lifespan)
+app.include_router(school_router)
 
 
 class ChatPrepareRequest(BaseModel):

@@ -10,8 +10,10 @@ from pathlib import Path
 def prepare(release: Path, home: Path) -> None:
     root = home / 'profiles' / 'lab'
     root.mkdir(parents=True, exist_ok=True, mode=0o750)
-    for name in ('package.json', 'cordis.yml'):
-        shutil.copyfile(release / 'runtime' / 'profile' / name, root / name)
+    if not os.environ.get('LAB_DSH_RELAY_TOKEN'):
+        raise ValueError('Missing DSH model relay credential')
+    shutil.copyfile(release / 'runtime/profile/package.json', root / 'package.json')
+    shutil.copyfile(release / 'deploy/dsh-school.yml', root / 'cordis.yml')
     modules = root / 'node_modules'
     if modules.is_symlink():
         modules.unlink()

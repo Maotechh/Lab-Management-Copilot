@@ -1653,9 +1653,93 @@ def test_deployment_uses_only_qualified_school_deepseek_without_primary_key(tmp_
     assert "GENAI_REQUIRED=1" in configured
     assert "GENAI_API_KEY=\n" in configured
     assert "GENAI_MODE=responses\n" in configured
-    assert "GENAI_BASE_URL=http://10.15.171.204:30969/v1" in configured
+    assert "GENAI_BASE_URL=https://genaiapi.shanghaitech.edu.cn/api/v1/response\n" in configured
     assert "GENAI_FALLBACK_PROVIDERS_JSON=[]" in configured
     assert "PUBLIC_BASE_URL=https://10.15.21.115" in configured
+
+
+def test_deployment_preserves_keyed_model_on_reinstall(tmp_path):
+    from scripts.configure_environment import configure
+
+    path = tmp_path / "environment"
+    settings = [
+        'GENAI_API_KEY="fixture-only"',
+        'GENAI_BASE_URL="https://school.test/v1"',
+        "GENAI_MODE=responses",
+        "GENAI_MODEL=deepseek-pro",
+        "GENAI_PRIMARY_NAME=Campus",
+        "VAPID_PRIVATE_KEY=existing",
+        "VAPID_PUBLIC_KEY=existing",
+    ]
+    path.write_text("\n".join(settings) + "\n", encoding="utf-8")
+    configure(path)
+    configure(path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert all(lines.count(setting) == 1 for setting in settings)
+    assert sum(line.startswith("GENAI_BASE_URL=") for line in lines) == 1
+
+
+@pytest.mark.parametrize("url", ["", "http://school.test/v1", "https://user@school.test/v1"])
+def test_keyed_deployment_requires_explicit_secure_url(tmp_path, url):
+    from scripts.configure_environment import configure
+
+    path = tmp_path / "environment"
+    original = f"GENAI_API_KEY=fixture-only\nGENAI_BASE_URL={url}\n"
+    path.write_text(original, encoding="utf-8")
+    with pytest.raises(ValueError, match="HTTPS"):
+        configure(path)
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_keyed_model_request_requires_https():
+    from consumable_assistant import genai
+
+    provider = {"model": "deepseek-pro", "mode": "responses", "api_key": "fixture-only"}
+    with pytest.raises(genai.AIUnavailable, match="HTTPS"):
+        genai.provider_request({**provider, "base_url": "http://school.test/v1"}, "system", "test", 32)
+    request = genai.provider_request({**provider, "base_url": "https://school.test/v1"}, "system", "test", 32)
+    assert request["url"] == "https://school.test/v1/responses"
+    assert request["headers"]["Authorization"] == "Bearer fixture-only"
+
+
+def test_institutional_gateway_preview(monkeypatch):
+    import json
+
+    import httpx
+
+    from consumable_assistant import genai
+
+    url = "https://genaiapi.shanghaitech.edu.cn/api/v1/response"
+    requests = []
+
+    def endpoint(request):
+        requests.append(request)
+        assert request.method == "POST" and str(request.url) == url
+        assert request.headers["Authorization"] == "Bearer fixture-only"
+        body = json.loads(request.content)
+        assert body == {"model": "deepseek-pro", "instructions": genai.SYSTEM_PROMPT,
+                        "input": genai.build_prompt("登记消耗两个烧杯"), "max_output_tokens": 1000,
+                        "temperature": 0.5, "stream": False}
+        return httpx.Response(200, json={"output": [{"type": "message", "content": [
+            {"type": "output_text", "text": '{"operations":[{"action":"consume","quantity":2}]}'}]}]})
+
+    client_type = httpx.Client
+    monkeypatch.setattr(genai.httpx, "Client", lambda **kw: client_type(transport=httpx.MockTransport(endpoint), **kw))
+    monkeypatch.setattr(genai, "GENAI_BASE_URL", url)
+    monkeypatch.setattr(genai, "GENAI_API_KEY", "")
+    monkeypatch.setattr(genai, "GENAI_MODE", "responses")
+    monkeypatch.setattr(genai, "GENAI_MODEL", "deepseek-pro")
+    monkeypatch.setattr(genai, "GENAI_TEMPERATURE", 0.5)
+    monkeypatch.setattr(genai, "GENAI_MAX_OUTPUT_TOKENS", 1000)
+    monkeypatch.setattr(genai, "record_health", lambda *args: None)
+    monkeypatch.setattr(genai, "record_provider_check", lambda *args: None)
+    assert not genai.model_is_enabled()
+    assert genai.parse_inventory_message("登记消耗两个烧杯") is None
+    assert not requests
+    monkeypatch.setattr(genai, "GENAI_API_KEY", "fixture-only")
+    result = genai.parse_inventory_message("登记消耗两个烧杯")
+    assert result["operations"] == [{"action": "consume", "quantity": 2}]
+    assert len(requests) == 1
 
 
 def test_inventory_parser_uses_school_responses_without_credentials(monkeypatch):
@@ -1958,7 +2042,7 @@ def test_ai_retries_only_the_qualified_provider(monkeypatch):
 
     monkeypatch.setattr(genai, "model_is_enabled", lambda: True)
     monkeypatch.setattr(genai, "GENAI_API_KEY", "test-key")
-    monkeypatch.setattr(genai, "GENAI_BASE_URL", "http://primary.test/v1")
+    monkeypatch.setattr(genai, "GENAI_BASE_URL", "https://primary.test/v1")
     monkeypatch.setattr(genai, "GENAI_MODE", "openai")
     monkeypatch.setenv("GENAI_FALLBACK_PROVIDERS_JSON", "[]")
     monkeypatch.setattr(genai.httpx, "Client", Client)

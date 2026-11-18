@@ -45,8 +45,9 @@ PHOTO_DIR = Path(os.environ.get("CONSUMABLE_PHOTO_DIR", PHOTO_DEFAULT))
 GENAI_API_KEY = os.environ.get("GENAI_API_KEY", "")
 GENAI_MODEL = os.environ.get("GENAI_MODEL", "deepseek-pro")
 GENAI_MODE = os.environ.get("GENAI_MODE", "responses")
+SCHOOL_RESPONSE_URL = "https://genaiapi.shanghaitech.edu.cn/api/v1/response"
 GENAI_RESPONSE_URL = os.environ.get(
-    "GENAI_RESPONSE_URL", "http://10.15.171.204:30969/v1"
+    "GENAI_RESPONSE_URL", SCHOOL_RESPONSE_URL
 )
 GENAI_COMPLETION_URL = os.environ.get(
     "GENAI_COMPLETION_URL", "https://genaiapi.shanghaitech.edu.cn/api/v1/start"
@@ -56,8 +57,8 @@ GENAI_BASE_URL = os.environ.get(
     GENAI_COMPLETION_URL if GENAI_MODE == "completion" else GENAI_RESPONSE_URL,
 )
 GENAI_TIMEOUT = float(os.environ.get("GENAI_TIMEOUT", "18"))
-GENAI_TEMPERATURE = float(os.environ.get("GENAI_TEMPERATURE", "0.2"))
-GENAI_MAX_OUTPUT_TOKENS = int(os.environ.get("GENAI_MAX_OUTPUT_TOKENS", "65536"))
+GENAI_TEMPERATURE = float(os.environ.get("GENAI_TEMPERATURE", "0.5"))
+GENAI_MAX_OUTPUT_TOKENS = int(os.environ.get("GENAI_MAX_OUTPUT_TOKENS", "1000"))
 GENAI_TOTAL_TIMEOUT = float(os.environ.get("GENAI_TOTAL_TIMEOUT", "300"))
 GENAI_PROVIDER_TIMEOUT = float(os.environ.get("GENAI_PROVIDER_TIMEOUT", "300"))
 

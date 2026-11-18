@@ -121,7 +121,7 @@ def _check_health() -> dict[str, Any]:
                         if isinstance(op, dict)
                     )
                 ),
-                max_output_tokens=65536,
+                max_output_tokens=min(GENAI_MAX_OUTPUT_TOKENS, 1000),
             )
             if not parsed:
                 raise AIUnavailable("模型没有返回可用操作")
@@ -132,7 +132,7 @@ def _check_health() -> dict[str, Any]:
 
 
 def model_is_enabled() -> bool:
-    return bool(GENAI_API_KEY.strip() or provider_entries())
+    return bool(provider_entries())
 
 
 def parse_inventory_message(text: str) -> dict[str, Any] | None:
@@ -187,7 +187,8 @@ def provider_entries() -> list[dict[str, Any]]:
         "api_key": GENAI_API_KEY,
         "primary": True,
     }
-    entries = [primary] if primary["base_url"].strip() else []
+    url = primary["base_url"].strip().rstrip("/")
+    entries = [primary] if url and (not url.endswith("/response") or primary["api_key"].strip()) else []
     # A configured endpoint is not evidence of native tools and image support.
     # Only the school DeepSeek integration is qualified for this release.
     raw = os.environ.get("GENAI_FALLBACK_PROVIDERS_JSON", "").strip()
@@ -278,17 +279,22 @@ def provider_request(
 ) -> dict[str, Any]:
     mode = provider.get("mode", "openai")
     if mode in {"response", "responses"}:
+        base_url = provider["base_url"].rstrip("/")
         body = {
             "model": provider["model"],
             "input": prompt,
             "instructions": system,
             "max_output_tokens": max_tokens,
-            "reasoning": {"effort": "high"},
             "stream": False,
-            "store": False,
         }
-        base_url = provider["base_url"].rstrip("/")
-        url = base_url if base_url.endswith("/responses") else base_url + "/responses"
+        if base_url.endswith("/response"):
+            if not provider.get("api_key"):
+                raise AIUnavailable("学校网关未配置 API key")
+            url = base_url
+            body["temperature"] = GENAI_TEMPERATURE
+        else:
+            url = base_url if base_url.endswith("/responses") else base_url + "/responses"
+            body.update(reasoning={"effort": "high"}, store=False)
     elif mode == "completion":
         body = {
             "model": provider["model"],
@@ -316,6 +322,9 @@ def provider_request(
         }
     headers = {"Content-Type": "application/json"}
     if provider.get("api_key"):
+        endpoint = httpx.URL(url)
+        if endpoint.scheme != "https" or not endpoint.host or endpoint.userinfo or endpoint.query or endpoint.fragment:
+            raise AIUnavailable("An authenticated model requires an explicit HTTPS endpoint without credentials or query parameters")
         headers["Authorization"] = f"Bearer {provider['api_key']}"
     return {"url": url, "body": body, "headers": headers}
 
@@ -340,7 +349,8 @@ def record_provider_check(
 def build_request(text: str) -> tuple[str, dict[str, Any]]:
     if GENAI_MODE in {"response", "responses"}:
         request = provider_request(
-            {"model": GENAI_MODEL, "mode": GENAI_MODE, "base_url": GENAI_BASE_URL or GENAI_RESPONSE_URL},
+            {"model": GENAI_MODEL, "mode": GENAI_MODE, "base_url": GENAI_BASE_URL or GENAI_RESPONSE_URL,
+             "api_key": GENAI_API_KEY},
             SYSTEM_PROMPT, build_prompt(text), GENAI_MAX_OUTPUT_TOKENS,
         )
         return request["url"], request["body"]

@@ -16,6 +16,7 @@ Environment=CONSUMABLE_PROFILE=production
 Environment=CONSUMABLE_AUTO_SEED=0
 Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=-/etc/lab-management/environment
+EnvironmentFile=/etc/lab-dsh/model-relay.env
 ExecStart=/opt/lab-management/current/.venv/bin/uvicorn consumable_assistant.server:app --host 127.0.0.1 --port 8000 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1
 Restart=on-failure
 RestartSec=3

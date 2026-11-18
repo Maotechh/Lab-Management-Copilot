@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from scripts import consistent_backup as backup
 from scripts.build_dsh_runtime import dependency_closure
@@ -78,18 +80,33 @@ def test_subordinate_ids_preserve_existing_ranges_and_do_not_overlap(tmp_path):
     assert path.read_text().count('lab-analysis:') == 1
 
 
-def test_volatile_profile_contains_no_persistent_state(tmp_path):
+def test_volatile_profile_contains_no_persistent_state(tmp_path, monkeypatch):
     release, home = tmp_path / 'release', tmp_path / 'run'
     source = release / 'runtime/profile'
     source.mkdir(parents=True)
     (source / 'cordis.yml').write_text('[]\n')
     (source / 'package.json').write_text(json.dumps({'dsh': {'profile': {'bundles': ['lab']}}}))
     (release / 'runtime/dsh/node_modules').mkdir(parents=True)
+    (release / 'deploy').mkdir()
+    patch = Path(__file__).resolve().parents[1] / 'deploy/dsh-school.yml'
+    (release / 'deploy/dsh-school.yml').write_bytes(patch.read_bytes())
+    monkeypatch.delenv('LAB_DSH_RELAY_TOKEN', raising=False)
+    with pytest.raises(ValueError, match='relay credential'):
+        prepare(release, home)
+    monkeypatch.setenv('LAB_DSH_RELAY_TOKEN', 'synthetic-relay-token')
     prepare(release, home)
     prepare(release, home)
     profile = home / 'profiles/lab'
     assert (profile / 'node_modules').resolve() == release / 'runtime/dsh/node_modules'
     assert not (home / 'sessions').exists()
+    overlay = (profile / 'cordis.yml').read_text()
+    provider = yaml.load(overlay, Loader=yaml.BaseLoader)[0]
+    assert provider['id'] == 'school-model'
+    school = provider['config']['providers']['school']
+    assert '/api/internal/school' in school['baseURL']
+    assert 'LAB_DSH_RELAY_TOKEN' in school['headers']['Authorization']
+    assert school['models'][0]['maxTokens'] == '1000'
+    assert 'synthetic-relay-token' not in overlay
     assert json.loads((profile / 'package.json').read_text())['dsh']['profile']['bundles'] == ['lab']
 
 
