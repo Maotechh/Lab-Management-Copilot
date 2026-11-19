@@ -13,7 +13,7 @@ def prepare(release: Path, home: Path) -> None:
     if not os.environ.get('LAB_DSH_RELAY_TOKEN'):
         raise ValueError('Missing DSH model relay credential')
     shutil.copyfile(release / 'runtime/profile/package.json', root / 'package.json')
-    shutil.copyfile(release / 'deploy/dsh-school.yml', root / 'cordis.yml')
+    shutil.copyfile(release / 'scripts/dsh-school.yml', root / 'cordis.yml')
     modules = root / 'node_modules'
     if modules.is_symlink():
         modules.unlink()

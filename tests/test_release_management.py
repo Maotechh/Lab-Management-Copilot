@@ -87,9 +87,9 @@ def test_volatile_profile_contains_no_persistent_state(tmp_path, monkeypatch):
     (source / 'cordis.yml').write_text('[]\n')
     (source / 'package.json').write_text(json.dumps({'dsh': {'profile': {'bundles': ['lab']}}}))
     (release / 'runtime/dsh/node_modules').mkdir(parents=True)
-    (release / 'deploy').mkdir()
-    patch = Path(__file__).resolve().parents[1] / 'deploy/dsh-school.yml'
-    (release / 'deploy/dsh-school.yml').write_bytes(patch.read_bytes())
+    (release / 'scripts').mkdir()
+    overlay_source = Path(__file__).resolve().parents[1] / 'scripts/dsh-school.yml'
+    (release / 'scripts/dsh-school.yml').write_bytes(overlay_source.read_bytes())
     monkeypatch.delenv('LAB_DSH_RELAY_TOKEN', raising=False)
     with pytest.raises(ValueError, match='relay credential'):
         prepare(release, home)
