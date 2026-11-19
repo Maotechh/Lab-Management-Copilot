@@ -11,7 +11,6 @@
         timeoutMs: 300000
         compat:
           supportsDeveloperRole: false
-          supportsMaxOutputTokens: true
         models:
           - id: deepseek-pro
             input: [text, image]
