@@ -6,9 +6,23 @@ from urllib.parse import urlsplit
 
 import httpx
 
+DSH_FAILURE_CODES = frozenset({
+    "MODEL_FAILED", "BUSINESS_CALLBACK_FAILED", "RUN_LIMIT", "DSH_UNAVAILABLE",
+    "DSH_INVALID_RESPONSE", "DSH_CONFIGURATION",
+})
+
+
+def result_error_code(result: dict) -> str:
+    status = result.get("status") if isinstance(result, dict) else None
+    return status if isinstance(status, str) and status in DSH_FAILURE_CODES else "DSH_FAILED"
+
 
 class DSHUnavailable(RuntimeError):
     """The local agent did not return a validated, persisted result."""
+
+    def __init__(self, message: str, code: str = "DSH_UNAVAILABLE"):
+        super().__init__(message)
+        self.code = code
 
 
 def gateway_url() -> str:
@@ -25,6 +39,8 @@ def run_dsh(payload: dict) -> dict:
             response = client.post(gateway_url() + "/runs", json=payload)
             response.raise_for_status()
             result = response.json()
+        if not isinstance(result, dict) or not isinstance(result.get("status"), str):
+            raise DSHUnavailable("DSH 返回内容未通过校验", "DSH_INVALID_RESPONSE")
         if not isinstance(result, dict) or result.get("runId") != payload["runId"] or not isinstance(result.get("reply", ""), str):
             raise DSHUnavailable("DSH 返回内容未通过校验")
         return result

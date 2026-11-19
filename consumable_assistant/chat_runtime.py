@@ -18,7 +18,7 @@ from pydantic import ValidationError
 
 from . import chat
 from . import ledger as stock
-from .dsh_client import DSHUnavailable, run_dsh
+from .dsh_client import DSHUnavailable, result_error_code, run_dsh
 
 TOOL_NAMES = frozenset({
     "inventory_search", "workflow_query", "history_search", "prepare_attachment",
@@ -213,12 +213,16 @@ def process_run(conn, run: dict, dispatch_fn, history_fn) -> dict:
                 response = {"status": "answered", "reply": verified_reply(result.get("reply") or "", tools), "tool_results": tools}
             else:
                 response = {"status": "failed", "reply": "本次对话处理未完成，输入和任务已保存。可以发送继续说明。"}
+                response["error_code"] = result_error_code(result)
         return finish(conn, run, response)
     except chat.PlanChanged as exc:
         return finish(conn, run, exc.response)
     except (DSHUnavailable, ValueError) as exc:
         conn.rollback()
-        return finish(conn, run, {"status": "failed", "reply": str(exc)})
+        response = {"status": "failed", "reply": str(exc)}
+        if isinstance(exc, DSHUnavailable):
+            response["error_code"] = exc.code
+        return finish(conn, run, response)
 
 
 CLARIFICATION_FIELDS = {
@@ -290,7 +294,8 @@ def finish(conn, run: dict, response: dict) -> dict:
                 chat._record_task_event(conn, task["id"], task["status"], "expired", "run_interrupted")
         request = json.loads(run["request_json"])
         chat._assistant_message(conn, run["conversation_id"], request["message_id"], response)
-        conn.execute("UPDATE chat_runs SET status=?,result_json=?,callback_hash=NULL,error=?,completed_at=CURRENT_TIMESTAMP WHERE id=?", (status, chat.json_text(response), response.get("reply") if status == "failed" else None, run["id"]))
+        error = (response.get("error_code") or response.get("reply")) if status == "failed" else None
+        conn.execute("UPDATE chat_runs SET status=?,result_json=?,callback_hash=NULL,error=?,completed_at=CURRENT_TIMESTAMP WHERE id=?", (status, chat.json_text(response), error, run["id"]))
         event(conn, run["conversation_id"], "run", {"run_id": run["id"], "status": status})
         conn.commit()
         return response

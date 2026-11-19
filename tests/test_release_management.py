@@ -105,6 +105,11 @@ def test_volatile_profile_contains_no_persistent_state(tmp_path, monkeypatch):
     school = provider['config']['providers']['school']
     assert '/api/internal/school' in school['baseURL']
     assert 'LAB_DSH_RELAY_TOKEN' in school['headers']['Authorization']
+    assert school['api'] == 'openai-responses'
+    assert school['reasoning'] == 'high'
+    assert school['timeoutMs'] == '300000'
+    assert school['compat']['supportsDeveloperRole'] == 'false'
+    assert school['compat']['supportsMaxOutputTokens'] == 'true'
     assert school['models'][0]['maxTokens'] == '1000'
     assert 'synthetic-relay-token' not in overlay
     assert json.loads((profile / 'package.json').read_text())['dsh']['profile']['bundles'] == ['lab']

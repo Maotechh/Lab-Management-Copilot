@@ -2,10 +2,16 @@
   config:
     providers:
       school:
+        api: openai-responses
         baseURL: !!js (process.env.LAB_CALLBACK_URL ?? 'http://127.0.0.1:8000') + '/api/internal/school'
         headers:
           Authorization: !!js |
             'Bearer ' + process.env.LAB_DSH_RELAY_TOKEN
+        reasoning: high
+        timeoutMs: 300000
+        compat:
+          supportsDeveloperRole: false
+          supportsMaxOutputTokens: true
         models:
           - id: deepseek-pro
             input: [text, image]
