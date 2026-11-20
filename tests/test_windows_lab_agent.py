@@ -78,8 +78,16 @@ def test_open_powershell_console_receives_command_and_returns_result():
             assert result.stdout.splitlines() == ["\u4e2d\u6587", "fixture stderr"]
             piped = invoke("run", "--stdin", input_text="printf fixture\n")
             assert piped.returncode == 17, piped.stderr
-            rejected = invoke("--pid", str(os.getpid()), "check")
-            assert rejected.returncode == 125
+            with subprocess.Popen(
+                [str(powershell), "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"],
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+            ) as unrelated:
+                try:
+                    rejected = invoke("--pid", str(unrelated.pid), "check")
+                    assert rejected.returncode == 125
+                    assert "No idle hxsy-zngl prompt found" in rejected.stderr
+                finally:
+                    unrelated.terminate()
         finally:
             console.terminate()
 
