@@ -1,5 +1,7 @@
 # 贡献指南 (Contributing Guidelines)
 
+Windows 开发者可以直接使用 PowerShell 检查校内网站和聊天错误，也可以从学校堡垒机取得服务器诊断报告。参见 [Windows 开发与故障诊断](deploy/WINDOWS-DIAGNOSTICS.md)。
+
 感谢你考虑为 **耗材智能管理助手 (Lab-Management-Copilot)** 做出贡献！
 
 ## 快速开始

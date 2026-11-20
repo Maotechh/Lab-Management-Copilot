@@ -320,11 +320,28 @@ async function ensureChatConversationOnce() {
 
 function renderChatRuns(runs, activities = []) {
   const labels = {queued:'排队中',running:'正在处理',failed:'处理失败',cancelled:'已取消',completed:'已完成'};
-  $('#chatRunStatus').innerHTML = runs.filter(run => ['queued','running','failed','cancelled'].includes(run.status)).slice(0,8).map(run =>
-    `<div class="run-status" data-status="${escapeHtml(run.status)}"><span>${escapeHtml(run.actor)}：${run.cancel_requested?'正在取消':labels[run.status]}${run.error ? `，${escapeHtml(run.error)}` : ''}</span>${['queued','running'].includes(run.status) ? `<button type="button" data-cancel-run="${escapeHtml(run.run_id)}" ${run.cancel_requested?'disabled':''}>取消运行</button>` : ''}</div>${activities.filter(entry=>entry.run_id===run.run_id).map(entry=>`<details class="chat-tool-process"><summary>${escapeHtml(toolActivityLabel(entry.name))}</summary><div class="chat-tool-details">${entry.error?escapeHtml(entry.error):run.status==='running'?'工具已经返回结果，助手正在继续处理':'工具结果已经保存'}</div></details>`).join('')}`).join('');
+  $('#chatRunStatus').innerHTML = runs.filter(run => ['queued','running','failed','cancelled'].includes(run.status)).slice(0,8).map(run => {
+    const runId = escapeHtml(run.run_id);
+    const copy = run.status === 'failed' && /^[0-9a-f]{32}$/.test(run.run_id)
+      ? `<button type="button" class="quiet" data-copy-run="${runId}">复制运行编号</button>`
+      : '';
+    return `<div class="run-status" data-status="${escapeHtml(run.status)}"><span>${escapeHtml(run.actor)}：${run.cancel_requested?'正在取消':labels[run.status]}${run.error ? `，${escapeHtml(run.error)}` : ''}</span>${copy}${['queued','running'].includes(run.status) ? `<button type="button" data-cancel-run="${runId}" ${run.cancel_requested?'disabled':''}>取消运行</button>` : ''}</div>${activities.filter(entry=>entry.run_id===run.run_id).map(entry=>`<details class="chat-tool-process"><summary>${escapeHtml(toolActivityLabel(entry.name))}</summary><div class="chat-tool-details">${entry.error?escapeHtml(entry.error):run.status==='running'?'工具已经返回结果，助手正在继续处理':'工具结果已经保存'}</div></details>`).join('')}`;
+  }).join('');
   state.activeChatRun = runs.find(run=>['running','queued'].includes(run.status));
   window.updateComposerState?.();
 }
+
+$('#chatRunStatus').addEventListener('click', async event => {
+  const button = event.target.closest('[data-copy-run]');
+  if (!button) return;
+  const runId = button.dataset.copyRun;
+  try {
+    await navigator.clipboard.writeText(runId);
+    toast('运行编号已复制');
+  } catch {
+    window.prompt('请手动复制运行编号', runId);
+  }
+});
 
 function toolActivityLabel(name) {
   return {inventory_search:'查询耗材',workflow_query:'查询业务记录',history_search:'查询历史',prepare_attachment:'核对实验清单',inventory_import_preview:'预览表格导入',business_preview:'生成业务预览',export_inventory:'导出库存',read_attachment:'读取附件',analyze_attachments:'分析附件',export_task:'导出任务',export_history:'导出历史'}[name] || '处理资料';
