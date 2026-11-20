@@ -11,17 +11,30 @@ import secrets
 import subprocess
 import sys
 import time
+from contextlib import ExitStack
 from ctypes import wintypes as w
 from pathlib import Path
 
 HOST = "hxsy-zngl"
 PROMPT = re.compile(r"[A-Za-z0-9_.-]+@" + HOST + r":[^\r\n]*[#$] ")
-CLIENTS = {"ssh.exe", "powershell.exe", "pwsh.exe", "accessclient.exe", "putty.exe", "plink.exe"}
+CLIENTS = ("ssh.exe", "plink.exe", "powershell.exe", "pwsh.exe", "cmd.exe", "putty.exe", "accessclient.exe")
 CAPTURE_ROWS = 240
+MISSING_CONSOLE_ERRORS = {6, 87}
 
 
 class ConsoleError(RuntimeError):
     pass
+
+
+class ConsoleAttachError(ConsoleError):
+    def __init__(self, pid, code):
+        self.code = code
+        detail = {
+            5: "Access denied. Open lab-agent in the same Windows session and at the same elevation as AccessClient.",
+            6: "This PID has no attachable console. Try lab-agent check --diagnose without --pid.",
+            87: "This PID is no longer available. Open AccessClient and rerun lab-agent check.",
+        }.get(code, "Run lab-agent check --diagnose.")
+        super().__init__(f"Cannot attach to console PID {pid} (Windows error {code}). {detail}")
 
 
 class Coord(c.Structure):
@@ -85,7 +98,7 @@ class Console:
         # Only the worker detaches. Its standard streams are pipes back to the CLI.
         self.detach()
         if not self.attach(self.pid):
-            raise ConsoleError(f"Cannot attach to console PID {self.pid} (Windows error {c.get_last_error()}).")
+            raise ConsoleAttachError(self.pid, c.get_last_error())
         try:
             for name, access in (("CONIN$", 0xC0000000), ("CONOUT$", 0x80000000)):
                 handle = self.open(name, access, 3, None, 3, 0, None)
@@ -155,7 +168,7 @@ class Console:
             raise ConsoleError("Terminal input was interrupted. Check the AccessClient window before retrying.")
 
 
-def find_console(preferred):
+def find_console(preferred, diagnose=False):
     # Process names suffice. The AccessClient command line may contain a login ticket.
     if preferred is None:
         tasklist = Path(os.environ["SystemRoot"]) / "System32/tasklist.exe"
@@ -163,30 +176,42 @@ def find_console(preferred):
             [str(tasklist), "/FO", "CSV", "/NH"], encoding="mbcs", errors="replace", timeout=8,
         )
         candidates = [
-            int(row[1]) for row in csv.reader(listing.splitlines())
+            (row[0].lower(), int(row[1])) for row in csv.reader(listing.splitlines())
             if len(row) >= 2 and row[0].lower() in CLIENTS and row[1].isdigit()
         ]
+        candidates.sort(key=lambda candidate: CLIENTS.index(candidate[0]))
     else:
-        candidates = [preferred]
+        candidates = [("Selected process", preferred)]
     seen = set()
     available = []
-    for pid in candidates:
+    for name, pid in candidates:
         if pid in seen:
             continue
         try:
             with Console(pid) as terminal:
-                seen.update(terminal.members())
+                members = terminal.members()
+                seen.update(members)
                 _, current = terminal.screen()
-                if PROMPT.fullmatch(current):
-                    available.append(pid)
-        except ConsoleError:
+                ready = PROMPT.fullmatch(current) is not None
+                if ready:
+                    others = [member for member in members if member not in {pid, os.getpid()}]
+                    available.append([pid, *others])
+                detail = f"ready at {HOST}" if ready else f"no idle {HOST} prompt"
+        except ConsoleError as error:
             if preferred is not None:
                 raise
+            detail = str(error)
+        if diagnose:
+            print(f"{name} (PID {pid}): {detail}", file=sys.stderr)
     if not available:
-        raise ConsoleError(f"No idle {HOST} prompt found. Open the lab in AccessClient and wait for the Linux prompt.")
+        raise ConsoleError(
+            f"No idle {HOST} prompt found. Open the lab in AccessClient and wait for the Linux prompt. "
+            "Run lab-agent check --diagnose for console details. If AccessClient opens in Windows Terminal, "
+            "try Windows Console Host as the default terminal application and reconnect."
+        )
     if len(available) > 1:
         raise ConsoleError("Multiple laboratory consoles found. Close the extra ones or select --pid: "
-                           + ", ".join(map(str, available)))
+                           + ", ".join(str(pids[0]) for pids in available))
     return available[0]
 
 
@@ -245,10 +270,17 @@ def completed_output(rows, token):
     return None
 
 
-def execute(pid, command, timeout):
+def execute(pids, command, timeout):
     token = secrets.token_hex(5)
     line = command_frame(command, token)
-    with Console(pid) as terminal:
+    with ExitStack() as console:
+        for pid in pids:
+            try:
+                terminal = console.enter_context(Console(pid))
+                break
+            except ConsoleAttachError as error:
+                if error.code not in MISSING_CONSOLE_ERRORS or pid == pids[-1]:
+                    raise
         _, current = terminal.screen()
         if not PROMPT.fullmatch(current):
             raise ConsoleError(f"The selected console is no longer at the {HOST} prompt.")
@@ -277,11 +309,11 @@ def worker(args):
             msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError as exc:
             raise ConsoleError("Another lab-agent command is running. Wait for it to finish.") from exc
-        pid = find_console(args.pid)
+        pids = find_console(args.pid, diagnose=getattr(args, "diagnose", False))
         if args.mode == "check":
-            print(f"AccessClient console ready: {HOST} (PID {pid})")
+            print(f"AccessClient console ready: {HOST} (PID {pids[0]})")
             return 0
-        return execute(pid, args.command, args.timeout)
+        return execute(pids, args.command, args.timeout)
 
 
 def main(arguments):
@@ -289,7 +321,8 @@ def main(arguments):
     parser.add_argument("--pid", type=int, help="select a console process if more than one lab is open")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     modes = parser.add_subparsers(dest="mode")
-    modes.add_parser("check", help="find an open AccessClient session")
+    check = modes.add_parser("check", help="find an open AccessClient session")
+    check.add_argument("--diagnose", action="store_true", help="show candidate processes and Windows errors")
     run = modes.add_parser("run", help="run one Bash command")
     run.add_argument("--timeout", type=int, default=45)
     run.add_argument("--stdin", action="store_true", help="read the UTF-8 command from standard input")
@@ -318,6 +351,7 @@ def main(arguments):
             [*invocation, *values], stdin=subprocess.DEVNULL, capture_output=True,
             encoding="utf-8", errors="replace", timeout=hang_limit + 20,
             env=dict(os.environ, PYTHONIOENCODING="utf-8"),
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         sys.stdout.write(result.stdout)
         sys.stderr.write(result.stderr)
@@ -326,7 +360,7 @@ def main(arguments):
     if args.mode == "run":
         return invoke(["run", "--timeout", str(args.timeout), "--", args.command])
     if args.mode == "check":
-        return invoke(["check"])
+        return invoke(["check", "--diagnose"] if args.diagnose else ["check"])
     if invoke(["check"]):
         return 125
     if not sys.stdin.isatty():

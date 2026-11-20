@@ -70,6 +70,9 @@ def test_open_powershell_console_receives_command_and_returns_result():
                 assert time.monotonic() < deadline, check.stderr
                 time.sleep(0.2)
             assert f"PID {console.pid}" in check.stdout
+            diagnosis = invoke("check", "--diagnose")
+            assert diagnosis.returncode == 0, diagnosis.stderr
+            assert f"powershell.exe (PID {console.pid}): ready at hxsy-zngl" in diagnosis.stderr
             result = invoke("run", "--timeout", "8", "printf fixture")
             assert result.returncode == 17, (result.stdout, result.stderr)
             assert result.stdout.splitlines() == ["\u4e2d\u6587", "fixture stderr"]
@@ -79,6 +82,21 @@ def test_open_powershell_console_receives_command_and_returns_result():
             assert rejected.returncode == 125
         finally:
             console.terminate()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Requires native Windows console APIs")
+def test_explicit_pid_without_console_reports_windows_error_six():
+    with subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        creationflags=subprocess.DETACHED_PROCESS,
+    ) as detached:
+        try:
+            result = invoke("--pid", str(detached.pid), "check")
+            assert result.returncode == 125
+            assert f"Cannot attach to console PID {detached.pid} (Windows error 6)" in result.stderr
+            assert "lab-agent check --diagnose without --pid" in result.stderr
+        finally:
+            detached.terminate()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Requires native Windows OpenSSH")

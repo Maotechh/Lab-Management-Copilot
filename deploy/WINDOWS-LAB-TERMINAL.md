@@ -53,7 +53,11 @@ date
 
 运行时将原 AccessClient 窗口留在提示符。每次命令在自己的 Bash 进程执行，可以用 `cd /目录 && 命令` 指定工作目录。标准输出和错误输出会合并，在第二个 PowerShell 中显示，退出状态可通过 `$LASTEXITCODE` 读取。原窗口通过 Base64 传递输出文本，以便工具还原换行和中文。如果日志超过控制台的容量，可以用 `-n` 或 `tail` 分段查询。如果超时，先核对实际执行结果，再决定是否重试。
 
-找不到提示符时，确认原会话仍显示 Linux 提示符。若 Windows Terminal 的标签页无法读取控制台缓冲区，可以在 Windows 设置中将默认终端应用设为 **Windows Console Host**，然后从 AccessClient 重新连接。出现多个匹配时，可关闭多余会话，或使用工具列出的进程编号，例如 `lab-agent --pid 1234 run 'hostname'`。
+## 控制台连接错误
+
+在第二个 PowerShell 运行 `lab-agent check --diagnose`，工具会列出候选进程和 Windows 错误编号。`Windows error 6` 表示所选进程没有可连接的控制台。使用 `check --diagnose` 自动选择进程。只在结果显示多个实验室会话时，才用工具列出的 PID 明确选择，例如 `lab-agent --pid 1234 run 'hostname'`。
+
+若自动查找仍找不到会话，确认 AccessClient 的窗口还显示 Linux 提示符。如果该窗口由 Windows Terminal 承载，在 Windows Terminal 的「设置 → 启动 → 默认终端应用程序」选择 **Windows Console Host**。从 AccessClient 重新连接后，再运行 `lab-agent check --diagnose`。`Windows error 5` 则应核对两个窗口是否由同一 Windows 用户、以相同的管理员权限运行。
 
 可以把下一段交给 AI。
 
