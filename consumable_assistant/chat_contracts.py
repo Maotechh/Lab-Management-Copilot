@@ -17,7 +17,13 @@ class Payload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class Stock(Payload):
+class Scoped(Payload):
+    category: Text | None = None
+    lab: Text | None = None
+    location_code: Text | None = None
+
+
+class Stock(Scoped):
     item_id: ID
     action: Literal["inbound", "consume", "borrow", "return", "adjust", "count", "threshold", "state"]
     quantity: Quantity
@@ -44,7 +50,7 @@ class Stock(Payload):
             raise ValueError("此库存操作缺少必要资料：" + "、".join(required))
 
 
-class Line(Payload):
+class Line(Scoped):
     item_id: ID
     action: Literal["consume", "borrow"]
     unit: str | None = None
@@ -84,7 +90,7 @@ class Purchase(Payload):
     note: str | None = None
 
 
-class PreparationLine(Payload):
+class PreparationLine(Scoped):
     item_ids: list[ID] = Field(default_factory=list, max_length=100)
     item_name: Text | None = None
     spec: Text | None = None
@@ -176,6 +182,10 @@ CONTRACTS = {
     "prepare": contract("Prepare", preview_id=(Text, ...), selected_rows=(list[ID], ...), actions=(dict[str, str], {})),
     "prepare_remap": contract("PrepareRemap", preview_id=(Text, ...), row_number=(ID, ...), item_id=(ID, ...)),
     "undo": contract("Undo", event_id=(ID, ...)),
+    "undo_batch": contract("UndoBatch", batch_id=(Text, ...), item_ids=(list[ID], ...)),
+    "archive_item": contract("ArchiveItem", item_id=(ID, ...), note=(Text, ...)),
+    "save_reference": contract("SaveReference", preview_id=(Text, ...)),
+    "remove_reference": contract("RemoveReference", file_id=(ID, ...)),
 }
 
 

@@ -43,10 +43,12 @@
                   <option value="物理化学">物理化学</option>
                 </select>
                 <label class="inline-check"><input id="lowStockFilter" type="checkbox" />只看预警</label>
+                <label class="inline-check"><input id="missingThreshold" type="checkbox" />未设预警阈值</label>
                 <button id="searchBtn"><i data-lucide="search" class="icon-sm"></i>查询</button>
               </div>
               <button id="searchMore" type="button" class="secondary" hidden>显示下一页</button>
               <div id="searchSummary" class="summary-strip muted">输入耗材名称、规格或位置开始查询。</div>
+              <details id="searchReferences"><summary>历史参考位置（不计入库存）</summary><div id="referenceResults"></div></details>
               <details class="advanced-filter"><summary>按实验时间检查可用数量</summary><div class="form-grid"><label>分配开始时间（上海时间）<input id="searchStart" type="datetime-local" /></label><label>分配结束时间（上海时间）<input id="searchEnd" type="datetime-local" /></label><button id="applyTimeFilter" type="button">应用时间范围</button></div></details>
               <div class="table-wrap responsive-cards">
                 <table>
@@ -95,6 +97,7 @@
                   <input id="courseName" type="text" placeholder="例如：普通化学实验" />
                 </label>
                 <label class="file-picker" for="prepareFile">实验耗材清单<input id="prepareFile" type="file" accept=".xlsx,.xls" /></label>
+                <label>取用科目<input id="prepareCategory" /></label><label>取用房间<input id="prepareLab" /></label><label>取用柜位<input id="prepareLocation" /></label>
                 <button id="prepareBtn"><i data-lucide="file-spreadsheet" class="icon-sm"></i>分析批量清单</button>
                 <button id="consumePrepareBtn" class="primary" disabled><i data-lucide="package-minus" class="icon-sm"></i>扣减已选库存</button>
                 <button id="exportPrepareBtn" class="secondary" disabled><i data-lucide="download" class="icon-sm"></i>导出结果</button>
@@ -137,21 +140,23 @@
                 <div class="toolbar upload-form">
                   <label class="file-picker" for="batchUploadFile">库存数据表<input id="batchUploadFile" type="file" accept=".xlsx,.xls" /></label>
                   <select id="batchUploadMode" aria-label="批量上传方式">
-                    <option value="add">新增并累加数量</option>
-                    <option value="overwrite">覆盖当前数量</option>
+                    <option value="count">实盘：柜内实际还剩</option>
+                    <option value="add">入库：新购数量累加</option>
+                    <option value="reference">历史参考：列为待实盘，不入库</option>
                   </select>
-                  <select id="batchUploadCategory" aria-label="默认类别">
-                    <option value="">表格没有类别时使用默认类别</option>
-                    <option value="普通化学">普通化学</option>
-                    <option value="有机化学">有机化学</option>
-                    <option value="物理化学">物理化学</option>
-                  </select>
+                  <label>科目<input id="batchUploadCategory" list="subjectNames" /></label>
+                  <datalist id="subjectNames"><option>普通化学</option><option>有机化学</option><option>物理化学</option><option>仪器分析</option><option>高级合成</option><option>公共耗材</option><option>分析化学</option></datalist>
+                  <label>实盘房间<input id="countLab" /></label><label>实盘柜位<input id="countLocation" /></label>
+                  <label class="inline-check"><input id="sumCountParts" type="checkbox" />同物多行是分开数的份数，按合计实盘</label>
+                  <button type="button" class="tab secondary" data-tab="prepare">课堂耗用</button>
                   <button id="batchUploadBtn" class="primary"><i data-lucide="upload" class="icon-sm"></i>上传库存表</button>
                 </div>
                 <div class="toolbar"><label class="inline-check"><input id="allowDuplicateImport" type="checkbox" />确认再次登记相同表格</label><label>登记原因<input id="importNote" /></label><button id="confirmImportBtn" disabled><i data-lucide="check" class="icon-sm"></i>确认导入</button></div>
                 <pre id="batchUploadLog"></pre>
               </div>
               <div class="surface">
+                <h2>上传更正</h2><button id="loadBatches" class="secondary"><i data-lucide="history" class="icon-sm"></i>查看上传批次</button><div id="batchList"></div><div id="batchDetails" aria-live="polite"></div>
+                <h2>历史参考附件</h2><button id="loadReferences" class="secondary"><i data-lucide="files" class="icon-sm"></i>查看附件</button><div id="referenceFiles"></div>
                 <h2>位置批量操作</h2>
                 <div class="toolbar location-form">
                   <select id="sourceLocationSelect" aria-label="原位置"><option value="">选择原位置</option></select>

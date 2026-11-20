@@ -83,11 +83,54 @@ function initWorkflows() {
   $('#maintenanceItem').addEventListener('change',fillMaintenance);
   $('#maintenanceAction').addEventListener('change',maintenanceMode);
   document.addEventListener('click',workflowClick);
-  $('#confirmImportBtn').addEventListener('click',async()=>{try{await perform('import',{preview_id:window.importPreview.preview_id,allow_duplicate:$('#allowDuplicateImport').checked,note:value('importNote')});$('#confirmImportBtn').disabled=true;toast('库存表已导入');await refreshAll();}catch(error){showError(error);}});
+  $('#confirmImportBtn').addEventListener('click',async()=>{try{const preview=window.importPreview;if(!preview)return;await perform(preview.reference?'save_reference':'import',preview.reference?{preview_id:preview.preview_id}:{preview_id:preview.preview_id,allow_duplicate:$('#allowDuplicateImport').checked,note:value('importNote')});$('#confirmImportBtn').disabled=true;toast(preview.reference?'历史参考已保存':'库存表已导入');await refreshAll();}catch(error){showError(error);}});
   $('#aiCheckBtn').addEventListener('click',async()=>{const button=$('#aiCheckBtn');button.disabled=true;try{await api('/api/ai/check',{method:'POST'});await loadAI();}catch(error){showError(error);}finally{button.disabled=false;}});
   maintenanceMode();
 }
 function populateSelect(id,options) {const el=$('#'+id);const previous=el.value;el.innerHTML=options.map(([key,label])=>`<option value="${esc(key)}">${esc(label)}</option>`).join('');if([...el.options].some(option=>option.value===previous))el.value=previous;}
+
+$('#missingThreshold').addEventListener('change',()=>loadSearch(false).catch(showError));
+$('#searchReferences').addEventListener('toggle',()=>{if($('#searchReferences').open)loadTeacherReferences().catch(showError);});
+for (const id of ['batchUploadMode','batchUploadCategory','countLab','countLocation','batchUploadFile','sumCountParts']) {
+  $('#'+id).addEventListener('input',()=>{window.importPreview=null;$('#confirmImportBtn').disabled=true;$('#batchUploadLog').textContent='';});
+}
+for (const id of ['prepareCategory','prepareLab','prepareLocation','courseName']) {
+  $('#'+id).addEventListener('input',()=>{state.prepareRows=[];state.prepareSelectedRows.clear();state.preparePreviewId=null;localStorage.removeItem('lab-prepare-preview');renderPrepareRows([]);});
+}
+
+async function showBatch(batchId) {
+  const result=await api('/api/uploads/batches/'+encodeURIComponent(batchId));
+  const eligible=result.rows.filter(row=>row.status==='可撤销').map(row=>row.item_id);
+  $('#batchDetails').innerHTML=tableHtml(['耗材','科目','位置','上传前','上传后','处理'],result.rows.map(row=>[row.item_name,row.category,`${row.lab||''} ${row.location_code||''}`,row.before,row.after,row.status].map(val=>esc(val??''))))+
+    (eligible.length?`<button data-undo-batch="${esc(batchId)}" data-item-ids="${eligible.join(',')}">预览撤销 ${eligible.length} 条</button>`:'没有可直接撤销的条目');
+}
+
+document.addEventListener('click',async event=>{
+  const button=event.target.closest('button');if(!button)return;
+  const data=button.dataset;
+  if(!['loadBatches','loadReferences'].includes(button.id)&&!['stockMore','chatReferences','archiveItem','batchDetail','undoBatch','removeReference'].some(key=>key in data))return;
+  button.disabled=true;
+  try {
+    if('stockMore' in data){
+      const filters=new URLSearchParams(data.stockMore);filters.set('offset',data.offset);filters.set('limit','80');
+      const result=await api('/api/items/search?'+filters);button.previousElementSibling.insertAdjacentHTML('beforeend',teacherStockTable(result.rows));
+      data.offset=String(result.offset+result.displayed_count);button.hidden=!result.has_more;
+    }else if('chatReferences' in data){
+      const result=await api('/api/reference-positions?'+data.chatReferences);button.nextElementSibling.innerHTML=referenceTable(result.rows);button.hidden=true;
+    }else if('archiveItem' in data){
+      const note=window.prompt('停用此条耗材记录的原因');if(!note?.trim())return;
+      await perform('archive_item',{item_id:Number(data.archiveItem),note});await refreshAll();
+    }else if(button.id==='loadBatches'){
+      const result=await api('/api/uploads/batches');$('#batchDetails').replaceChildren();
+      $('#batchList').innerHTML=result.rows.length?tableHtml(['上传时间','文件','操作'],result.rows.map(row=>[esc(formatDate(row.created_at)),esc(row.filename),row.tracked?`<button data-batch-detail="${esc(row.id)}">查看影响</button>`:'旧批次无逐笔关联，请实盘更正'])):'暂无库存上传批次';
+    }else if('batchDetail' in data){await showBatch(data.batchDetail);
+    }else if('undoBatch' in data){await perform('undo_batch',{batch_id:data.undoBatch,item_ids:data.itemIds.split(',').map(Number)});await showBatch(data.undoBatch);await refreshAll();
+    }else if(button.id==='loadReferences'){
+      const result=await api('/api/reference-positions');const files=new Map(result.rows.map(row=>[row.file_id,row]));
+      $('#referenceFiles').innerHTML=files.size?tableHtml(['文件','科目','操作'],Array.from(files.values(),row=>[esc(row.filename),esc(row.category),`<button data-remove-reference="${Number(row.file_id)}">移除参考附件</button>`])):'暂无历史附件';
+    }else if('removeReference' in data){await perform('remove_reference',{file_id:Number(data.removeReference)});$('#loadReferences').click();await refreshAll();}
+  }catch(error){showError(error);}finally{button.disabled=false;}
+});
 function itemOptions() {return [['','选择物品'],...ops.items.map(item=>[item.id,`${item.item_name} ${item.spec||''} · ${item.lab||''} ${item.location_code||''} · 可用 ${item.available_quantity}${item.unit||''}${item.review_reason?' · 待核对':''}`])];}
 function addLessonLine(line={}) {
   const id=newRequestId();const element=document.createElement('div');element.className='lesson-line form-grid';element.dataset.line=id;

@@ -342,6 +342,10 @@ def operate(
     if not checked:
         check_version(item, op.get("version"))
     action = required(op, "action")
+    if action in ("consume", "borrow"):
+        from .matching import require_scope
+
+        require_scope(item, op)
     if op.get("quantity") is None or op.get("quantity") == "":
         raise ValueError("请填写操作数量")
     quantity = convert(item, op.get("quantity"), op.get("unit"))
@@ -354,6 +358,10 @@ def operate(
     note = str(op.get("note") or "")
     if item["review_reason"] and action not in ("count", "threshold"):
         raise ValueError("此物品需要先进行实物清点")
+    if action == "consume":
+        available = max(Decimal(0), number(item["ready"]) - reserved(conn, item_id, op.get("reservation_start"), op.get("reservation_end")))
+        if quantity > available:
+            raise ValueError(f"库存不足（已扣除预留）：本柜可用 {text(available)}{item['unit']}，还差 {text(quantity - available)}{item['unit']}")
     if action in ("inbound", "consume", "adjust", "count"):
         delta = (
             quantity
@@ -460,7 +468,7 @@ def operate(
     }
 
 
-def undo(conn: sqlite3.Connection, event_id: int, actor: str, version: int) -> dict:
+def undo(conn: sqlite3.Connection, event_id: int, actor: str, version: int, *, later_batch_events=()) -> dict:
     old = conn.execute("SELECT * FROM stock_events WHERE id=?", (event_id,)).fetchone()
     if (
         not old
@@ -481,18 +489,18 @@ def undo(conn: sqlite3.Connection, event_id: int, actor: str, version: int) -> d
         conn.execute("UPDATE loans SET outstanding='0' WHERE id=?", (loan["id"],))
     if (
         old["action"] == "inbound"
-        and conn.execute(
-            "SELECT 1 FROM stock_events WHERE item_id=? AND id>? AND action NOT IN ('inbound','threshold','metadata','alert_acknowledge','alert_snooze','alert_remind') LIMIT 1",
+        and any(row[0] not in later_batch_events for row in conn.execute(
+            "SELECT id FROM stock_events WHERE item_id=? AND id>? AND action NOT IN ('inbound','threshold','metadata','alert_acknowledge','alert_snooze','alert_remind')",
             (old["item_id"], event_id),
-        ).fetchone()
+        ))
     ):
         raise Conflict("入库后已有使用、借还、转移或预留，请通过清点更正")
     if (
         old["action"] in ("state", "count", "adjust")
-        and conn.execute(
-            "SELECT 1 FROM stock_events WHERE item_id=? AND id>? LIMIT 1",
+        and any(row[0] not in later_batch_events for row in conn.execute(
+            "SELECT id FROM stock_events WHERE item_id=? AND id>?",
             (old["item_id"], event_id),
-        ).fetchone()
+        ))
     ):
         raise Conflict("后续已有相关操作，请通过实物清点或状态转移更正")
     inverse = {

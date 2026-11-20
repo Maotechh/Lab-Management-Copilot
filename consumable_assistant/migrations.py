@@ -90,6 +90,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         migrate_exports(conn)
         migrate_preparation_history(conn)
         migrate_procurement(conn)
+        migrate_teacher_uploads(conn)
         return
     database = conn.execute("PRAGMA database_list").fetchone()[2]
     if database:
@@ -122,6 +123,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         migrate_exports(conn)
         migrate_preparation_history(conn)
         migrate_procurement(conn)
+        migrate_teacher_uploads(conn)
     except Exception:
         conn.rollback()
         raise
@@ -443,3 +445,16 @@ def migrate_procurement(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE TABLE procurement_demands (id INTEGER PRIMARY KEY AUTOINCREMENT, preparation_id INTEGER REFERENCES preparations(id), item_name TEXT NOT NULL, spec TEXT NOT NULL, unit TEXT NOT NULL, quantity TEXT NOT NULL, received TEXT NOT NULL DEFAULT '0', actor TEXT NOT NULL, expected_at TEXT, note TEXT, status TEXT NOT NULL DEFAULT 'draft', version INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
         conn.execute("CREATE TABLE procurement_receipts (id INTEGER PRIMARY KEY AUTOINCREMENT, demand_id INTEGER NOT NULL REFERENCES procurement_demands(id), item_id INTEGER NOT NULL REFERENCES inventory_items(id), quantity TEXT NOT NULL, event_id INTEGER NOT NULL REFERENCES stock_events(id), created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
         conn.execute("INSERT INTO schema_migrations(version,report) VALUES (9,?)", (json.dumps({"unregistered_material_procurement": True}),))
+
+
+def migrate_teacher_uploads(conn):
+    if conn.execute("SELECT 1 FROM schema_migrations WHERE version=10").fetchone():
+        return
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("CREATE TABLE upload_events(batch_id TEXT NOT NULL REFERENCES upload_previews(id), event_id INTEGER PRIMARY KEY REFERENCES stock_events(id), item_id INTEGER NOT NULL REFERENCES inventory_items(id), created_item INTEGER NOT NULL)")
+        conn.execute("CREATE INDEX idx_upload_events_batch ON upload_events(batch_id,item_id)")
+        conn.execute("CREATE TABLE reference_files(id INTEGER PRIMARY KEY, filename TEXT NOT NULL, category TEXT NOT NULL, digest TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, actor TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+        conn.execute("CREATE UNIQUE INDEX idx_reference_active ON reference_files(digest,category) WHERE active=1")
+        conn.execute("CREATE TABLE reference_positions(id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES reference_files(id), sheet TEXT, source_row INTEGER, item_name TEXT NOT NULL, spec TEXT, unit TEXT, lab TEXT, location_code TEXT, original_location TEXT, original_quantity TEXT)")
+        conn.execute("INSERT INTO schema_migrations(version,report) VALUES (10,'{\"teacher_uploads\":true}')")

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from . import ledger as stock
 from .importer import add_aliases
+from .matching import SCOPE_FIELDS, in_scope, require_scope
 from .normalization import normalize_text, stable_key
 
 
@@ -212,16 +213,21 @@ def preview_import(
     mode: str,
     category: str = "",
     commit: bool = True,
+    *, lab="", location_code="", sum_parts=False,
 ) -> dict:
     from .services import map_upload_row
 
-    if mode not in ("add", "overwrite"):
+    if mode not in ("add", "overwrite", "count"):
         raise ValueError("上传方式无效")
+    scope = {"category": category, "lab": lab, "location_code": location_code}
+    if mode == "count" and not all(str(value or "").strip() for value in scope.values()):
+        raise ValueError("分批实盘必须选择科目、房间和柜位")
     from .attachments import uploaded_frame
 
     df = uploaded_frame(path, arithmetic=True).dropna(how="all")
     df.columns = [str(col).strip() for col in df.columns]
     rows, errors, seen = [], [], set()
+    parts = {}
     for index, row in df.iterrows():
         source = df.attrs["sources"][int(index)]
         try:
@@ -230,6 +236,17 @@ def preview_import(
                 continue
             if not mapped["unit"]:
                 raise ValueError("必须填写数量单位")
+            if mode == "count":
+                for field in SCOPE_FIELDS:
+                    if mapped[field] and mapped[field] != scope[field]:
+                        raise ValueError("表格条目不在本次清点范围")
+                    mapped[field] = scope[field]
+                mapped["threshold"] = None
+                matches = count_matches(conn, mapped)
+                if len(matches) > 1:
+                    raise ValueError("本柜有多条符合记录，请在表格补全规格、品牌")
+                mapped["item_key"] = matches[0]["item_key"] if matches else stable_key([
+                    mapped[key] for key in (*SCOPE_FIELDS, "item_name", "spec", "brand", "unit")])
             if (
                 mapped["threshold"] is not None
                 and stock.number(mapped["threshold"]) < 0
@@ -246,7 +263,7 @@ def preview_import(
                 {
                     "row_number": int(index) + 2,
                     **source,
-                    "duplicate_row": signature in seen,
+                    "duplicate_row": signature in seen if mode != "count" else False,
                     "item_id": old["id"] if old else None,
                     "version": balance["version"] if balance else None,
                     "before": balance["ready"] if balance else "0",
@@ -254,8 +271,17 @@ def preview_import(
             )
             seen.add(signature)
             rows.append(mapped)
+            if mode == "count":
+                group = parts.setdefault(mapped["item_key"], [])
+                group.append(mapped)
+                if len(group) > 1 and not sum_parts:
+                    raise ValueError(f"同一条目重复（首行：{group[0]['source_sheet']} 第 {group[0]['source_row']} 行）；请修正，或确认这些行是分开数的份数")
         except ValueError as exc:
             errors.append({"row_number": int(index) + 2, **source, "error": str(exc)})
+    for group in parts.values():
+        group[0]["count_total"] = stock.text(sum(stock.number(row["quantity"]) for row in group))
+        for row in group[1:]:
+            row["count_part"] = True
     token = uuid.uuid4().hex
     file_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     normalized = [
@@ -297,9 +323,17 @@ def preview_import(
     }
 
 
+def count_matches(conn, row):
+    candidates = conn.execute("""SELECT i.id,i.item_key,i.category,i.lab,i.location_code FROM inventory_items i JOIN stock_balances b ON b.item_id=i.id
+        WHERE b.active=1 AND i.category=? AND i.location_code=? AND i.normalized_name=? AND i.unit=?
+        AND (? IS NULL OR i.spec=?) AND (? IS NULL OR i.brand=?)""",
+        tuple(row[key] for key in ("category", "location_code", "normalized_name", "unit", "spec", "spec", "brand", "brand")))
+    return [item for item in candidates if in_scope(dict(item), row)]
+
+
 def commit_import(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
     preview = conn.execute(
-        "SELECT * FROM upload_previews WHERE id=?", (data.get("preview_id"),)
+        "SELECT * FROM upload_previews WHERE id=? AND mode IN ('add','overwrite','count')", (data.get("preview_id"),)
     ).fetchone()
     if not preview or preview["committed"]:
         raise ValueError("上传预览不存在或已执行")
@@ -314,26 +348,32 @@ def commit_import(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
     ):
         raise stock.Conflict("该表格已导入，再次登记需要明确确认及填写原因")
     all_rows = json.loads(preview["rows"])
-    rows = [row for row in all_rows if not row["duplicate_row"]]
+    rows = [row for row in all_rows if not row["duplicate_row"] and not row.get("count_part")]
     if not rows:
         raise ValueError("没有可导入的记录")
     for row in rows:
+        if preview["mode"] == "count":
+            matches = count_matches(conn, row)
+            if [item["id"] for item in matches] != ([row["item_id"]] if row["item_id"] else []):
+                raise stock.Conflict("清点范围内的记录已变化，请重新预览")
+        if not row["item_id"] and conn.execute("SELECT 1 FROM inventory_items WHERE item_key=?", (row["item_key"],)).fetchone():
+            raise stock.Conflict("记录已存在或已停用，请重新核对")
         if row["item_id"]:
             stock.check_version(
                 stock.ensure_balance(conn, row["item_id"]), row["version"]
             )
     for row in rows:
-        item_id = row["item_id"] or create_item(conn, row)
+        item_id = row["item_id"] or create_item(conn, {**row, "threshold": None})
         item = stock.ensure_balance(conn, item_id)
-        if item["review_reason"]:
+        if item["review_reason"] and preview["mode"] != "count":
             raise ValueError("上传涉及待清点物品，请先完成实物清点")
-        stock.operate(
+        result = stock.operate(
             conn,
             {
                 "item_id": item_id,
                 "version": item["version"],
                 "action": "inbound" if preview["mode"] == "add" else "count",
-                "quantity": row["quantity"],
+                "quantity": row.get("count_total", row["quantity"]),
                 "unit": row["unit"],
                 "note": (
                     f"库存表 {preview['filename']} {row.get('source_sheet') or ''} "
@@ -342,8 +382,13 @@ def commit_import(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
             },
             actor,
         )
+        def record_event(result):
+            conn.execute("INSERT INTO upload_events(batch_id,event_id,item_id,created_item) VALUES (?,?,?,?)",
+                         (preview["id"], result["id"], item_id, int(not row["item_id"])))
+
+        record_event(result)
         if row["threshold"] is not None:
-            stock.operate(
+            result = stock.operate(
                 conn,
                 {
                     "item_id": item_id,
@@ -353,6 +398,7 @@ def commit_import(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
                 },
                 actor,
             )
+            record_event(result)
     source_ids = {}
     for row in all_rows:
         identity = (row["item_key"], str(row["quantity"]), str(row.get("threshold")), json.dumps(row["raw"], ensure_ascii=False, sort_keys=True))
@@ -384,12 +430,14 @@ def capacities(value: str) -> list[str]:
 
 
 def strict_matches(
-    conn: sqlite3.Connection, name: str, spec: str | None, unit: str | None
+    conn: sqlite3.Connection, name: str, spec: str | None, unit: str | None, scope: dict
 ) -> tuple[list[dict], list[dict]]:
     from .matching import same_material
     from .services import search_items
 
-    candidates = search_items(conn, " ".join(part for part in (name, spec) if part), limit=1_000_000)
+    candidates = search_items(conn, " ".join(part for part in (name, spec) if part),
+                              category=scope.get("category"), lab=scope.get("lab"), limit=1_000_000,
+                              location_code=scope.get("location_code"))
     matches = []
     for candidate in candidates:
         item = stock.view(conn, candidate["id"])
@@ -406,7 +454,7 @@ def strict_matches(
         (normalize_text(item["spec"]), item["unit"], normalize_text(item["brand"]))
         for item in matches
     }
-    if not spec and len(variants) > 1:
+    if (not spec and len(variants) > 1) or len({tuple(item.get(field) for field in SCOPE_FIELDS) for item in matches}) > 1:
         matches = []
     return matches, candidates
 
@@ -420,13 +468,14 @@ def allocate_preparation(
     for original in rows:
         row = dict(original)
         matches, candidates = strict_matches(
-            conn, row["name"], row["spec"], row["unit"]
+            conn, row["name"], row["spec"], row["unit"], row
         )
         chosen = (selections or {}).get(
             str(row["row_number"]), row.get("selected_item_id")
         )
         if chosen:
             item = stock.view(conn, int(chosen))
+            require_scope(item, row)
             if not item["active"] or item["review_reason"]:
                 raise ValueError("选定物品需要清点或已经停用")
             from .matching import same_material
@@ -477,7 +526,7 @@ def allocate_preparation(
                     "unit": item["unit"],
                     "quantity": stock.text(ready),
                     "allocated_quantity": stock.text(take),
-                    "lab": item["lab"],
+                    "category": item["category"], "lab": item["lab"],
                     "location_code": item["location_code"],
                     "version": item["version"],
                 }
@@ -542,7 +591,7 @@ def remap_preparation(conn: sqlite3.Connection, data: dict) -> dict:
 
 
 def preparation(
-    conn: sqlite3.Connection, path: Path, course: str = "", commit: bool = True
+    conn: sqlite3.Connection, path: Path, course: str = "", commit: bool = True, *, scope=None
 ) -> dict:
     from .attachments import uploaded_frame
     from .services import resolve_column
@@ -555,6 +604,9 @@ def preparation(
         "unit": ["数量单位", "单位"],
         "spec": ["规格型号", "规格", "型号"],
         "course": ["课程", "课程名称"],
+        "category": ["科目", "取用科目", "类别", "学科"],
+        "lab": ["实验室", "房间", "取用房间"],
+        "location_code": ["柜位", "位置", "柜号", "位置编号", "存放位置"],
         "experiment": ["实验", "实验名称", "实验项目"],
         "action": ["使用方式", "动作"],
     }
@@ -590,10 +642,10 @@ def preparation(
         )
         row["action"] = action if action in ("consume", "borrow") else ""
         rows.append(row)
-    return checklist(conn, rows, path.name, commit=commit)
+    return checklist(conn, rows, path.name, commit=commit, scope=scope)
 
 
-def checklist(conn, rows: list[dict], filename: str, *, commit=False, attachment_id=None, replaces=None):
+def checklist(conn, rows: list[dict], filename: str, *, commit=False, attachment_id=None, replaces=None, scope=None):
     from pydantic import BaseModel, ConfigDict, Field
 
     class ChecklistRow(BaseModel):
@@ -604,6 +656,9 @@ def checklist(conn, rows: list[dict], filename: str, *, commit=False, attachment
         required_quantity: str | int | float
         action: str = ""
         course: str = "未命名课程"
+        category: str | None = None
+        lab: str | None = None
+        location_code: str | None = None
         experiment: str = "未命名实验"
         source_sheet: str = "照片"
         source_row: int = Field(default=1, ge=1)
@@ -614,6 +669,11 @@ def checklist(conn, rows: list[dict], filename: str, *, commit=False, attachment
     prepared = []
     for index, value in enumerate(rows):
         row = ChecklistRow.model_validate(value).model_dump()
+        for field in SCOPE_FIELDS:
+            selected = (scope or {}).get(field)
+            if selected and row[field] and selected != row[field]:
+                raise ValueError(f"第 {index + 1} 项与选定取用范围不一致")
+            row[field] = selected or row[field]
         amount = stock.number(row["required_quantity"])
         if amount <= 0:
             raise ValueError(f"第 {index + 1} 项需求数量必须大于零")
@@ -659,6 +719,10 @@ def consume_preparation(conn: sqlite3.Connection, data: dict, actor: str) -> dic
     results = []
     for row in rows:
         action = (data.get("actions") or {}).get(str(row["row_number"]), row["action"])
+        if not all(field in row for field in SCOPE_FIELDS):
+            raise ValueError("旧预览未核对取用范围，请重新上传清单")
+        if stock.number(row["missing_quantity"]) > 0:
+            raise ValueError(f"{row['name']}：当前可分配 {row['allocated_quantity']}，还差 {row['missing_quantity']}{row['unit'] or ''}；请核对取用位置和需求数量")
         if (
             stock.number(row["missing_quantity"]) > 0
             or not row["locations"]
@@ -675,6 +739,7 @@ def consume_preparation(conn: sqlite3.Connection, data: dict, actor: str) -> dic
                         {
                             "item_id": location["item_id"],
                             "action": "consume",
+                            **{field: row.get(field) for field in SCOPE_FIELDS},
                             "quantity": location["allocated_quantity"],
                             "unit": location["unit"],
                             "note": f"{row['course']} / {row['experiment']}",
@@ -730,6 +795,7 @@ def schedule(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
     amounts: dict[int, Decimal] = {}
     for line in lines:
         item = stock.ensure_balance(conn, line["item_id"])
+        require_scope(item, line)
         stock.check_version(item, line.get("version"))
         if item["review_reason"] or not item["active"]:
             raise ValueError("安排中包含待核对或停用物品")

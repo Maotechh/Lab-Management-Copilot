@@ -485,19 +485,22 @@ def rooms():
 
     with connect() as conn:
         return {"rooms": sorted({physical_room(dict(row)) for row in conn.execute(
-            "SELECT lab,location_code FROM inventory_items") if row["lab"]})}
+              "SELECT lab,location_code FROM inventory_items") if row["lab"]}),
+                "categories": [row[0] for row in conn.execute("SELECT category FROM inventory_items WHERE category IS NOT NULL UNION SELECT category FROM reference_files WHERE active=1 ORDER BY 1")]}
 
 
 @app.get("/api/items/search")
 def search(q: str = "", category: str | None = None, lab: str | None = None,
            low_stock: bool = False, limit: int = 80, offset: int = 0,
-           starts_at: str | None = None, ends_at: str | None = None):
+           starts_at: str | None = None, ends_at: str | None = None, location_code: str = '', missing_threshold: bool = False):
     with connect() as conn:
         start = stock.moment(starts_at) if starts_at else None
         end = stock.moment(ends_at) if ends_at else None
         if bool(start) != bool(end) or start and start >= end:
             raise ValueError("请填写有效的开始和结束时间")
-        all_rows = search_items(conn, q, category, lab, low_stock, 1_000_000, start, end)
+        all_rows = search_items(conn, q, category, lab, low_stock, 1_000_000, start, end, location_code=location_code)
+        if missing_threshold:
+            all_rows = [row for row in all_rows if stock.number(row['threshold']) <= 0]
         offset, limit = max(offset, 0), min(max(limit, 1), 2000)
         rows = all_rows[offset:offset + limit]
         units = {}
@@ -581,6 +584,18 @@ def transaction_preview(payload: dict):
 
 
 def dispatch(conn: sqlite3.Connection, kind: str, data: dict, actor: str) -> dict:
+    from . import teacher_uploads
+
+    if kind == 'undo_batch':
+        return teacher_uploads.undo_batch(conn, data, actor)
+    if kind == 'archive_item':
+        return teacher_uploads.archive_item(conn, data, actor)
+    if kind == 'save_reference':
+        return teacher_uploads.save_reference(conn, data, actor)
+    if kind == 'remove_reference':
+        if not conn.execute('UPDATE reference_files SET active=0 WHERE id=? AND active=1', (data['file_id'],)).rowcount:
+            raise ValueError('参考附件已移除或不存在')
+        return {'ok': True, 'file_id': data['file_id']}
     if kind == "mixed":
         operations = data["operations"]
         receipt_items, inbound_items = set(), set()
@@ -931,23 +946,53 @@ async def upload_inventory(
     file: Annotated[UploadFile, File()],
     mode: str = Form("add"),
     category: str = Form(""),
+    lab: str = Form(""), location_code: str = Form(""), sum_parts: bool = Form(False),
 ):
     path = await uploaded(file)
     try:
         with connect() as conn:
-            return flow.preview_import(conn, path, file.filename, mode, category)
+            if mode == 'reference':
+                from .teacher_uploads import preview_reference
+
+                return preview_reference(conn, path, file.filename, category)
+            return flow.preview_import(conn, path, file.filename, mode, category, lab=lab, location_code=location_code, sum_parts=sum_parts)
     finally:
         path.unlink(missing_ok=True)
 
 
 @app.post("/api/prepare/preview")
-async def prepare(file: Annotated[UploadFile, File()], course: str = Form("")):
+async def prepare(file: Annotated[UploadFile, File()], course: str = Form(""), category: str = Form(""),
+                  lab: str = Form(""), location_code: str = Form("")):
     path = await uploaded(file)
     try:
         with connect() as conn:
-            return flow.preparation(conn, path, course)
+            return flow.preparation(conn, path, course, scope={"category": category, "lab": lab, "location_code": location_code})
     finally:
         path.unlink(missing_ok=True)
+
+
+@app.get('/api/uploads/batches')
+def upload_batches():
+    from .teacher_uploads import batches
+
+    with connect() as conn:
+        return {'rows': batches(conn)}
+
+
+@app.get('/api/uploads/batches/{batch_id}')
+def upload_batch(batch_id: str):
+    from .teacher_uploads import batch_detail
+
+    with connect() as conn:
+        return {'rows': batch_detail(conn, batch_id)}
+
+
+@app.get('/api/reference-positions')
+def reference_positions(category: str = '', q: str = '', lab: str = '', location_code: str = ''):
+    from .teacher_uploads import references
+
+    with connect() as conn:
+        return {'rows': references(conn, category, q, lab, location_code)}
 
 
 @app.get("/api/workflows")

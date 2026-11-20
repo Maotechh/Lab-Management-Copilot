@@ -73,8 +73,8 @@ def normalize_history_filters(query: dict) -> dict:
 
 
 UPLOAD_COLUMNS = {
-    "category": ["类别", "分类", "category"],
-    "lab": ["实验室", "所属实验室", "lab"],
+    "category": ["类别", "科目", "分类", "category"],
+    "lab": ["实验室", "房间", "所属实验室", "lab"],
     "location": ["位置", "存放地", "耗材位置", "柜位", "位置编码", "location"],
     "name": ["耗材名称", "产品名", "名称", "物品", "耗材", "item", "product"],
     "spec": ["规格型号", "规格", "型号", "spec"],
@@ -130,12 +130,16 @@ def search_items(
     starts_at: str | None = None,
     ends_at: str | None = None,
     offset: int = 0,
+    location_code: str | None = None,
 ) -> list[dict[str, Any]]:
     params: list[Any] = []
     where: list[str] = ["1 = 1"]
     if category:
         where.append("category = ?")
         params.append(category)
+    if location_code:
+        where.append("location_code = ?")
+        params.append(location_code)
     rows = rows_to_dicts(
         conn.execute(
             f"""
@@ -205,6 +209,9 @@ def search_items(
             key=lambda item: (item["low_stock"], item["updated_at"]), reverse=True
         )
     limited = ranked[max(offset, 0):max(offset, 0) + limit]
+    counted = {row[0] for row in conn.execute("SELECT DISTINCT c.item_id FROM stock_counts c JOIN stock_events e ON e.id=c.event_id WHERE e.action='count' AND e.reversed_by IS NULL")}
+    for item in limited:
+        item['count_status'] = '待核对' if item['review_reason'] else '已实盘' if item['id'] in counted else '未实盘'
     attach_latest_transactions(conn, limited)
     return limited
 

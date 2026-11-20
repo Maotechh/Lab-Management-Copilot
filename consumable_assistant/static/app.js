@@ -491,7 +491,8 @@ function renderToolResult(entry) {
     return `<div class="chat-result"><strong>库存统计</strong><p>匹配耗材记录 ${escapeHtml(data.item_count)} 条，实验室 ${escapeHtml(data.lab_count)} 个，位置 ${escapeHtml(data.location_count)} 个，低于预警阈值 ${escapeHtml(data.low_stock_count)} 条。</p>${tableHtml(['单位','记录数','总拥有','可用','借出','预留','待清洗','维修','待核对'],(data.units || []).map(row=>[escapeHtml(row.unit || '未填写'),escapeHtml(row.item_count),...['owned_quantity','available_quantity','borrowed_quantity','reserved_quantity','cleaning','repair','quarantine'].map(key=>escapeHtml(row[key]))]))}<p class="muted">数量按单位分别统计，借出和预留已计入可用数量计算。</p></div>`;
   }
   if (data.type === 'inventory' || data.type === 'alerts') {
-    return `<div class="chat-result"><strong>${data.type === 'alerts' ? '库存预警' : '物品位置与库存'}</strong>${tableHtml(['耗材','规格','实验室','位置','可用','总拥有'], rows.slice(0,30).map(row=>[escapeHtml(row.item_name),escapeHtml(row.spec || '未填写'),escapeHtml(row.lab),escapeHtml(row.location_code),formatQuantity(row.available_quantity,row.unit),formatQuantity(row.owned_quantity,row.unit)]))}</div>`;
+    const filters=new URLSearchParams(Object.entries(data.search||{}).filter(([,value])=>value!=null));
+    return `<div class="chat-result"><strong>${data.type === 'alerts' ? '库存预警' : '物品位置与库存'} · ${escapeHtml(data.total_count??rows.length)} 条</strong><div data-stock-pages>${teacherStockTable(rows)}</div>${data.next_offset!=null?`<button type="button" class="secondary" data-stock-more="${escapeHtml(filters.toString())}" data-offset="${Number(data.next_offset)}">查看后续位置</button>`:''}${data.reference_count?`<details><summary>历史参考 ${Number(data.reference_count)} 处（不计入库存）</summary><button type="button" data-chat-references="${escapeHtml(filters.toString())}">查看全部参考位置</button><div></div></details>`:''}</div>`;
   }
   if (data.type === 'history') {
     return `<div class="chat-result"><strong>操作记录</strong>${tableHtml(['时间','耗材','动作','数量','操作人'],rows.slice(0,30).map(row=>[formatDate(row.created_at),escapeHtml(row.item_name),escapeHtml(row.action_label),formatDelta(row.delta_quantity,row.unit),escapeHtml(row.actor)]))}</div>`;
@@ -691,6 +692,7 @@ async function loadSearch(append = false) {
   params.set("category", $("#categoryFilter").value);
   params.set("lab", $("#roomFilter").value);
   params.set("low_stock", $("#lowStockFilter").checked ? "true" : "false");
+  params.set('missing_threshold',String($('#missingThreshold').checked));
   const start=$("#searchStart").value,end=$("#searchEnd").value;
   if(start&&end){params.set('starts_at',shanghaiTime(start));params.set('ends_at',shanghaiTime(end));}
   const filters=params.toString();
@@ -702,11 +704,15 @@ async function loadSearch(append = false) {
   $("#searchRows").innerHTML = state.inventoryRows.map(renderInventoryRow).join("") || emptyRow(8, "没有匹配结果");
   $("#searchMore").hidden=!data.has_more;
   renderSearchSummary(data);
+  if ($('#searchReferences').open) await loadTeacherReferences();
   if (window.lucide) window.lucide.createIcons();
 }
 
 async function loadRooms(){
   const data=await api('/api/rooms');const select=$('#roomFilter');
+  const categories=$('#categoryFilter'),previous=categories.value;
+  categories.replaceChildren(new Option('全部科目',''),...(data.categories||[]).map(name=>new Option(name,name)));
+  categories.value=previous;
   select.replaceChildren(new Option('全部房间',''));
   for(const room of data.rooms||[]){const option=document.createElement('option');option.value=room;option.textContent=room+' 房间';select.append(option);}
 }
@@ -723,7 +729,7 @@ function renderSearchSummary(data) {
 }
 
 function renderInventoryRow(row) {
-  const low = row.low_stock ? `<span class="badge danger">低于预警</span>` : `<span class="badge ok">正常</span>`;
+  const low = Number(row.threshold||0)<=0 ? '<span class="badge">未设阈值</span>' : row.low_stock ? `<span class="badge danger">低于预警</span>` : `<span class="badge ok">正常</span>`;
   const spec = row.spec ? escapeHtml(row.spec) : `<span class="muted">无</span>`;
   return `
     <tr>
@@ -731,7 +737,7 @@ function renderInventoryRow(row) {
       <td data-label="实验室">${escapeHtml(row.physical_room || row.lab)}</td>
       <td data-label="耗材" class="name-cell"><button type="button" class="item-link" data-item-detail="${row.id}">${escapeHtml(row.item_name)}</button>${renderAliases(row.aliases)}</td>
       <td data-label="规格">${spec}</td>
-      <td data-label="位置"><strong>${escapeHtml(row.location_code)}</strong></td>
+      <td data-label="位置"><strong>${escapeHtml(row.location_code)}</strong><div>${escapeHtml(row.count_status)}</div></td>
       <td data-label="数量"><strong>可用 ${formatQuantity(row.available_quantity, row.unit)}</strong><div class="muted small-text">总量 ${formatQuantity(row.owned_quantity, row.unit)} · 借出 ${row.borrowed_quantity} · 预留 ${row.reserved_quantity}</div><div class="muted small-text">待清洗 ${row.cleaning} · 维修 ${row.repair} · 待核对 ${row.quarantine}</div>${row.review_reason ? `<span class="badge danger">${escapeHtml(row.review_reason)}</span>` : ''}</td>
       <td data-label="预警">
         <div class="inline-edit">
@@ -739,9 +745,28 @@ function renderInventoryRow(row) {
           <button class="secondary icon-only" data-threshold-id="${row.id}" title="保存预警" aria-label="保存${escapeHtml(row.item_name)}的预警数量"><i data-lucide="save" class="icon-sm"></i></button>
         </div>
       </td>
-      <td data-label="最近状态">${low}${renderLatestTransaction(row.latest_transaction, row.unit)}</td>
+      <td data-label="最近状态">${low}${renderLatestTransaction(row.latest_transaction, row.unit)}<button class="quiet" data-archive-item="${Number(row.id)}" title="停用此耗材记录">停用此条</button></td>
     </tr>
   `;
+}
+
+function teacherStockTable(rows) {
+  return tableHtml(['科目','耗材','规格','房间','柜位','可用','总拥有','清点状态'],rows.map(row=>[
+    row.category,row.item_name,row.spec,row.physical_room||row.lab,row.location_code
+  ].map(value=>escapeHtml(value||'未填写')).concat(formatQuantity(row.available_quantity,row.unit),formatQuantity(row.owned_quantity,row.unit),escapeHtml(row.count_status||'未记录'))));
+}
+
+function referenceTable(rows) {
+  return rows.length?tableHtml(['科目','耗材','规格','房间','柜位','实盘状态','来源'],rows.map(row=>[
+    row.category,row.item_name,row.spec,row.lab,row.location_code,row.counted?'已实盘':'待核对',`${row.filename} · ${row.sheet} 第 ${row.source_row} 行（原位置：${row.original_location||'未注明'}；原行总量：${row.original_quantity??'未注明'} ${row.unit||''}）`
+  ].map(value=>escapeHtml(value||'未注明')))):'暂无匹配参考记录';
+}
+
+async function loadTeacherReferences() {
+  const filters=new URLSearchParams({category:$('#categoryFilter').value,q:$('#searchInput').value.trim(),lab:$('#roomFilter').value});
+  const target=$('#referenceResults');target.dataset.filters=String(filters);
+  const result=await api('/api/reference-positions?'+filters);
+  if(target.dataset.filters===String(filters))target.innerHTML=referenceTable(result.rows);
 }
 
 function renderAliases(aliases) {
@@ -1100,9 +1125,12 @@ async function preparePreview() {
   const form = new FormData();
   form.append("file", file);
   form.append("course", $("#courseName").value.trim());
+  const scopeFields={category:'prepareCategory',lab:'prepareLab',location_code:'prepareLocation'};
+  for (const [field,id] of Object.entries(scopeFields)) form.append(field,document.getElementById(id).value.trim());
   $("#prepareBtn").disabled = true;
   try {
     const data = await api("/api/prepare/preview", { method: "POST", body: form });
+    if(file!== $('#prepareFile').files[0] || Object.entries({...scopeFields,course:'courseName'}).some(([field,id])=>form.get(field)!==document.getElementById(id).value.trim()))return;
     state.prepareRows = data.rows;
     state.preparePreviewId = data.preview_id;
     state.prepareActions = {};
@@ -1136,8 +1164,8 @@ function renderPrepareRows(rows) {
   $("#prepareRows").innerHTML = sortedRows.map((row) => {
     const visibleLocations = (row.locations || []);
     const locations = visibleLocations.map((item) =>
-      `${escapeHtml(item.lab || "")} ${escapeHtml(item.location_code || "")} ${formatQuantity(item.quantity, item.unit)}`
-    ).join("<br>") + ((row.locations || []).length > 4 ? `<br><span class="muted">还有 ${(row.locations || []).length - 4} 个位置</span>` : "");
+      `${escapeHtml(item.category || "")} ${escapeHtml(item.lab || "")} ${escapeHtml(item.location_code || "")}：本次 ${formatQuantity(item.allocated_quantity, item.unit)}`
+    ).join("<br>");
     const statusClass = row.status === "足够" ? "ok" : "danger";
     const enough = Number(row.missing_quantity || 0) <= 0;
     const selected = state.prepareSelectedRows.has(String(row.row_number));
@@ -1347,12 +1375,18 @@ async function batchUploadInventory() {
   form.append("file", file);
   form.append("mode", $("#batchUploadMode").value);
   form.append("category", $("#batchUploadCategory").value);
+  form.append('lab',$('#countLab').value.trim());form.append('location_code',$('#countLocation').value.trim());form.append('sum_parts',String($('#sumCountParts').checked));
+  window.importPreview=null;$('#confirmImportBtn').disabled=true;
   $("#batchUploadBtn").disabled = true;
   try {
     const result = await api("/api/import/upload", { method: "POST", body: form });
+    if (file !== $('#batchUploadFile').files[0] || [...form].some(([field,val])=>({mode:$('#batchUploadMode').value,category:$('#batchUploadCategory').value,lab:$('#countLab').value.trim(),location_code:$('#countLocation').value.trim(),sum_parts:String($('#sumCountParts').checked)})[field] !== val && field!=='file')) return;
     window.importPreview = result;
+    result.reference=form.get('mode')==='reference';
     const sourcePosition = row => `${row.source_sheet ? `${row.source_sheet} ` : ""}第 ${row.source_row ?? row.row_number} 行`;
     $('#batchUploadLog').textContent = `${result.rows.length} 行，${result.errors.length} 行错误${result.duplicate_file ? '，这份表格已经导入过' : ''}\n` + result.rows.map(row=>`${sourcePosition(row)}：${row.item_name}，原数量 ${row.before}，表格数量 ${row.quantity}${row.unit}，${row.item_id?'已有物品':'新增物品'}${row.duplicate_row?'，表内重复行将忽略':''}`).join('\n') + '\n' + result.errors.map(row=>`${sourcePosition(row)}：${row.error}`).join('\n');
+    if ($('#batchUploadMode').value==='count') $('#batchUploadLog').textContent += '\n'+result.rows.filter(row=>row.count_total!==undefined).map(row=>`${row.category} · ${row.lab} ${row.location_code} · ${row.item_name}：实盘合计 ${row.count_total}${row.unit}`).join('\n');
+    if(result.reference) $('#batchUploadLog').textContent=result.rows.map(row=>`${sourcePosition(row)}：${row.category} · ${row.name} ${row.spec||''} · ${row.lab||'房间待核对'} ${row.location_code||'柜位待核对'} · 待实盘`).join('\n');
     $('#confirmImportBtn').disabled = !result.rows.length || !!result.errors.length;
     toast('库存表预览已生成，请核对后确认');
   } catch (err) {

@@ -581,6 +581,25 @@ def test_preparation_strict_spec_and_shared_allocation(db, tmp_path):
     assert stock.view(db, right)["ready"] == "2"
 
 
+def test_classroom_scope_shortage_never_spills(db, tmp_path):
+    target = make_item(db, quantity=10)
+    other = make_item(db, quantity=20, location="B1")
+    db.execute("UPDATE inventory_items SET category='普通化学' WHERE id=?", (target,))
+    db.execute("UPDATE inventory_items SET category='有机化学' WHERE id=?", (other,))
+    path = tmp_path / "class.xlsx"
+    sheet(path, ["耗材名称", "规格", "数量", "单位", "科目", "柜位", "使用方式"],
+          [["玻璃烧杯", "100mL", 15, "个", "普通化学", "A1", "消耗"]])
+    preview = flow.preparation(db, path)
+    row = preview["rows"][0]
+    assert (row["available_quantity"], row["missing_quantity"]) == ("10", "5")
+    assert [item["id"] for item in row["candidates"]] == [target]
+    with pytest.raises(ValueError, match="5"):
+        write(db, "prepare", {"preview_id": preview["preview_id"], "selected_rows": [2]})
+    with pytest.raises(ValueError):
+        write(db, "prepare_remap", {"preview_id": preview["preview_id"], "row_number": 2, "item_id": other})
+    assert [stock.view(db, key)["ready"] for key in (target, other)] == ["10", "20"]
+
+
 def test_preparation_requires_explicit_usage(db, tmp_path):
     make_item(db)
     path = tmp_path / "prepare.xlsx"
@@ -597,6 +616,84 @@ def test_preparation_requires_explicit_usage(db, tmp_path):
         ]
         == 1
     )
+
+
+def test_partial_count_and_safe_batch_correction(db, tmp_path):
+    from consumable_assistant.teacher_uploads import batch_detail
+
+    scope = {'category': '普通化学', 'lab': '实验室', 'location_code': 'A1'}
+    existing = [flow.create_item(db, {**scope, 'item_name': name, 'brand': '甲', 'spec': '100mL', 'unit': '个'})
+                for name in ('烧杯','量筒','漏斗')]
+    for key in existing:
+        db.execute("UPDATE stock_balances SET ready='2' WHERE item_id=?", (key,))
+    db.execute("UPDATE stock_balances SET review_reason='待核对',ready='0',quarantine='4' WHERE item_id=?", (existing[0],))
+    path = tmp_path/'count.xlsx'
+    headers = ['耗材名称','规格','单位','数量']
+    sheet(path, headers, [['烧杯','100mL','个',5],['烧杯','100mL','个',7],['量筒','100mL','个',0]])
+    def preview(**kwargs):
+        return flow.preview_import(db,path,path.name,'count',**scope,**kwargs)
+
+    rejected = preview()
+    assert rejected['errors'] and '重复' in rejected['errors'][0]['error']
+    batch = preview(sum_parts=True)
+    assert batch['rows'][0]['count_total']=='12'
+    write(db,'import',{'preview_id':batch['preview_id']})
+    assert [stock.view(db,key)['ready'] for key in existing] == ['12','0','2']
+    assert not stock.view(db,existing[0])['review_reason']
+    with pytest.raises(ValueError):
+        write(db,'import',{'preview_id':batch['preview_id']})
+    operation(db,existing[0],'consume',1)
+    details = batch_detail(db,batch['preview_id'])
+    assert [row['status'] for row in details] == ['需重新清点','可撤销']
+    write(db,'undo_batch',{'batch_id':batch['preview_id'],'item_ids':[existing[1]]})
+    assert [stock.view(db,key)['ready'] for key in existing] == ['11','2','2']
+    assert batch_detail(db,batch['preview_id'])[1]['status']=='已撤销'
+    sheet(path, headers, [['量筒','100mL','个',None]])
+    assert preview()['errors']
+    flow.create_item(db, {**scope, 'item_name':'烧杯','brand':'乙','spec':'100mL','unit':'个'})
+    sheet(path, headers, [['烧杯','100mL','个',2]])
+    assert '品牌' in preview()['errors'][0]['error']
+
+
+def test_reference_positions_never_duplicate_old_total(db, tmp_path):
+    from consumable_assistant.teacher_uploads import preview_reference, references
+
+    path = tmp_path/'reference.xlsx'
+    sheet(path,['名称','规格','房间','位置','单位','数量'],[['量筒','100mL','307','A1、A2','支',12]])
+    preview = preview_reference(db,path,path.name,'高级合成')
+    write(db,'save_reference',{'preview_id':preview['preview_id']})
+    assert db.execute('SELECT COUNT(*) FROM inventory_items').fetchone()[0] == 0
+    rows = references(db,'高级合成')
+    assert [(row['location_code'],row['counted']) for row in rows]==[('A1',False),('A2',False)]
+    sheet(path,['名称','规格','单位','数量'],[['量筒','100mL','支',5]])
+    preview = flow.preview_import(db,path,path.name,'count','高级合成',lab='307',location_code='A1')
+    write(db,'import',{'preview_id':preview['preview_id']})
+    assert [row['counted'] for row in references(db,'高级合成')] == [True,False]
+    write(db,'remove_reference',{'file_id':rows[0]['file_id']})
+    assert not references(db) and db.execute('SELECT quantity FROM inventory_items').fetchone()[0] == 5
+
+
+def test_scoped_chat_write_and_experiment_reject_wrong_cabinet(db):
+    from consumable_assistant.chat import ToolArguments, bind_chat_scope
+    from consumable_assistant.chat_contracts import validate_payload
+    from consumable_assistant.preparations import _allocate
+
+    target = make_item(db, quantity=10)
+    other = make_item(db, quantity=15, location='B1')
+    assert ToolArguments(location_code='A1').location_code == 'A1'
+    with pytest.raises(ValueError, match='柜位'):
+        bind_chat_scope(db,'stock',{'item_id':other,'action':'consume'},'从 A1 取用玻璃烧杯 15 个')
+    with pytest.raises(ValueError, match='多个存放位置'):
+        bind_chat_scope(db,'stock',{'item_id':target,'action':'consume','location_code':'A1'},'玻璃烧杯用了 5 个')
+    with pytest.raises(ValueError, match='柜位'):
+        operation(db, other, 'consume', 5, location_code='A1')
+    with pytest.raises(ValueError, match='还差 5'):
+        operation(db, target, 'consume', 15, location_code='A1')
+    plan = validate_payload('preparation',{'course':'实验课','name':'准备','venue':'教室','starts_at':'2030-12-01T09:00:00+08:00','ends_at':'2030-12-01T12:00:00+08:00',
+        'lines':[{'item_ids':[target,other],'location_code':'A1','action':'consume','quantity':15,'unit':'个'}]})
+    with pytest.raises(ValueError, match='柜位'):
+        _allocate(db,{**plan,'item_versions':{str(key):1 for key in (target,other)}},plan['lines'])
+    assert [stock.view(db,key)['ready'] for key in (target,other)]==['10','15']
 
 
 def test_chat_query_result_can_create_and_confirm_a_bound_write(db, monkeypatch):

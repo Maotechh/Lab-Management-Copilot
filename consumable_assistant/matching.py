@@ -41,3 +41,17 @@ def physical_room(item):
         if source_room in rooms:
             return source_room
     return lab
+
+
+SCOPE_FIELDS = ("category", "lab", "location_code")
+
+
+def in_scope(item, scope):
+    return all(not scope.get(field) or str(scope[field]).strip() in (
+        {item.get("lab"), physical_room(item)} if field == "lab" else {item.get(field)}
+    ) for field in SCOPE_FIELDS)
+
+
+def require_scope(item, scope):
+    if not in_scope(item, scope):
+        raise ValueError("所选记录不在指定科目、房间和柜位内，请重新选择取用位置")

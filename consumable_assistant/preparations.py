@@ -10,6 +10,7 @@ from decimal import Decimal
 
 from . import ledger as stock
 from . import workflows as flow
+from .matching import SCOPE_FIELDS, in_scope, require_scope
 
 
 def _allocate(conn, data: dict, sources: list[dict]) -> tuple[list, list]:
@@ -27,7 +28,7 @@ def _allocate(conn, data: dict, sources: list[dict]) -> tuple[list, list]:
             received_items = [stock.ensure_balance(conn, row[0]) for row in conn.execute(
                 "SELECT DISTINCT item_id FROM procurement_receipts WHERE demand_id=? ORDER BY item_id",
                 (source["procurement_demand_id"],))]
-            items = list({item["item_id"]: item for item in items + received_items}.values())
+            items = list({item["item_id"]: item for item in items + [entry for entry in received_items if in_scope(entry, source)]}.values())
             source = {**source, "item_ids": [item["item_id"] for item in items]}
         if not items:
             for field in ("item_name", "spec", "unit"):
@@ -43,6 +44,7 @@ def _allocate(conn, data: dict, sources: list[dict]) -> tuple[list, list]:
         from .services import exact_item_query
 
         for item in items:
+            require_scope(item, source)
             stock.check_version(item, versions.get(str(item["item_id"])))
             if not same_material(first["item_name"], first["spec"], item["item_name"], item["spec"]) or any(
                 (item.get(key) or "") != (first.get(key) or "") for key in ("brand", "unit")):
@@ -79,6 +81,7 @@ def _allocate(conn, data: dict, sources: list[dict]) -> tuple[list, list]:
             if assigned:
                 assigned_totals[item_id] = assigned_totals.get(item_id, Decimal(0)) + assigned
                 allocations.append({"item_id": item_id, "action": source["action"],
+                                    **{field: source.get(field) for field in SCOPE_FIELDS},
                                     "quantity": stock.text(assigned), "unit": item["unit"],
                                     "version": item["version"]})
                 remaining -= assigned
@@ -265,7 +268,7 @@ def update(conn, data: dict, actor: str) -> dict:
         revised["ends_at"] = stock.moment(revised["ends_at"])
         if revised["starts_at"] >= revised["ends_at"]:
             raise ValueError("结束时间必须晚于开始时间")
-        fields = {"item_name", "spec", "item_ids", "procurement_demand_id", "action", "unit", "quantity", "per_person", "per_group", "fixed", "spare", "source"}
+        fields = {*SCOPE_FIELDS, "item_name", "spec", "item_ids", "procurement_demand_id", "action", "unit", "quantity", "per_person", "per_group", "fixed", "spare", "source"}
         sources = [{key: value for key, value in line.items() if key in fields}
                    for line in revised["lines"]]
         if "lines" not in data:
