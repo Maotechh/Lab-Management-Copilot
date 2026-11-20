@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lab-accessclient-agent"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "Use an open AccessClient lab console from another PowerShell"
+
+[project.scripts]
+lab-agent = "windows_lab_agent:entrypoint"
+
+[tool.setuptools]
+py-modules = ["windows_lab_agent"]

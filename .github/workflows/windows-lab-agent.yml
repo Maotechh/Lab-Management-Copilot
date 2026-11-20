@@ -1,0 +1,21 @@
+name: Windows lab-agent
+
+on:
+  push:
+    branches: [codex/windows-lab-terminal]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  console:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install pytest ./scripts/lab-agent-windows
+      - run: lab-agent --help
+      - run: python -m pytest -q tests/test_windows_lab_agent.py

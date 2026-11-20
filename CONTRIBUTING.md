@@ -1,6 +1,6 @@
 # 贡献指南 (Contributing Guidelines)
 
-Windows 开发者可以让 AI 复用已认证的学校堡垒机连接。参见 [Windows 堡垒机终端](deploy/WINDOWS-LAB-TERMINAL.md)和 [Windows 开发与故障诊断](deploy/WINDOWS-DIAGNOSTICS.md)。
+Windows 开发者可以在另一个 PowerShell 中通过 `lab-agent` 使用已打开的 AccessClient 会话。参见 [Windows 堡垒机终端](deploy/WINDOWS-LAB-TERMINAL.md)和 [Windows 开发与故障诊断](deploy/WINDOWS-DIAGNOSTICS.md)。
 
 感谢你考虑为 **耗材智能管理助手 (Lab-Management-Copilot)** 做出贡献！
 
