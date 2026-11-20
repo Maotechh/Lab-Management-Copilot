@@ -1,11 +1,15 @@
 import base64
 import importlib.util
 import os
+import re
+import socket
 import subprocess
 import sys
 import textwrap
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -13,6 +17,13 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts/lab-agent-windows/window
 SPEC = importlib.util.spec_from_file_location("windows_lab_agent", SCRIPT)
 agent = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(agent)
+
+
+def invoke(*arguments, input_text=None):
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), *arguments],
+        input=input_text, capture_output=True, encoding="utf-8", timeout=35,
+    )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="The shell framing test uses Bash")
@@ -50,12 +61,6 @@ def test_open_powershell_console_receives_command_and_returns_result():
          "& $env:LAB_TEST_PYTHON $env:LAB_TEST_FIXTURE"],
         env=env, creationflags=subprocess.CREATE_NEW_CONSOLE,
     ) as console:
-        def invoke(*arguments, input_text=None):
-            return subprocess.run(
-                [sys.executable, str(SCRIPT), *arguments],
-                input=input_text, capture_output=True, encoding="utf-8", timeout=35,
-            )
-
         try:
             deadline = time.monotonic() + 20
             while True:
@@ -74,3 +79,71 @@ def test_open_powershell_console_receives_command_and_returns_result():
             assert rejected.returncode == 125
         finally:
             console.terminate()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Requires native Windows OpenSSH")
+def test_powershell_ssh_console_transmits_commands():
+    import paramiko
+
+    shell_ready = Event()
+
+    class TestServer(paramiko.ServerInterface):
+        def check_auth_none(self, username):
+            return paramiko.AUTH_SUCCESSFUL
+
+        def check_channel_request(self, kind, chanid):
+            if kind == "session":
+                return paramiko.OPEN_SUCCEEDED
+            return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+
+        def check_channel_pty_request(self, *args):
+            return True
+
+        def check_channel_shell_request(self, channel):
+            shell_ready.set()
+            return True
+
+    system32 = Path(os.environ["SystemRoot"]) / "System32"
+    powershell = system32 / "WindowsPowerShell/v1.0/powershell.exe"
+    ssh = system32 / "OpenSSH/ssh.exe"
+    assert ssh.is_file(), "Windows OpenSSH client is required for this test"
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(15)
+        env = dict(os.environ, LAB_TEST_SSH=str(ssh), LAB_TEST_PORT=str(listener.getsockname()[1]))
+        with subprocess.Popen(
+            [str(powershell), "-NoProfile", "-NonInteractive", "-Command",
+             "& $env:LAB_TEST_SSH -F NUL -tt -o BatchMode=yes -o StrictHostKeyChecking=no "
+             "-o UserKnownHostsFile=NUL -o GlobalKnownHostsFile=NUL "
+             "-o LogLevel=ERROR -p $env:LAB_TEST_PORT fixture@127.0.0.1"],
+            env=env, creationflags=subprocess.CREATE_NEW_CONSOLE,
+        ) as console:
+            try:
+                client, _ = listener.accept()
+                with client, paramiko.Transport(client) as transport:
+                    transport.add_server_key(paramiko.RSAKey.generate(2048))
+                    transport.start_server(server=TestServer())
+                    channel = transport.accept(10)
+                    assert channel is not None and shell_ready.wait(10)
+                    channel.settimeout(10)
+                    channel.sendall(b"fixture@hxsy-zngl:~$ ")
+                    with ThreadPoolExecutor() as executor:
+                        result = executor.submit(invoke, "run", "--timeout", "12", "hostname")
+                        command = b""
+                        while b"\r" not in command and b"\n" not in command:
+                            chunk = channel.recv(4096)
+                            assert chunk, "SSH shell closed before receiving the command"
+                            command += chunk
+                        token = re.search(rb"LAB:%s:BEGIN\\n' ([0-9a-f]{10})", command)
+                        assert token and b"/bin/bash -c $'hostname'" in command, command
+                        content = base64.b64encode(b"hxsy-zngl\n")
+                        channel.sendall(
+                            b"\r\nLAB:" + token[1] + b":BEGIN\r\n" + content
+                            + b"\r\nLAB:" + token[1] + b":END:0\r\nfixture@hxsy-zngl:~$ "
+                        )
+                        response = result.result()
+                        assert response.returncode == 0, response.stderr
+                        assert response.stdout == "hxsy-zngl\n"
+            finally:
+                console.terminate()
