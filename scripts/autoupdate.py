@@ -166,15 +166,16 @@ class Updater:
     def update(self, *, check_only: bool = False, retry: bool = False) -> dict:
         commit = self.fetch_head()
         installed = read_json(self.current / 'release-manifest.json').get('application_commit')
-        if installed == commit:
+        failed = read_json(self.state / 'failed.json')
+        failed_candidate = failed.get('commit') == commit
+        if failed_candidate and not retry:
+            return self.record('failed_commit_skipped', commit=commit, installed_commit=installed,
+                               error='Fix the commit or explicitly retry after inspecting the previous failure')
+        if installed == commit and not failed_candidate:
             return self.record('current', commit=commit)
         authorization = self.authorization(commit)
         if authorization is None:
             return self.record('waiting_for_ci', commit=commit, installed_commit=installed)
-        failed = read_json(self.state / 'failed.json')
-        if failed.get('commit') == commit and not retry:
-            return self.record('failed_commit_skipped', commit=commit, installed_commit=installed,
-                               error='Fix the commit or explicitly retry after inspecting the previous failure')
         if check_only:
             return self.record('ready', commit=commit, installed_commit=installed, ci=authorization)
         release = None

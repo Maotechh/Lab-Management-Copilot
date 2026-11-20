@@ -53,7 +53,7 @@ sudo /opt/lab-management/current/.venv/bin/python /opt/lab-management/current/sc
 sudo /opt/lab-management/current/.venv/bin/python /opt/lab-management/current/scripts/consistent_backup.py restore --snapshot /var/backups/lab-management/<snapshot>
 ```
 
-Restore requires the recorded immutable release directory. The coordinator verifies its files, stops writers, restores all named roots, selects the matching release, restores service configuration, and resumes the recorded services. Existing replaced roots remain with `.restore-previous` names. Preserve or move those directories before another restoration. For a rehearsal on an isolated destination, use `scripts/full_backup.py restore --destination-root <directory> --services-stopped` instead; it never changes the selected production release.
+Restore requires the recorded immutable release directory. The coordinator verifies its files, stops writers, restores all named roots, selects the matching release, restores service configuration, and resumes the recorded services. Existing replaced roots remain with unique `.restore-previous-<restoration-id>` names. Earlier recovery directories are preserved and do not prevent another restoration. An unfinished `.restore-new` directory still requires inspection before retrying. For a rehearsal on an isolated destination, use `scripts/full_backup.py restore --destination-root <directory> --services-stopped` instead; it never changes the selected production release.
 
 ## Required actual verification
 

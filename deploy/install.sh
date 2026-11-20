@@ -66,7 +66,7 @@ rollback() {
         printf 'Previous code, inventory, conversations, files and settings restored from %s.\n' "$release_backup" >&2
     elif [[ "$paused" == 1 ]]; then
         if [[ -n "$previous_release" ]]; then
-            systemctl start consumable-assistant consumable-notifications || true
+            systemctl start consumable-dsh consumable-assistant consumable-notifications || true
         fi
     fi
     systemctl start consumable-backup.timer || true

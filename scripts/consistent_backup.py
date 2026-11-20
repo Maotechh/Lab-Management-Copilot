@@ -150,7 +150,10 @@ def main() -> None:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         source = args.snapshot or Path('/var/backups/lab-management') / datetime.now(UTC).strftime('complete-%Y%m%dT%H%M%S.%fZ')
         result = snapshot(source, args.leave_stopped) if args.action == 'create' else restore_snapshot(source, args.leave_stopped)
-        print(json.dumps({'snapshot': str(source), 'verified': True, 'versions': result['versions']}))
+        version_summary = {name: result['versions'][name] for name in
+                           ('application_commit', 'application_release', 'runtime', 'active_writers')
+                           if name in result['versions']}
+        print(json.dumps({'snapshot': str(source), 'verified': True, 'versions': version_summary}))
 
 
 if __name__ == '__main__':

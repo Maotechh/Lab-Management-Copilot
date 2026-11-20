@@ -123,6 +123,20 @@ def test_failed_install_is_not_repeated_until_explicit_retry(updater, monkeypatc
     assert auto.read_json(updater.state / 'last-success.json')['commit'] == COMMIT
 
 
+def test_failed_selected_candidate_is_never_reported_as_current(updater, monkeypatch):
+    auto.write_json(updater.current / 'release-manifest.json', {'application_commit': COMMIT})
+    auto.write_json(updater.state / 'failed.json', {'commit': COMMIT})
+    monkeypatch.setattr(updater, 'authorization', lambda commit: authorization(updater))
+    attempts = []
+    monkeypatch.setattr(updater, 'stage', lambda commit: updater.releases / commit)
+    monkeypatch.setattr(updater, 'install', lambda release: attempts.append(release))
+    assert updater.update()['status'] == 'failed_commit_skipped'
+    assert not attempts
+    assert updater.update(retry=True)['status'] == 'deployed'
+    assert len(attempts) == 1
+    assert not (updater.state / 'failed.json').exists()
+
+
 def test_installer_success_without_selected_commit_is_failure(updater, monkeypatch):
     monkeypatch.setattr(updater, 'authorization', lambda commit: authorization(updater))
     monkeypatch.setattr(updater, 'stage', lambda commit: updater.releases / commit)

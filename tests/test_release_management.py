@@ -99,7 +99,8 @@ def test_volatile_profile_contains_no_persistent_state(tmp_path, monkeypatch):
     profile = home / 'profiles/lab'
     assert (profile / 'node_modules').resolve() == release / 'runtime/dsh/node_modules'
     assert not (home / 'sessions').exists()
-    overlay = (profile / 'cordis.yml').read_text()
+    assert yaml.safe_load((profile / 'cordis.yml').read_text()) == []
+    overlay = (profile / 'cordis.patch.yml').read_text()
     provider = yaml.load(overlay, Loader=yaml.BaseLoader)[0]
     assert provider['id'] == 'school-model'
     school = provider['config']['providers']['school']

@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import tarfile
 import tempfile
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -150,9 +151,13 @@ def restore(snapshot: Path, destination_root: Path) -> dict:
         if any(a != b and a in b.parents for a in values for b in values):
             raise ValueError('Restoration roots overlap')
         for target in values:
-            for suffix in ('.restore-new', '.restore-previous'):
-                if target.with_name(target.name + suffix).exists():
-                    raise ValueError('Preserve or move previous restoration files before retrying')
+            candidate = target.with_name(target.name + '.restore-new')
+            if candidate.exists() or candidate.is_symlink():
+                raise ValueError('Preserve or move the previous restoration candidate before retrying')
+        # Every restoration retains its own previous roots. An earlier successful
+        # restoration must not prevent a later failed release from rolling back.
+        restoration_id = uuid.uuid4().hex
+        replacements = {}
         for name, target in targets.items():
             replacement = target.with_name(target.name + '.restore-new')
             if replacement.exists():
@@ -166,12 +171,29 @@ def restore(snapshot: Path, destination_root: Path) -> dict:
                     os.chown(path, mode['uid'], mode['gid'])
                 path.chmod(mode['mode'])
             replacement.chmod(metadata['mode'])
-            previous = target.with_name(target.name + '.restore-previous')
-            if previous.exists():
-                raise ValueError('Preserve or move the previous restoration before retrying')
-            if target.exists():
-                target.rename(previous)
-            replacement.rename(target)
+            replacements[name] = replacement
+        swapped = []
+        try:
+            for name, target in targets.items():
+                previous = target.with_name(target.name + '.restore-previous-' + restoration_id)
+                existed = target.exists()
+                if existed:
+                    target.rename(previous)
+                try:
+                    replacements[name].rename(target)
+                except BaseException:
+                    if existed:
+                        previous.rename(target)
+                    raise
+                swapped.append((target, previous, existed, replacements[name]))
+        except BaseException:
+            # Undo completed directory switches if a later switch fails. All
+            # writers remain stopped until the complete restoration succeeds.
+            for target, previous, existed, replacement in reversed(swapped):
+                target.rename(replacement)
+                if existed:
+                    previous.rename(target)
+            raise
         return manifest
 
 

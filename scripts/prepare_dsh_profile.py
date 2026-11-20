@@ -13,7 +13,10 @@ def prepare(release: Path, home: Path) -> None:
     if not os.environ.get('LAB_DSH_RELAY_TOKEN'):
         raise ValueError('Missing DSH model relay credential')
     shutil.copyfile(release / 'runtime/profile/package.json', root / 'package.json')
-    shutil.copyfile(release / 'scripts/dsh-school.yml', root / 'cordis.yml')
+    # DSH recreates cordis.yml as an empty composition root during startup.
+    # Provider overrides belong in its persistent profile patch, applied after bundles.
+    shutil.copyfile(release / 'runtime/profile/cordis.yml', root / 'cordis.yml')
+    shutil.copyfile(release / 'scripts/dsh-school.yml', root / 'cordis.patch.yml')
     modules = root / 'node_modules'
     if modules.is_symlink():
         modules.unlink()
