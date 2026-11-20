@@ -3,7 +3,6 @@
 import argparse
 import base64
 import binascii
-import csv
 import ctypes as c
 import os
 import re
@@ -13,6 +12,7 @@ import sys
 import time
 from contextlib import ExitStack
 from ctypes import wintypes as w
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 HOST = "hxsy-zngl"
@@ -59,11 +59,71 @@ class InputRecord(c.Structure):
     _fields_ = [("kind", w.WORD), ("key", KeyEvent)]
 
 
+class ProcessEntry(c.Structure):
+    _fields_ = [
+        ("size", w.DWORD), ("usage", w.DWORD), ("pid", w.DWORD), ("heap", c.c_size_t),
+        ("module", w.DWORD), ("threads", w.DWORD), ("parent_pid", w.DWORD),
+        ("priority", w.LONG), ("flags", w.DWORD), ("name", w.WCHAR * 260),
+    ]
+
+
 def api(library, name, result, *arguments):
     function = getattr(library, name)
     function.restype = result
     function.argtypes = arguments
     return function
+
+
+def process_snapshot():
+    # Toolhelp returns names and parent PIDs, without reading login arguments.
+    kernel = c.WinDLL("kernel32", use_last_error=True)
+    snapshot = api(kernel, "CreateToolhelp32Snapshot", w.HANDLE, w.DWORD, w.DWORD)
+    first = api(kernel, "Process32FirstW", w.BOOL, w.HANDLE, c.POINTER(ProcessEntry))
+    next_entry = api(kernel, "Process32NextW", w.BOOL, w.HANDLE, c.POINTER(ProcessEntry))
+    close = api(kernel, "CloseHandle", w.BOOL, w.HANDLE)
+    handle = snapshot(2, 0)  # TH32CS_SNAPPROCESS
+    if handle == c.c_void_p(-1).value:
+        raise c.WinError(c.get_last_error())
+    try:
+        entry = ProcessEntry(size=c.sizeof(ProcessEntry))
+        if not first(handle, c.byref(entry)):
+            raise c.WinError(c.get_last_error())
+        processes = {}
+        while True:
+            processes[entry.pid] = (entry.name, entry.parent_pid)
+            if not next_entry(handle, c.byref(entry)):
+                if c.get_last_error() != 18:  # ERROR_NO_MORE_FILES
+                    raise c.WinError(c.get_last_error())
+                return processes
+    finally:
+        close(handle)
+
+
+def console_candidates(processes, preferred):
+    children = {}
+    for pid, (_, parent) in processes.items():
+        if pid != parent:
+            children.setdefault(parent, []).append(pid)
+
+    if preferred is not None:
+        roots = [preferred]
+        candidates = []
+    else:
+        priority = {name: index for index, name in enumerate(CLIENTS)}
+        candidates = sorted(
+            (pid for pid, (name, _) in processes.items() if name.lower() in priority),
+            key=lambda pid: priority[processes[pid][0].lower()],
+        )
+        roots = [pid for pid, (name, _) in processes.items() if name.lower().startswith("accessclient")]
+
+    descendants = set()
+    while roots:
+        pid = roots.pop()
+        if pid not in descendants:
+            descendants.add(pid)
+            candidates.append(pid)
+            roots.extend(children.get(pid, ()))
+    return list(dict.fromkeys(candidates))
 
 
 class Console:
@@ -169,24 +229,15 @@ class Console:
 
 
 def find_console(preferred, diagnose=False):
-    # Process names suffice. The AccessClient command line may contain a login ticket.
-    if preferred is None:
-        tasklist = Path(os.environ["SystemRoot"]) / "System32/tasklist.exe"
-        listing = subprocess.check_output(
-            [str(tasklist), "/FO", "CSV", "/NH"], encoding="mbcs", errors="replace", timeout=8,
-        )
-        candidates = [
-            (row[0].lower(), int(row[1])) for row in csv.reader(listing.splitlines())
-            if len(row) >= 2 and row[0].lower() in CLIENTS and row[1].isdigit()
-        ]
-        candidates.sort(key=lambda candidate: CLIENTS.index(candidate[0]))
-    else:
-        candidates = [("Selected process", preferred)]
-    seen = set()
+    processes = process_snapshot()
+    candidates = console_candidates(processes, preferred)
+    seen = {os.getpid()}
     available = []
-    for name, pid in candidates:
+    selected_error = None
+    for pid in candidates:
         if pid in seen:
             continue
+        name, parent = processes.get(pid, ("Selected process", 0))
         try:
             with Console(pid) as terminal:
                 members = terminal.members()
@@ -198,12 +249,14 @@ def find_console(preferred, diagnose=False):
                     available.append([pid, *others])
                 detail = f"ready at {HOST}" if ready else f"no idle {HOST} prompt"
         except ConsoleError as error:
-            if preferred is not None:
-                raise
+            if pid == preferred:
+                selected_error = error
             detail = str(error)
         if diagnose:
-            print(f"{name} (PID {pid}): {detail}", file=sys.stderr)
+            print(f"{name.lower()} (PID {pid}, parent {parent}): {detail}", file=sys.stderr)
     if not available:
+        if selected_error is not None:
+            raise selected_error
         raise ConsoleError(
             f"No idle {HOST} prompt found. Open the lab in AccessClient and wait for the Linux prompt. "
             "Run lab-agent check --diagnose for console details. If AccessClient opens in Windows Terminal, "
@@ -318,7 +371,12 @@ def worker(args):
 
 def main(arguments):
     parser = argparse.ArgumentParser(prog="lab-agent", description=__doc__)
-    parser.add_argument("--pid", type=int, help="select a console process if more than one lab is open")
+    try:
+        installed_version = version("lab-accessclient-agent")
+    except PackageNotFoundError:
+        installed_version = "uninstalled"
+    parser.add_argument("--version", action="version", version=f"%(prog)s {installed_version}")
+    parser.add_argument("--pid", type=int, help="select a console process or its AccessClient launcher")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     modes = parser.add_subparsers(dest="mode")
     check = modes.add_parser("check", help="find an open AccessClient session")

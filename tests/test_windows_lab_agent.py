@@ -72,7 +72,7 @@ def test_open_powershell_console_receives_command_and_returns_result():
             assert f"PID {console.pid}" in check.stdout
             diagnosis = invoke("check", "--diagnose")
             assert diagnosis.returncode == 0, diagnosis.stderr
-            assert f"powershell.exe (PID {console.pid}): ready at hxsy-zngl" in diagnosis.stderr
+            assert f"powershell.exe (PID {console.pid}, parent {os.getpid()}): ready at hxsy-zngl" in diagnosis.stderr
             result = invoke("run", "--timeout", "8", "printf fixture")
             assert result.returncode == 17, (result.stdout, result.stderr)
             assert result.stdout.splitlines() == ["\u4e2d\u6587", "fixture stderr"]
@@ -97,6 +97,35 @@ def test_explicit_pid_without_console_reports_windows_error_six():
             assert "lab-agent check --diagnose without --pid" in result.stderr
         finally:
             detached.terminate()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Requires native Windows console APIs")
+def test_detached_launcher_pid_finds_child_console():
+    fixture = Path(__file__).with_name("windows_lab_console_fixture.py")
+    launch = (
+        "import subprocess, sys; "
+        "with_console = subprocess.Popen(sys.argv[1:], creationflags=subprocess.CREATE_NEW_CONSOLE); "
+        "with_console.wait(timeout=45)"
+    )
+    with subprocess.Popen(
+        [sys.executable, "-c", launch, sys.executable, str(fixture)],
+        creationflags=subprocess.DETACHED_PROCESS,
+    ) as launcher:
+        try:
+            deadline = time.monotonic() + 15
+            while True:
+                check = invoke("--pid", str(launcher.pid), "check", "--diagnose")
+                if check.returncode == 0:
+                    break
+                assert time.monotonic() < deadline, check.stderr
+                time.sleep(0.2)
+            assert "Windows error 6" in check.stderr
+            assert f"parent {launcher.pid}): ready at hxsy-zngl" in check.stderr
+            result = invoke("--pid", str(launcher.pid), "run", "--timeout", "8", "printf fixture")
+            assert result.returncode == 17, result.stderr
+            assert result.stdout.splitlines() == ["\u4e2d\u6587", "fixture stderr"]
+        finally:
+            subprocess.run(["taskkill.exe", "/T", "/F", "/PID", str(launcher.pid)], capture_output=True, timeout=10)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Requires native Windows OpenSSH")

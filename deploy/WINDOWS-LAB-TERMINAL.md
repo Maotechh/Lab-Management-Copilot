@@ -55,7 +55,7 @@ date
 
 ## 控制台连接错误
 
-在第二个 PowerShell 运行 `lab-agent check --diagnose`，工具会列出候选进程和 Windows 错误编号。`Windows error 6` 表示所选进程没有可连接的控制台。使用 `check --diagnose` 自动选择进程。只在结果显示多个实验室会话时，才用工具列出的 PID 明确选择，例如 `lab-agent --pid 1234 run 'hostname'`。
+在第二个 PowerShell 运行 `lab-agent --version` 和 `lab-agent check --diagnose`。从 `0.1.2` 开始，工具会查找 AccessClient 启动的子进程，并列出候选进程的 PID、父进程 PID 和 Windows 错误编号。候选进程出现 `Windows error 6` 表示该进程没有可连接的控制台。最后显示 `AccessClient console ready` 就可以继续执行命令。只有多个会话均符合条件时，才需要用工具列出的 PID 明确选择，例如 `lab-agent --pid 1234 run 'hostname'`。
 
 若自动查找仍找不到会话，确认 AccessClient 的窗口还显示 Linux 提示符。如果该窗口由 Windows Terminal 承载，在 Windows Terminal 的「设置 → 启动 → 默认终端应用程序」选择 **Windows Console Host**。从 AccessClient 重新连接后，再运行 `lab-agent check --diagnose`。`Windows error 5` 则应核对两个窗口是否由同一 Windows 用户、以相同的管理员权限运行。
 
