@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Use a human-authenticated OpenSSH session from the same WSL user."""
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import secrets
+import selectors
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE = Path.home() / ".local/state/lab-ssh"
+DESTINATION = re.compile(r"[A-Za-z0-9_.@%+:/\[\]-]+")
+PROMPT = re.compile(rb"(?:^|[\r\n])[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:[^\r\n]*[$#] $")
+TERMINAL_CONTROLS = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))")
+MAX_COMMAND_BYTES = 2816
+
+
+def session_options(socket_path, port):
+    return [
+        "ssh", "-F", "/dev/null", "-S", str(socket_path), "-p", str(port),
+        "-o", "BatchMode=yes", "-o", "ControlMaster=no",
+        "-o", "ProxyCommand=/usr/bin/false", "-o", "ConnectTimeout=5",
+    ]
+
+
+def connection_is_open(options, destination):
+    try:
+        check = subprocess.run(
+            [*options, "-O", "check", destination], stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("The local OpenSSH control socket did not respond.") from exc
+    return check.returncode == 0
+
+
+def require_open_session(options, destination):
+    if not connection_is_open(options, destination):
+        raise RuntimeError("No authenticated lab session. Use lab-terminal login in a separate WSL terminal.")
+
+
+def login(args):
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise RuntimeError("Run login yourself from an interactive WSL terminal.")
+    STATE.mkdir(parents=True, mode=0o700, exist_ok=True)
+    state = STATE.lstat()
+    if not stat.S_ISDIR(state.st_mode) or state.st_uid != os.getuid() or state.st_mode & 0o077:
+        raise RuntimeError("The lab session directory must be private to your WSL user (mode 0700).")
+    with (STATE / "login.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("A lab login window is already open for this WSL user.") from exc
+        socket_path = STATE / "control.sock"
+        if socket_path.exists() or socket_path.is_symlink():
+            if not stat.S_ISSOCK(socket_path.lstat().st_mode):
+                raise RuntimeError("The OpenSSH control path is not a socket.")
+            # This path is managed under the login lock. A timeout is not proof
+            # that the socket is stale; leave it intact while investigating.
+            options = session_options(socket_path, args.port)
+            if connection_is_open(options, args.destination):
+                raise RuntimeError("An authenticated lab session is already open.")
+            socket_path.unlink()
+        session_file = STATE / "session.json"
+        session_file.write_text(json.dumps({"destination": args.destination, "port": args.port}), encoding="utf-8")
+        options = [
+            "ssh", "-o", "ControlMaster=yes", "-o", "ControlPersist=no", "-S", str(socket_path),
+            "-p", str(args.port), "-tt",
+        ]
+        if args.config:
+            options.extend(["-F", args.config])
+        if args.identity:
+            options.extend(["-i", args.identity])
+        print("Complete the school login and keep this terminal open. Other terminals can use lab-terminal --check.", flush=True)
+        try:
+            return subprocess.call([*options, args.destination])
+        finally:
+            session_file.unlink(missing_ok=True)
+
+
+def read_session():
+    try:
+        session = json.loads((STATE / "session.json").read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RuntimeError("No lab login window. Use lab-terminal login in a separate WSL terminal.") from exc
+    destination = target(session["destination"])
+    options = session_options(STATE / "control.sock", port(session["port"]))
+    require_open_session(options, destination)
+    return options, destination
+
+
+def run_remote(options, destination, command, timeout):
+    payload = command.encode()
+    if not payload or b"\0" in payload or len(payload) > MAX_COMMAND_BYTES:
+        raise RuntimeError(f"Provide a command with 1 to {MAX_COMMAND_BYTES} UTF-8 bytes and no null bytes.")
+    # Keep the command readable in the school's terminal audit. Bash quoting
+    # keeps the whole request on a single PTY line even for multiline commands.
+    quoted = "$'" + (
+        command.replace("\\", "\\\\").replace("'", "\\'")
+        .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    ) + "'"
+    token = secrets.token_hex(16)
+    start = b"\x1e" + token.encode() + b":start\x1f"
+    end = re.compile(rb"\x1e" + token.encode() + rb":end:([0-9]{1,3})\x1f")
+    # The school gateway expects an interactive shell. Frame stdout/stderr and
+    # the exit status inside that shell; the PTY also echoes the submitted line.
+    line = (
+        f"command printf '\\036%s:start\\037' {token}; "
+        f"/bin/bash -c {quoted} </dev/null; "
+        f"command printf '\\036%s:end:%s\\037\\n' {token} \"$?\"; exit\n"
+    ).encode()
+    if len(line) > 4000 or any((byte < 32 and byte != 10) or byte == 127 for byte in line):
+        raise RuntimeError("The command exceeds the PTY line limit or contains unsupported control characters.")
+    phase = "prompt"
+    buffer = b""
+    deadline = time.monotonic() + min(30, timeout)
+    environment = dict(os.environ, TERM="dumb")
+    with subprocess.Popen(
+        [*options, "-tt", "-e", "none", destination],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment,
+    ) as ssh, selectors.DefaultSelector() as selector:
+        try:
+            selector.register(ssh.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    if phase == "output":
+                        write_output(buffer)
+                    detail = "Server shell did not become ready. Check the original login window." if phase == "prompt" else (
+                        "Timed out while running the command. Check its outcome before retrying."
+                    )
+                    raise RuntimeError(detail)
+                chunk = os.read(ssh.stdout.fileno(), 8192)
+                if not chunk:
+                    if phase == "output":
+                        write_output(buffer)
+                    detail = TERMINAL_CONTROLS.sub(b"", buffer).decode("utf-8", errors="replace").strip()
+                    suffix = f"\n{detail[-1800:]}" if phase == "prompt" and detail else ""
+                    raise RuntimeError("SSH closed before the server returned an exit status." + suffix)
+                buffer += chunk
+                if phase == "prompt":
+                    buffer = buffer[-8192:]
+                    if PROMPT.search(TERMINAL_CONTROLS.sub(b"", buffer)):
+                        ssh.stdin.write(line)
+                        ssh.stdin.flush()
+                        buffer = b""
+                        phase = "start"
+                        deadline = time.monotonic() + timeout
+                elif phase == "start":
+                    offset = buffer.find(start)
+                    if offset == -1:
+                        buffer = buffer[-8192:]
+                        continue
+                    buffer = buffer[offset + len(start):]
+                    phase = "output"
+                if phase == "output":
+                    match = end.search(buffer)
+                    if match:
+                        write_output(buffer[:match.start()])
+                        return int(match.group(1))
+                    if len(buffer) > 128:
+                        boundary = len(buffer) - 128
+                        if buffer[boundary - 1:boundary + 1] == b"\r\n":
+                            boundary -= 1
+                        write_output(buffer[:boundary])
+                        buffer = buffer[boundary:]
+        finally:
+            if ssh.poll() is None:
+                try:
+                    ssh.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    ssh.terminate()
+                    try:
+                        ssh.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        ssh.kill()
+
+
+def write_output(value):
+    sys.stdout.buffer.write(value.replace(b"\r\n", b"\n"))
+    sys.stdout.buffer.flush()
+
+
+def target(value):
+    if not DESTINATION.fullmatch(value) or value.startswith("-"):
+        raise argparse.ArgumentTypeError("Enter the SSH destination supplied by your institution.")
+    return value
+
+
+def port(value):
+    number = int(value)
+    if not 1 <= number <= 65535:
+        raise argparse.ArgumentTypeError("Enter a valid SSH port.")
+    return number
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="lab-terminal", description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="verify that the lab shell can execute a command")
+    mode.add_argument("--shell", action="store_true", help="open an interactive shell (default)")
+    commands = parser.add_subparsers(dest="command")
+    authenticate = commands.add_parser("login", help="open a login terminal using your authorized SSH destination")
+    authenticate.add_argument("-p", "--port", type=port, default=22)
+    authenticate.add_argument("-F", "--config", help="approved OpenSSH configuration file")
+    authenticate.add_argument("-i", "--identity", help="authorized identity file for this login")
+    authenticate.add_argument("destination", type=target)
+    run = commands.add_parser("run", help="execute one command and return its exit status")
+    run.add_argument("--timeout", type=int, default=60, help="maximum execution time in seconds")
+    run.add_argument("remote_command", help="one quoted Bash command")
+    args = parser.parse_args()
+    if args.command and (args.check or args.shell):
+        parser.error("Use --check or --shell without a subcommand.")
+    if args.command == "run" and not 1 <= args.timeout <= 3600:
+        parser.error("--timeout must be between 1 and 3600 seconds.")
+    try:
+        if args.command == "login":
+            return login(args)
+        options, destination = read_session()
+        if args.check:
+            return run_remote(options, destination, "printf '%s\\n' 'Lab server shell is ready.'", 12)
+        if args.command == "run":
+            return run_remote(options, destination, args.remote_command, args.timeout)
+        return subprocess.call([*options, "-tt", destination])
+    except (OSError, ValueError, RuntimeError, KeyError, argparse.ArgumentTypeError) as exc:
+        print(f"lab-terminal: {exc}", file=sys.stderr)
+        return 125
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

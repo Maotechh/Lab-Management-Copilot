@@ -1,5 +1,7 @@
 # Windows 开发与故障诊断
 
+要让 AI 在同学完成学校认证后直接执行服务器命令，请使用 [Windows 堡垒机终端](WINDOWS-LAB-TERMINAL.md)。本文的 `lab_terminal.py` 用于检查网站和读取诊断报告。
+
 从 GitHub 上的 `codex/dsh-lab-delivery` 获取 `scripts/lab_terminal.py`。Windows PowerShell 需要 Python 3.11 或更新版本，脚本只用 Python 自带的模块。使用 WSL 或 macOS 时，将示例中的 `py -3` 换成 `python3`。
 
 ## 从 Windows 读取网站错误
