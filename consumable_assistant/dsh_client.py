@@ -1,7 +1,9 @@
 """Private DSH transport. No business execution capability is sent to DSH."""
 from __future__ import annotations
 
+import io
 import os
+import wave
 from urllib.parse import urlsplit
 
 import httpx
@@ -55,6 +57,28 @@ def cancel_dsh(run_id: str) -> None:
             response.raise_for_status()
     except httpx.HTTPError as exc:
         raise DSHUnavailable("取消请求已保存，服务器会拒绝该运行后续的工具调用。") from exc
+
+
+def canonical_voice_wave(audio: bytes) -> bytes:
+    try:
+        if not audio.startswith(b"RIFF"):
+            raise ValueError("录音格式必须是 WAV")
+        with wave.open(io.BytesIO(audio), "rb") as source:
+            if (source.getnchannels(), source.getsampwidth(), source.getframerate()) != (1, 2, 16000):
+                raise ValueError("录音必须是 16 kHz 单声道 PCM16 WAV")
+            frames = source.getnframes()
+            if not 0 < frames <= 16000 * 120:
+                raise ValueError("录音必须短于两分钟且包含音频")
+            pcm = source.readframes(frames)
+            if len(pcm) != frames * 2:
+                raise ValueError("录音文件不完整，请重新录音")
+    except (wave.Error, EOFError) as exc:
+        raise ValueError("录音格式无效，请重新录音") from exc
+    result = io.BytesIO()
+    with wave.open(result, "wb") as destination:
+        destination.setparams((1, 2, 16000, frames, "NONE", "not compressed"))
+        destination.writeframes(pcm)
+    return result.getvalue()
 
 
 def transcribe(audio: bytes) -> dict:

@@ -252,3 +252,8 @@ scheduleFromPrepare.addEventListener('click',()=>{
   $('#lessonName').value=rows[0].experiment;$('#lessonCourse').value=rows[0].course;$('#lessonPeople').value='0';
   saveFormDraft($('#lessonForm'));calculateDemand();document.querySelector('.tab[data-tab="lessons"]').click();
 });
+$('#batchUploadMode').addEventListener('change',()=>{
+  const reference=$('#batchUploadMode').value==='reference';
+  $('#uploadRoomLabel').textContent=reference?'原表空白房间（可选）':'实盘房间';
+  $('#uploadCabinetField').hidden=reference;
+});

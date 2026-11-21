@@ -36,7 +36,7 @@ inventory_search 的 query 使用教师给出的完整耗材名称，规格可�
 - history_search：可选 q、actor、action、from_date、to_date、limit。操作类型 action 使用业务代码，例如 consume（消耗）、borrow（借出）、return（归还）、inbound（入库）。export_history 使用相同筛选定义。教师指定耗材名称时，q 必须完整保留该名称及其中的编号、前缀和限定词，不得只使用通用名称。首次调用前核对所有指定筛选条件，不得先导出扩大范围的文件。直接导出请求应一次传入完整筛选条件，生成符合要求的文件后结束，不重复导出。
 - read_attachment：attachment_id，读取表格及来源。图片由当前消息输入，模糊字段需要教师核对。
 - prepare_attachment：attachment_id 和可选 course，生成清单核对预览，不扣减库存。照片必须调用此工具并在 payload.rows 传入识别的全部条目，每行填写 name、spec、unit、required_quantity、action（borrow、consume 或留空）、source_row。表格自动读取，也可通过 payload.rows 整理不规则表格。保留所有未知耗材，不能因为没有匹配库存而省略。清单可在界面修改后重新核对。
-- inventory_import_preview：实际清点用 mode=count，必须填写 category、lab、location_code；新购入库才用 add。旧表参考不是入库，不用 add 或 overwrite 导入。课堂耗用走 prepare_attachment。每次只生成预览，不直接记账。
+- inventory_import_preview：实际清点用 mode=count，必须填写 category、lab、location_code；新购入库才用 add。旧表参考不是入库，不用 add 或 overwrite 导入。课堂耗用先调用 prepare_attachment，再用 business_preview 的 prepare 保存所选行。重复行需教师亲自说明再次登记原因。每次只生成预览，不直接记账。
 - business_preview：kind 和 payload，格式见业务 JSON Schema。编号必须来自当前对话中已查询的记录。一次完整任务使用一个计划，混合操作使用 mixed。
 - analyze_attachments：attachment_ids 和 code（Python 程序），仅分析选定附件，输出文件写入 /output。分析结果不能直接修改业务数据，正式数量由服务器校验。
 - export_inventory：可选 query、lab、category。export_history：可选 q、actor、action、from_date、to_date，导出实际业务历史。export_task：task_id，导出服务器保存的计划和实际结果。
@@ -48,6 +48,8 @@ inventory_search 的 query 使用教师给出的完整耗材名称，规格可�
 
 
 class ChatMessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     message_id: str = Field(min_length=8, max_length=100)
     text: str = Field(default="", max_length=MAX_MESSAGE_LENGTH)
     attachments: list[str] = Field(default_factory=list, max_length=8)
@@ -235,8 +237,7 @@ def _run_read_tool(
 ) -> dict:
     if name == "inventory_search":
         query = str(args.get("query") or "")
-        category = args.get("category")
-        lab = args.get("lab")
+        category, lab = inventory_search_scope(conn, args.get("category"), args.get("lab"))
         limit = min(max(int(args.get("limit") or 30), 1), 100)
         starts_at = args.get("starts_at")
         ends_at = args.get("ends_at")
@@ -259,7 +260,7 @@ def _run_read_tool(
         reference_rows = references(conn, category or '', query, lab or '', args.get('location_code') or '')
         result['reference_count'] = len(reference_rows)
         result['reference_rows'] = reference_rows[offset:offset + limit]
-        if not rows and args.get("lab") and not args.get("location_code"):
+        if not rows and lab and not args.get("location_code"):
             result["available_labs"] = [row[0] for row in conn.execute("SELECT DISTINCT lab FROM inventory_items WHERE lab IS NOT NULL ORDER BY lab")]
             # A tool argument can accidentally combine a real laboratory name
             # and a cabinet code. Correct it only when the database contains
@@ -370,9 +371,11 @@ def _run_read_tool(
         if name == "prepare_attachment":
             if attachment["content_type"].startswith("image/") or (args.get("payload") or {}).get("rows"):
                 result = flow.checklist(conn, (args.get("payload") or {}).get("rows") or [],
-                                        attachment["filename"], attachment_id=attachment["id"], scope=args)
+                                        attachment["filename"], attachment_id=attachment["id"], scope=args,
+                                        file_hash=attachment.get("sha256") or hashlib.sha256(path.read_bytes()).hexdigest())
             else:
-                result = flow.preparation(conn, path, str(args.get("course") or ""), commit=False, scope=args)
+                result = flow.preparation(conn, path, str(args.get("course") or ""), commit=False,
+                                          scope=args, filename=attachment["filename"])
                 result["attachment_id"] = attachment["id"]
             return {"type": "preparation", **result}
         mode = str(args.get("mode") or "add")
@@ -519,6 +522,20 @@ def _business_task(
     }
 
 
+def inventory_search_scope(conn, category, lab):
+    import re
+
+    if not lab:
+        return category, lab
+    for row in conn.execute("SELECT DISTINCT category FROM inventory_items WHERE category IS NOT NULL"):
+        subject = row["category"]
+        match = re.fullmatch(re.escape(subject) + r"\s*(\d{3})\s*(?:房间|实验室)?", lab)
+        if match and (not category or category == subject):
+            return subject, match[1]
+    match = re.fullmatch(r"(\d{3})\s*(?:房间|实验室)", lab)
+    return category, match[1] if match else lab
+
+
 def bind_chat_scope(conn, kind, payload, message):
     import re
 
@@ -537,6 +554,11 @@ def bind_chat_scope(conn, kind, payload, message):
         if not ids:
             continue
         item = stock.ensure_balance(conn, ids[0])
+        if line.get('lab'):
+            category, lab = inventory_search_scope(conn, line.get('category'), line['lab'])
+            line.update(lab=lab)
+            if category:
+                line.update(category=category)
         siblings = [dict(row) for row in conn.execute('''SELECT i.category,i.lab,i.location_code FROM inventory_items i
             JOIN stock_balances b ON i.id=b.item_id WHERE b.active=1 AND i.normalized_name=? AND coalesce(i.spec,'')=coalesce(?,'')''',
             (item['normalized_name'], item['spec']))]
@@ -546,10 +568,14 @@ def bind_chat_scope(conn, kind, payload, message):
             names = {row[field] for row in siblings if row[field]}
             if field == 'lab':
                 names.update(physical_room(row) for row in siblings if row['lab'])
-            mentioned = {value for value in names if re.search(r'(?<![a-zA-Z0-9])' + re.escape(value) + r'(?![a-zA-Z0-9])', message, re.I)}
+            mentioned = {value for value in names if (
+                value in message if field == 'category' else
+                re.search(r'(?<![a-zA-Z0-9])' + re.escape(value) + r'(?![a-zA-Z0-9])', message, re.I)
+            )}
             if len(mentioned) == 1:
                 requested = next(iter(mentioned))
-                if line.get(field) and line[field] != requested:
+                same_room = field == 'lab' and line.get(field) == item['lab'] and requested == physical_room(item)
+                if line.get(field) and line[field] != requested and not same_room:
                     raise ValueError('选定的库存与消息中的取用范围不一致，请核对科目和柜位')
                 line[field] = requested
             if line.get(field) in mentioned:

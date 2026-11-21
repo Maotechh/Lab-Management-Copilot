@@ -137,9 +137,6 @@ def search_items(
     if category:
         where.append("category = ?")
         params.append(category)
-    if location_code:
-        where.append("location_code = ?")
-        params.append(location_code)
     rows = rows_to_dicts(
         conn.execute(
             f"""
@@ -152,7 +149,12 @@ def search_items(
         )
     )
     alias_map = load_alias_map(conn)
-    from .matching import physical_room
+    from .matching import (
+        beaker_capacity_match,
+        cabinet_codes,
+        matches_cabinet,
+        physical_room,
+    )
 
     # A standalone room number is an exact scope, never a fuzzy quantity query.
     room_query = re.fullmatch(r"\s*(\d{3})(?:实验室|房间)?\s*", q)
@@ -170,7 +172,12 @@ def search_items(
             continue
         if lab and lab not in {room, row["lab"]}:
             continue
+        if location_code and not matches_cabinet(row["location_code"], location_code):
+            continue
         row["physical_room"] = room
+        codes = cabinet_codes(row["location_code"])
+        if len(codes) > 1:
+            row["shared_location_quantity"] = True
         from .ledger import view
 
         details = view(conn, row["id"], starts_at, ends_at)
@@ -180,7 +187,7 @@ def search_items(
         score = score_item(row, query, alias_map.get(row["id"], []))
         from .matching import same_material
 
-        if query and same_material(q, "", row["item_name"], row.get("spec")):
+        if query and (same_material(q, "", row["item_name"], row.get("spec")) or beaker_capacity_match(q, row)):
             score = 100
         if query and score < 40:
             continue
@@ -201,7 +208,7 @@ def search_items(
         ranked.sort(key=lambda item: (item["score"], item["quantity"]), reverse=True)
         # Exact identities must not be mixed with similarly spelled materials.
         # Preserve every matching location and specification for disambiguation.
-        exact = [item for item in ranked if exact_item_query(item, query)]
+        exact = [item for item in ranked if exact_item_query(item, query) or beaker_capacity_match(q, item)]
         if exact:
             ranked = exact
     else:

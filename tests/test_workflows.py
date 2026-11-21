@@ -118,6 +118,38 @@ def test_exact_inventory_identity_excludes_similar_names_and_keeps_locations(db)
     assert len(search_items(db, "烧杯")) == 3
 
 
+def test_beaker_capacity_and_compound_cabinet_search(db):
+    from consumable_assistant.services import search_items
+
+    plain = make_item(db, name="100mL烧杯", spec="100mL，10个/盒")
+    low = make_item(db, name="100ml低型烧杯", location="B1")
+    make_item(db, name="50ml低型烧杯", spec="50mL", location="B2")
+    tube = make_item(db, name="15mL试管", spec="15mL", location="10-De4，10-De5")
+    for query in ("100毫升烧杯", "烧杯100mL"):
+        assert {row["id"] for row in search_items(db, query)} == {plain, low}
+    for location in ("10-De4", "10-De5", "10-De4，10-De5"):
+        rows = search_items(db, "15mL试管", location_code=location)
+        assert rows[0]["id"] == tube and rows[0]["shared_location_quantity"]
+
+
+def test_chat_borrow_accepts_physical_room_when_model_uses_source_label(db):
+    from consumable_assistant.chat import _run_read_tool, bind_chat_scope
+
+    item = make_item(db, name="100mL烧杯", location="07-Ad3")
+    db.execute("UPDATE inventory_items SET category='有机化学',lab='307/310' WHERE id=?", (item,))
+    result = _run_read_tool(db, "unused", "inventory_search", {
+        "query": "100mL烧杯", "lab": "有机化学307", "location_code": "07-Ad3"
+    }, [], None)
+    assert [row["id"] for row in result["rows"]] == [item]
+    for model_lab in ("307/310", "有机化学307"):
+        action = {"item_id": item, "action": "borrow", "lab": model_lab, "location_code": "07-Ad3"}
+        bind_chat_scope(db, "stock", action, "借有机化学307房间07-Ad3柜的100mL烧杯2个")
+        assert action["lab"] == "307" and action["category"] == "有机化学"
+    with pytest.raises(ValueError, match="柜位"):
+        bind_chat_scope(db, "stock", {"item_id": item, "action": "borrow", "lab": "310"},
+                        "借有机化学307房间07-Ad3柜的100mL烧杯2个")
+
+
 def test_inventory_summary_counts_all_records_and_preserves_units_without_writes(db):
     from consumable_assistant.chat import _run_read_tool
 
@@ -610,12 +642,29 @@ def test_preparation_requires_explicit_usage(db, tmp_path):
     payload = {"preview_id": result["preview_id"], "selected_rows": [2]}
     with pytest.raises(ValueError):
         write(db, "prepare", payload)
-    assert (
-        write(db, "prepare", {**payload, "actions": {"2": "consume"}})[
-            "transaction_count"
-        ]
-        == 1
-    )
+    assert write(db, "prepare", {**payload, "actions": {"2": "consume"}})["transaction_count"] == 1
+
+
+def test_second_upload_detects_consumed_source_rows(db, tmp_path):
+    item = make_item(db, quantity=20)
+    path = tmp_path / "classroom.xlsx"
+    sheet(path, ["耗材名称", "规格", "数量", "单位", "使用方式"],
+          [["玻璃烧杯", "100mL", 2, "个", "消耗"], ["玻璃烧杯", "100mL", 1, "个", "消耗"]])
+    first = flow.preparation(db, path)
+    write(db, "prepare", {"preview_id": first["preview_id"], "selected_rows": [2]})
+    second = flow.preparation(db, path)
+    assert [row["previously_consumed"] for row in second["rows"]] == [True, False]
+    payload = {"preview_id": second["preview_id"], "selected_rows": [2]}
+    with pytest.raises(ValueError, match="已登记消耗"):
+        write(db, "prepare", payload)
+    assert stock.view(db, item)["ready"] == "18"
+    write(db, "prepare", {**payload, "selected_rows": [3]})
+    third = flow.preparation(db, path)
+    result = write(db, "prepare", {"preview_id": third["preview_id"], "selected_rows": [2],
+                                   "repeat_reason": "下一班实际取用"})
+    event = db.execute("SELECT note FROM stock_events WHERE id=?", (result["transactions"][0]["id"],)).fetchone()
+    assert stock.view(db, item)["ready"] == "15"
+    assert "下一班实际取用" in event["note"]
 
 
 def test_partial_count_and_safe_batch_correction(db, tmp_path):
@@ -671,6 +720,23 @@ def test_reference_positions_never_duplicate_old_total(db, tmp_path):
     assert [row['counted'] for row in references(db,'高级合成')] == [True,False]
     write(db,'remove_reference',{'file_id':rows[0]['file_id']})
     assert not references(db) and db.execute('SELECT quantity FROM inventory_items').fetchone()[0] == 5
+
+
+def test_reference_without_room_links_to_unique_actual_count(db, tmp_path):
+    from consumable_assistant.teacher_uploads import preview_reference, references
+
+    path = tmp_path / "reference.xlsx"
+    sheet(path, ["产品名", "规格型号", "存放地", "数量单位", "数量"],
+          [["100ml量筒", "玻璃 100ml", "02-Ca3，10-fc3", "个", 8]])
+    preview = preview_reference(db, path, path.name, "高级合成")
+    write(db, "save_reference", {"preview_id": preview["preview_id"]})
+    assert not references(db, "高级合成", lab="310")
+    sheet(path, ["产品名", "规格型号", "数量单位", "数量"],
+          [["100ml量筒", "玻璃 100ml", "个", 3]])
+    count = flow.preview_import(db, path, path.name, "count", "高级合成", lab="310", location_code="10-fc3")
+    write(db, "import", {"preview_id": count["preview_id"]})
+    matched = references(db, "高级合成", lab="310")
+    assert [(row["location_code"], row["counted"]) for row in matched] == [("10-fc3", True)]
 
 
 def test_scoped_chat_write_and_experiment_reject_wrong_cabinet(db):

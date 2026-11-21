@@ -91,6 +91,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         migrate_preparation_history(conn)
         migrate_procurement(conn)
         migrate_teacher_uploads(conn)
+        migrate_classroom_consumption(conn)
         return
     database = conn.execute("PRAGMA database_list").fetchone()[2]
     if database:
@@ -124,6 +125,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         migrate_preparation_history(conn)
         migrate_procurement(conn)
         migrate_teacher_uploads(conn)
+        migrate_classroom_consumption(conn)
     except Exception:
         conn.rollback()
         raise
@@ -458,3 +460,16 @@ def migrate_teacher_uploads(conn):
         conn.execute("CREATE UNIQUE INDEX idx_reference_active ON reference_files(digest,category) WHERE active=1")
         conn.execute("CREATE TABLE reference_positions(id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES reference_files(id), sheet TEXT, source_row INTEGER, item_name TEXT NOT NULL, spec TEXT, unit TEXT, lab TEXT, location_code TEXT, original_location TEXT, original_quantity TEXT)")
         conn.execute("INSERT INTO schema_migrations(version,report) VALUES (10,'{\"teacher_uploads\":true}')")
+
+
+def migrate_classroom_consumption(conn):
+    if conn.execute("SELECT 1 FROM schema_migrations WHERE version=11").fetchone():
+        return
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""CREATE TABLE classroom_consumption_rows(
+            file_hash TEXT NOT NULL, source_sheet TEXT NOT NULL, source_row INTEGER NOT NULL,
+            event_id INTEGER PRIMARY KEY REFERENCES stock_events(id))""")
+        conn.execute("""CREATE INDEX idx_classroom_consumption_source
+            ON classroom_consumption_rows(file_hash,source_sheet,source_row)""")
+        conn.execute("INSERT INTO schema_migrations(version,report) VALUES (11,'{\"classroom_consumption_sources\":true}')")

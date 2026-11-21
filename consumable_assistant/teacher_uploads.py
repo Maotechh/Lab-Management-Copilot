@@ -1,10 +1,10 @@
 import hashlib
 import json
-import re
 import uuid
 
 from . import ledger as stock
 from .attachments import uploaded_frame
+from .matching import cabinet_codes, matches_cabinet, physical_room, same_material
 from .normalization import clean_cell, normalize_text
 from .services import resolve_upload_column
 
@@ -64,7 +64,7 @@ def undo_batch(conn, data, actor):
     return {'ok': True, 'reversed_items': len(eligible), 'needs_count': [row['item_id'] for row in rows if row['status'] == '需重新清点']}
 
 
-def preview_reference(conn, path, filename, category):
+def preview_reference(conn, path, filename, category, default_lab=""):
     if not category.strip():
         raise ValueError('请选择旧表所属科目')
     frame = uploaded_frame(path)
@@ -74,7 +74,8 @@ def preview_reference(conn, path, filename, category):
         values = {key: clean_cell(record.get(col)) if col else None for key, col in columns.items()}
         if not values['name']:
             continue
-        locations = list(dict.fromkeys(part.strip() for part in re.split(r'[、,，;；\n/]+', values['location'] or '') if part.strip())) or [None]
+        values['lab'] = values['lab'] or default_lab.strip() or None
+        locations = cabinet_codes(values['location']) or [None]
         for location in locations:
             rows.append({**values, **frame.attrs['sources'][int(index)], 'category': category, 'location_code': location})
     if not rows:
@@ -106,17 +107,26 @@ def save_reference(conn, data, actor):
 def references(conn, category='', query='', lab='', location_code=''):
     rows = [dict(row) for row in conn.execute("""SELECT p.*,f.category,f.filename FROM reference_positions p
         JOIN reference_files f ON p.file_id=f.id WHERE f.active=1 AND (?='' OR f.category=?)
-        AND (?='' OR p.lab=?) AND (?='' OR p.location_code=?) ORDER BY f.category,f.id,p.source_row,p.id""",
-        (category, category, lab, lab, location_code, location_code))]
+        ORDER BY f.category,f.id,p.source_row,p.id""", (category, category))]
     output = []
     for row in rows:
+        if location_code and not matches_cabinet(row['location_code'], location_code):
+            continue
+        candidates = [dict(item) for item in conn.execute("""SELECT i.*,EXISTS(SELECT 1 FROM stock_counts c JOIN stock_events e ON e.id=c.event_id
+            WHERE c.item_id=i.id AND e.action='count' AND e.reversed_by IS NULL) AS counted FROM inventory_items i
+            JOIN stock_balances b ON b.item_id=i.id WHERE b.active=1 AND b.review_reason IS NULL
+            AND category=? AND normalized_name=? AND unit=?""",
+            (row['category'], normalize_text(row['item_name']), row['unit']))]
+        matches = [item for item in candidates if row['location_code'] and
+                   (item['location_code'] or '').casefold() == row['location_code'].casefold()
+                   and (not row['lab'] or row['lab'] in {item['lab'], physical_room(item)})
+                   and (not row['spec'] or same_material(row['item_name'], row['spec'], item['item_name'], item['spec']))]
+        row['counted'] = bool(len(matches) == 1 and matches[0]['counted'])
+        if row['counted']:
+            row['lab'] = physical_room(matches[0])
+        if lab and row['lab'] != lab:
+            continue
         if normalize_text(query) not in normalize_text(' '.join(str(row[key] or '') for key in ('item_name','spec','lab','location_code'))):
             continue
-        matches = conn.execute("""SELECT i.id,EXISTS(SELECT 1 FROM stock_counts c JOIN stock_events e ON e.id=c.event_id
-            WHERE c.item_id=i.id AND e.action='count' AND e.reversed_by IS NULL) AS counted FROM inventory_items i
-            JOIN stock_balances b ON b.item_id=i.id WHERE b.active=1 AND b.review_reason IS NULL AND category=? AND lab=? AND location_code=?
-            AND normalized_name=? AND (? IS NULL OR spec=?) AND unit=?""",
-            (row['category'],row['lab'],row['location_code'],normalize_text(row['item_name']),row['spec'],row['spec'],row['unit'])).fetchall()
-        row['counted'] = bool(len(matches) == 1 and matches[0]['counted'])
         output.append(row)
     return output

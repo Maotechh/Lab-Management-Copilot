@@ -135,13 +135,34 @@ def execute_tool(conn, run_id: str, token: str, name: str, arguments: dict, disp
         try:
             args = chat.ToolArguments.model_validate(arguments).model_dump(exclude_none=True)
             attachments = [dict(value) for value in conn.execute("SELECT * FROM chat_attachments WHERE conversation_id=?", (row["conversation_id"],))]
+            request = chat.ChatMessageRequest.model_validate_json(row["request_json"])
+            if name in {"read_attachment", "prepare_attachment"}:
+                attachment = chat._find_attachment(attachments, args.get("attachment_id") or "")
+                if attachment and attachment["content_type"].startswith("image/") and attachment["id"] not in request.attachments:
+                    raise ValueError("请把要识别的照片随当前消息一起发送")
             result = chat._cached_tool_result(conn, row["message_id"], name, args)
             if result is None:
                 if name == "business_preview":
                     newer = conn.execute("SELECT 1 FROM chat_runs WHERE conversation_id=? AND message_id>? AND status IN ('queued','running')", (row["conversation_id"], row["message_id"])).fetchone()
                     if newer:
                         raise stock.Conflict("有更新的消息等待处理，本条消息的计划已失效")
-                    result = chat._business_task(conn, row["conversation_id"], row["message_id"], json.loads(row["request_json"])["message_id"], args, attachments, dispatch_fn, row["actor"])
+                    steps = (args.get("payload") or {}).get("operations", []) if args.get("kind") == "mixed" else [args]
+                    selected = chat._attachments(conn, row["conversation_id"], request.attachments)
+                    if selected and any(
+                        step.get("kind") == "stock" and (step.get("payload") or {}).get("action") == "consume"
+                        or step.get("kind") == "bulk" and any(
+                            operation.get("action") == "consume"
+                            for operation in (step.get("payload") or {}).get("operations", [])
+                        )
+                        for step in steps
+                    ):
+                        raise ValueError("附件中的课堂消耗须先核对清单，再由 prepare 登记原表条目")
+                    for step in steps:
+                        if step.get("kind") == "prepare":
+                            reason = str((step.get("payload") or {}).get("repeat_reason") or "").strip()
+                            if reason and reason not in request.text:
+                                raise ValueError("请在本条消息中说明再次登记的实际原因")
+                    result = chat._business_task(conn, row["conversation_id"], row["message_id"], request.message_id, args, attachments, dispatch_fn, row["actor"])
                 elif name == "analyze_attachments":
                     from . import analysis
 
@@ -188,11 +209,13 @@ def process_run(conn, run: dict, dispatch_fn, history_fn) -> dict:
                 response["reply"] = "已取消待确认计划，没有修改库存。"
         else:
             conn.commit()
+            selected = chat._attachments(conn, conversation_id, request.attachments)
             payload = {
                 "runId": run["id"], "conversationId": conversation_id,
                 "callbackToken": run["callback_token"], "systemPrompt": chat.CHAT_SYSTEM,
                 "text": chat.json_text({
                     "current_message": request.text,
+                    "current_attachment_ids": request.attachments,
                     "history": chat._recent_history(conn, conversation_id),
                     "attachments": [{key: value for key, value in dict(item).items() if key != "path"} for item in conn.execute("SELECT * FROM chat_attachments WHERE conversation_id=?", (conversation_id,))],
                     "current_time": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
@@ -200,7 +223,6 @@ def process_run(conn, run: dict, dispatch_fn, history_fn) -> dict:
             }
             from .attachments import image_payload
 
-            selected = chat._attachments(conn, conversation_id, request.attachments)
             payload["images"] = [image_payload(Path(item["path"]), item["filename"]) for item in selected if item["content_type"].startswith("image/")]
             result = run_dsh(payload)
             # The preview is the business server's result, never a model claim.

@@ -61,3 +61,21 @@ def test_process_run_persists_model_failure_code(tmp_path, monkeypatch):
         assert response["status"] == "failed"
         assert response["error_code"] == "MODEL_FAILED"
         assert db.execute("SELECT error FROM chat_runs WHERE id=?", (run["id"],)).fetchone()[0] == "MODEL_FAILED"
+def test_voice_repackages_wav_metadata_and_rejects_wrong_format():
+    import io
+    import wave
+
+    import pytest
+
+    from consumable_assistant.dsh_client import canonical_voice_wave
+
+    output = io.BytesIO()
+    with wave.open(output, "wb") as source:
+        source.setparams((1, 2, 16000, 2, "NONE", ""))
+        source.writeframes(b"\x01\x00\x02\x00")
+    canonical = output.getvalue()
+    extra = b"LIST\x04\x00\x00\x00INFO"
+    with_metadata = canonical[:4] + (len(canonical) + len(extra) - 8).to_bytes(4, "little") + canonical[8:36] + extra + canonical[36:]
+    assert canonical_voice_wave(with_metadata) == canonical
+    with pytest.raises(ValueError, match="不完整"):
+        canonical_voice_wave(canonical[:-2])

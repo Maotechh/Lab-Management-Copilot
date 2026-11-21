@@ -100,6 +100,7 @@
                 <label>取用科目<input id="prepareCategory" /></label><label>取用房间<input id="prepareLab" /></label><label>取用柜位<input id="prepareLocation" /></label>
                 <button id="prepareBtn"><i data-lucide="file-spreadsheet" class="icon-sm"></i>分析批量清单</button>
                 <button id="consumePrepareBtn" class="primary" disabled><i data-lucide="package-minus" class="icon-sm"></i>扣减已选库存</button>
+                <label id="prepareRepeatField" class="field-label" hidden>再次登记原因<input id="prepareRepeatReason" maxlength="300" /></label>
                 <button id="exportPrepareBtn" class="secondary" disabled><i data-lucide="download" class="icon-sm"></i>导出结果</button>
                 <label class="inline-check"><input id="prepareMissingOnly" type="checkbox" />只看需要采购</label>
               </div>
@@ -146,7 +147,7 @@
                   </select>
                   <label>科目<input id="batchUploadCategory" list="subjectNames" /></label>
                   <datalist id="subjectNames"><option>普通化学</option><option>有机化学</option><option>物理化学</option><option>仪器分析</option><option>高级合成</option><option>公共耗材</option><option>分析化学</option></datalist>
-                  <label>实盘房间<input id="countLab" /></label><label>实盘柜位<input id="countLocation" /></label>
+                  <label><span id="uploadRoomLabel">实盘房间</span><input id="countLab" /></label><label id="uploadCabinetField">实盘柜位<input id="countLocation" /></label>
                   <label class="inline-check"><input id="sumCountParts" type="checkbox" />同物多行是分开数的份数，按合计实盘</label>
                   <button type="button" class="tab secondary" data-tab="prepare">课堂耗用</button>
                   <button id="batchUploadBtn" class="primary"><i data-lucide="upload" class="icon-sm"></i>上传库存表</button>

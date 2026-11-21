@@ -306,10 +306,11 @@ async def transcribe_voice(request: Request):
         audio.extend(chunk)
         if len(audio) > 4 * 1024 * 1024:
             raise HTTPException(413, "录音不能超过两分钟")
-    if not audio or bytes(audio[:4]) != b"RIFF":
-        raise HTTPException(400, "录音格式必须是 WAV")
     try:
-        return await asyncio.to_thread(dsh_client.transcribe, bytes(audio))
+        canonical = dsh_client.canonical_voice_wave(bytes(audio))
+        return await asyncio.to_thread(dsh_client.transcribe, canonical)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     except dsh_client.DSHUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
     finally:
@@ -954,7 +955,7 @@ async def upload_inventory(
             if mode == 'reference':
                 from .teacher_uploads import preview_reference
 
-                return preview_reference(conn, path, file.filename, category)
+                return preview_reference(conn, path, file.filename, category, lab)
             return flow.preview_import(conn, path, file.filename, mode, category, lab=lab, location_code=location_code, sum_parts=sum_parts)
     finally:
         path.unlink(missing_ok=True)
@@ -966,7 +967,8 @@ async def prepare(file: Annotated[UploadFile, File()], course: str = Form(""), c
     path = await uploaded(file)
     try:
         with connect() as conn:
-            return flow.preparation(conn, path, course, scope={"category": category, "lab": lab, "location_code": location_code})
+            return flow.preparation(conn, path, course, filename=file.filename,
+                                    scope={"category": category, "lab": lab, "location_code": location_code})
     finally:
         path.unlink(missing_ok=True)
 

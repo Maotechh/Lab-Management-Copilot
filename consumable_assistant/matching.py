@@ -26,6 +26,26 @@ def same_material(name, spec, item_name, item_spec=""):
     return identity(name, spec) == identity(item_name, item_spec)
 
 
+def cabinet_codes(value):
+    return list(dict.fromkeys(part.strip() for part in re.split(r"[、,，;；\n/]+", value or "") if part.strip()))
+
+
+def matches_cabinet(value, requested):
+    requested = requested.strip().casefold()
+    return (value or "").strip().casefold() == requested or any(
+        code.casefold() == requested for code in cabinet_codes(value)
+    )
+
+
+def beaker_capacity_match(query, item):
+    name, measures = identity(query)
+    if name != "烧杯" or len(measures) != 1 or measures[0][0] != "volume":
+        return False
+    item_name, _ = identity(item["item_name"])
+    _, item_measures = identity(item["item_name"], item.get("spec"))
+    return item_name in {"烧杯", "低型烧杯", "高型烧杯", "玻璃烧杯"} and measures == item_measures
+
+
 def physical_room(item):
     lab = str(item.get("lab") or "")
     rooms = {room.strip() for room in re.split(r"[/、,，+＋]", lab) if room.strip()}

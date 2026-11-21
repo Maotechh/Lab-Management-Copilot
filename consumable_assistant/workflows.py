@@ -297,7 +297,7 @@ def preview_import(
     ).hexdigest()
     duplicate = bool(
         conn.execute(
-            "SELECT 1 FROM upload_previews WHERE committed=1 AND (file_hash=? OR content_hash=?)",
+            "SELECT 1 FROM upload_previews WHERE mode!='prepare' AND committed=1 AND (file_hash=? OR content_hash=?)",
             (file_hash, content_hash),
         ).fetchone()
     )
@@ -340,7 +340,7 @@ def commit_import(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
     if json.loads(preview["errors"]):
         raise ValueError("请先修正表格中的错误行")
     old = conn.execute(
-        "SELECT 1 FROM upload_previews WHERE committed=1 AND (file_hash=? OR content_hash=?)",
+        "SELECT 1 FROM upload_previews WHERE mode!='prepare' AND committed=1 AND (file_hash=? OR content_hash=?)",
         (preview["file_hash"], preview["content_hash"]),
     ).fetchone()
     if old and not (
@@ -581,17 +581,19 @@ def remap_preparation(conn: sqlite3.Connection, data: dict) -> dict:
     rows = allocate_preparation(
         conn, json.loads(preview["rows"]), data.get("selections")
     )
+    for row in rows:
+        row["previously_consumed"] = previously_consumed(conn, preview["file_hash"], row)
     token = uuid.uuid4().hex
     conn.execute("UPDATE upload_previews SET committed=1 WHERE id=?", (preview["id"],))
     conn.execute(
-        "INSERT INTO upload_previews(id,file_hash,content_hash,filename,mode,rows,errors) VALUES (?,'','',?,'prepare',?,'[]')",
-        (token, preview["filename"], json.dumps(rows, ensure_ascii=False)),
+        "INSERT INTO upload_previews(id,file_hash,content_hash,filename,mode,rows,errors) VALUES (?,?,'',?,'prepare',?,'[]')",
+        (token, preview["file_hash"], preview["filename"], json.dumps(rows, ensure_ascii=False)),
     )
     return {"preview_id": token, "rows": rows}
 
 
 def preparation(
-    conn: sqlite3.Connection, path: Path, course: str = "", commit: bool = True, *, scope=None
+    conn: sqlite3.Connection, path: Path, course: str = "", commit: bool = True, *, scope=None, filename=None
 ) -> dict:
     from .attachments import uploaded_frame
     from .services import resolve_column
@@ -642,10 +644,21 @@ def preparation(
         )
         row["action"] = action if action in ("consume", "borrow") else ""
         rows.append(row)
-    return checklist(conn, rows, path.name, commit=commit, scope=scope)
+    return checklist(conn, rows, filename or path.name, commit=commit, scope=scope,
+                     file_hash=hashlib.sha256(path.read_bytes()).hexdigest())
 
 
-def checklist(conn, rows: list[dict], filename: str, *, commit=False, attachment_id=None, replaces=None, scope=None):
+def previously_consumed(conn, file_hash, row):
+    if not file_hash:
+        return False
+    return bool(conn.execute("""SELECT 1 FROM classroom_consumption_rows r
+        JOIN stock_events e ON e.id=r.event_id WHERE r.file_hash=? AND r.source_sheet=?
+        AND r.source_row=? AND e.reversed_by IS NULL LIMIT 1""",
+        (file_hash, row["source_sheet"], row["source_row"])).fetchone())
+
+
+def checklist(conn, rows: list[dict], filename: str, *, commit=False, attachment_id=None, replaces=None,
+              scope=None, file_hash=""):
     from pydantic import BaseModel, ConfigDict, Field
 
     class ChecklistRow(BaseModel):
@@ -685,10 +698,12 @@ def checklist(conn, rows: list[dict], filename: str, *, commit=False, attachment
     if len({row["row_number"] for row in prepared}) != len(prepared):
         raise ValueError("清单行号不能重复")
     prepared = allocate_preparation(conn, prepared)
+    for row in prepared:
+        row["previously_consumed"] = previously_consumed(conn, file_hash, row)
     token = uuid.uuid4().hex
     conn.execute(
-        "INSERT INTO upload_previews(id,file_hash,content_hash,filename,mode,rows,errors) VALUES (?,'','',?,'prepare',?,'[]')",
-        (token, filename, json.dumps(prepared, ensure_ascii=False)),
+        "INSERT INTO upload_previews(id,file_hash,content_hash,filename,mode,rows,errors) VALUES (?,?,'',?,'prepare',?,'[]')",
+        (token, file_hash, filename, json.dumps(prepared, ensure_ascii=False)),
     )
     if replaces:
         conn.execute("UPDATE upload_previews SET committed=1 WHERE id=?", (replaces,))
@@ -709,6 +724,12 @@ def consume_preparation(conn: sqlite3.Connection, data: dict, actor: str) -> dic
     rows = [row for row in json.loads(preview["rows"]) if row["row_number"] in selected]
     if not rows:
         raise ValueError("请选择清单条目")
+    file_hash = preview["file_hash"]
+    duplicates = [row for row in rows if previously_consumed(conn, file_hash, row)]
+    reason = str(data.get("repeat_reason") or "").strip()
+    if duplicates and not reason:
+        sources = "、".join(f"{row['source_sheet']} 第 {row['source_row']} 行" for row in duplicates[:8])
+        raise ValueError(f"这些条目已登记消耗：{sources}。如确属另一次取用，请填写再次登记原因。")
     versions = {
         location["item_id"]: location["version"]
         for row in rows
@@ -733,6 +754,9 @@ def consume_preparation(conn: sqlite3.Connection, data: dict, actor: str) -> dic
             )
         for location in row["locations"]:
             if stock.number(location["allocated_quantity"]) > 0:
+                note = f"{row['course']} / {row['experiment']} · {row['source_file']} · {row['source_sheet']} 第 {row['source_row']} 行"
+                if reason:
+                    note += f" · 再次登记原因：{reason}"
                 results.append(
                     stock.operate(
                         conn,
@@ -742,12 +766,15 @@ def consume_preparation(conn: sqlite3.Connection, data: dict, actor: str) -> dic
                             **{field: row.get(field) for field in SCOPE_FIELDS},
                             "quantity": location["allocated_quantity"],
                             "unit": location["unit"],
-                            "note": f"{row['course']} / {row['experiment']}",
+                            "note": note,
                         },
                         actor,
                         checked=True,
                     )
                 )
+                if file_hash:
+                    conn.execute("INSERT INTO classroom_consumption_rows VALUES (?,?,?,?)",
+                                 (file_hash, row["source_sheet"], row["source_row"], results[-1]["id"]))
     conn.execute("UPDATE upload_previews SET committed=1 WHERE id=?", (preview["id"],))
     return {"ok": True, "transaction_count": len(results), "transactions": results}
 

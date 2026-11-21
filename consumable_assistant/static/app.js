@@ -737,7 +737,7 @@ function renderInventoryRow(row) {
       <td data-label="实验室">${escapeHtml(row.physical_room || row.lab)}</td>
       <td data-label="耗材" class="name-cell"><button type="button" class="item-link" data-item-detail="${row.id}">${escapeHtml(row.item_name)}</button>${renderAliases(row.aliases)}</td>
       <td data-label="规格">${spec}</td>
-      <td data-label="位置"><strong>${escapeHtml(row.location_code)}</strong><div>${escapeHtml(row.count_status)}</div></td>
+      <td data-label="位置"><strong>${escapeHtml(row.location_code)}</strong><div>${escapeHtml(row.count_status)}</div>${row.shared_location_quantity ? '<div class="muted small-text">多个柜位合计</div>' : ''}</td>
       <td data-label="数量"><strong>可用 ${formatQuantity(row.available_quantity, row.unit)}</strong><div class="muted small-text">总量 ${formatQuantity(row.owned_quantity, row.unit)} · 借出 ${row.borrowed_quantity} · 预留 ${row.reserved_quantity}</div><div class="muted small-text">待清洗 ${row.cleaning} · 维修 ${row.repair} · 待核对 ${row.quarantine}</div>${row.review_reason ? `<span class="badge danger">${escapeHtml(row.review_reason)}</span>` : ''}</td>
       <td data-label="预警">
         <div class="inline-edit">
@@ -752,7 +752,7 @@ function renderInventoryRow(row) {
 
 function teacherStockTable(rows) {
   return tableHtml(['科目','耗材','规格','房间','柜位','可用','总拥有','清点状态'],rows.map(row=>[
-    row.category,row.item_name,row.spec,row.physical_room||row.lab,row.location_code
+    row.category,row.item_name,row.spec,row.physical_room||row.lab,row.shared_location_quantity ? `${row.location_code}（合计）` : row.location_code
   ].map(value=>escapeHtml(value||'未填写')).concat(formatQuantity(row.available_quantity,row.unit),formatQuantity(row.owned_quantity,row.unit),escapeHtml(row.count_status||'未记录'))));
 }
 
@@ -1184,7 +1184,7 @@ function renderPrepareRows(rows) {
         <td data-label="还需采购">${formatQuantity(row.missing_quantity, row.unit)}</td>
         <td data-label="建议采购">${formatQuantity(row.purchase_quantity, row.purchase_unit)}</td>
         <td data-label="位置">${locations || '<span class="muted">无匹配位置</span>'}${row.status==='需要确认匹配'||row.selected_item_id?`<select data-prepare-match="${row.row_number}" aria-label="${escapeHtml(row.name)}匹配物品"><option value="">选择具体物品</option>${(row.candidates||[]).map(item=>`<option value="${item.id}" ${item.id===row.selected_item_id?'selected':''}>${escapeHtml(item.item_name)} ${escapeHtml(item.spec)} · ${escapeHtml(item.lab)} ${escapeHtml(item.location_code)} · ${escapeHtml(item.unit)}</option>`).join('')}</select>`:''}</td>
-        <td data-label="状态"><span class="badge ${statusClass}">${escapeHtml(row.status)}</span></td>
+        <td data-label="状态"><span class="badge ${statusClass}">${escapeHtml(row.status)}</span>${row.previously_consumed ? '<div class="small-text">此表格行已登记消耗</div>' : ''}</td>
       </tr>
     `;
   }).join("") || emptyRow(11, state.prepareOnlyMissing ? "当前清单没有需要采购的耗材" : "暂无清单结果");
@@ -1200,10 +1200,14 @@ function renderPrepareSummary(rows) {
 }
 
 function updatePrepareCommitButton() {
-  $("#consumePrepareBtn").disabled = state.prepareSelectedRows.size === 0;
+  const repeated = state.prepareRows.some(row => row.previously_consumed && state.prepareSelectedRows.has(String(row.row_number)));
+  $('#prepareRepeatField').hidden = !repeated;
+  if (!repeated) $('#prepareRepeatReason').value = '';
+  $("#consumePrepareBtn").disabled = state.prepareSelectedRows.size === 0 || (repeated && !$('#prepareRepeatReason').value.trim());
 }
 
 async function consumeSelectedPrepareRows() {
+  const previewId = state.preparePreviewId;
   const selected = state.prepareRows.filter((row) => state.prepareSelectedRows.has(String(row.row_number)));
   if (!selected.length) {
     toast("请先选择库存足够的清单条目");
@@ -1214,11 +1218,13 @@ async function consumeSelectedPrepareRows() {
     const result = await api("/api/prepare/consume", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ preview_id:state.preparePreviewId,selected_rows:selected.map(row=>row.row_number),actions:state.prepareActions }),
+      body: JSON.stringify({ preview_id:previewId,selected_rows:selected.map(row=>row.row_number),actions:state.prepareActions,repeat_reason:$('#prepareRepeatReason').value.trim()||null }),
     });
     toast(`已扣减 ${result.transaction_count} 条库存记录`);
-    state.prepareSelectedRows = new Set();
-    state.prepareRows=[];state.preparePreviewId=null;localStorage.removeItem('lab-prepare-preview');renderPrepareRows([]);
+    if(state.preparePreviewId===previewId){
+      state.prepareSelectedRows = new Set();
+      state.prepareRows=[];state.preparePreviewId=null;localStorage.removeItem('lab-prepare-preview');renderPrepareRows([]);
+    }
     await refreshAll();
   } catch (err) {
     toast(err.message || "库存扣减失败");
@@ -1467,6 +1473,7 @@ function bindEvents() {
     renderPrepareRows(state.prepareRows);
   });
   $("#consumePrepareBtn").addEventListener("click", consumeSelectedPrepareRows);
+  $('#prepareRepeatReason').addEventListener('input', updatePrepareCommitButton);
   $("#prepareRows").addEventListener("change", async (event) => {
     const match=event.target.closest('select[data-prepare-match]');
     if(match && match.value){
