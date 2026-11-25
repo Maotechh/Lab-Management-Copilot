@@ -24,6 +24,7 @@ class Scoped(Payload):
 
 
 class Stock(Scoped):
+    source_quote: Text | None = None
     item_id: ID
     action: Literal["inbound", "consume", "borrow", "return", "adjust", "count", "threshold", "state"]
     quantity: Quantity

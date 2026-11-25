@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from . import chat
 from . import ledger as stock
 from .dsh_client import DSHUnavailable, result_error_code, run_dsh
+from .genai import parse_model_json
 
 TOOL_NAMES = frozenset({
     "inventory_search", "workflow_query", "history_search", "prepare_attachment",
@@ -244,23 +245,34 @@ def process_run(conn, run: dict, dispatch_fn, history_fn) -> dict:
         else:
             conn.commit()
             selected = chat._attachments(conn, conversation_id, request.attachments)
+            history = chat._recent_history(conn, conversation_id, run["message_id"])
             payload = {
                 "runId": run["id"], "conversationId": conversation_id,
                 "callbackToken": run["callback_token"], "systemPrompt": chat.CHAT_SYSTEM,
                 "text": chat.json_text({
-                    "current_message": request.text,
                     "current_attachment_ids": request.attachments,
-                    "history": chat._recent_history(conn, conversation_id),
+                    "history": history,
                     "current_plan": json.loads(pending["plan_json"]) if pending and pending["status"] == "pending_confirmation" else None,
                     "plan_to_revise": json.loads(pending["plan_json"]) if pending and pending["status"] == "expired" and chat._edits_plan(request.text) else None,
                     "attachments": [{key: value for key, value in dict(item).items() if key != "path"} for item in conn.execute("SELECT * FROM chat_attachments WHERE conversation_id=?", (conversation_id,))],
                     "current_time": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
+                    "current_message": request.text,
                 }),
             }
             from .attachments import image_payload
 
             payload["images"] = [image_payload(Path(item["path"]), item["filename"]) for item in selected if item["content_type"].startswith("image/")]
             result = run_dsh(payload)
+            if history and result.get("status") == "completed":
+                calls, cancelled = conn.execute("SELECT tool_calls,cancel_requested FROM chat_runs WHERE id=?",
+                                                (run["id"],)).fetchone()
+                if not calls and not cancelled and not reply_guidance(result.get("reply", "")):
+                    result = run_dsh({
+                        **payload, "conversationId": run["id"],
+                        "systemPrompt": payload["systemPrompt"] + "\n上次处理没有产生业务工具结果或有效追问。"
+                        "请结合 history 和 current_message 接续任务。对取用登记先调用 inventory_search 核实各来源，"
+                        "然后生成 business_preview；资料不足时返回只含实际缺项的 missing_fields。",
+                    })
             # The preview is the business server's result, never a model claim.
             saved = conn.execute(
                 "SELECT * FROM chat_tasks WHERE message_id=? AND status='pending_confirmation' ORDER BY rowid DESC LIMIT 1",
@@ -276,7 +288,12 @@ def process_run(conn, run: dict, dispatch_fn, history_fn) -> dict:
                     "reply": "已按当前数据生成预览。请核对物品、位置、数量和状态，再确认执行。",
                 }
             elif result.get("status") == "completed":
-                response = {"status": "answered", "reply": verified_reply(result.get("reply") or "", tools), "tool_results": tools}
+                reply = result.get("reply") or ""
+                if history and not tools and not reply_guidance(reply):
+                    response = {"status": "failed", "error_code": "NO_ACTIONABLE_RESULT",
+                                "reply": "本轮未生成查询、登记预览或具体追问。对话已保留，可以发送继续登记。"}
+                else:
+                    response = {"status": "answered", "reply": verified_reply(reply, tools), "tool_results": tools}
             else:
                 response = {"status": "failed", "reply": "本次对话处理未完成，输入和任务已保存。可以发送继续说明。"}
                 response["error_code"] = result_error_code(result)
@@ -320,24 +337,23 @@ EXPLANATIONS = {
 }
 
 
-def verified_reply(model_text: str, tools: list[dict]) -> str:
-    """Only server-owned wording can assert a business outcome or quantity.
-
-    The model can select missing-field identifiers; free-form assertions are not
-    displayed. Query facts remain available in the persisted tool result cards.
-    """
-    try:
-        value = json.loads(model_text.removeprefix("```json").removesuffix("```").strip())
-        topics = value.get("explanation_topics", []) if isinstance(value, dict) else []
-        fields = value.get("missing_fields", []) if isinstance(value, dict) else []
-        fields = list(dict.fromkeys(field for field in fields if isinstance(field, str) and field in CLARIFICATION_FIELDS)) if isinstance(fields, list) else []
-    except (ValueError, TypeError):
-        fields, topics = [], []
+def reply_guidance(model_text: str) -> str:
+    value = parse_model_json(model_text) or {}
+    topics = value.get("explanation_topics", [])
+    fields = value.get("missing_fields", [])
+    fields = list(dict.fromkeys(field for field in fields if isinstance(field, str) and field in CLARIFICATION_FIELDS)) if isinstance(fields, list) else []
     explanations = [EXPLANATIONS[topic] for topic in dict.fromkeys(topic for topic in topics if isinstance(topic, str)) if topic in EXPLANATIONS] if isinstance(topics, list) else []
     if explanations:
         return "\n\n".join(explanations) + ("\n\n请补充：" + "、".join(CLARIFICATION_FIELDS[field] for field in fields) + "。" if fields else "")
     if fields:
         return "请补充以下资料：" + "、".join(CLARIFICATION_FIELDS[field] for field in fields) + "。当前没有执行新的业务变更。"
+    return ""
+
+
+def verified_reply(model_text: str, tools: list[dict]) -> str:
+    guidance = reply_guidance(model_text)
+    if guidance:
+        return guidance
     if tools:
         if any(entry["result"].get("status") in {"needs_details", "failed"} for entry in tools):
             return "请查看服务器返回的资料核对要求。当前没有执行新的业务变更。"

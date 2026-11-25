@@ -845,6 +845,58 @@ def test_chat_tool_rounds_reuse_prior_query_results(db, monkeypatch):
     assert db.execute("SELECT COUNT(*) FROM chat_tool_calls").fetchone()[0] == 1
 
 
+def test_followup_without_action_recovers_scoped_mixed_preview(db, monkeypatch):
+    import json
+
+    from consumable_assistant import chat, chat_runtime
+    from consumable_assistant.server import dispatch, history_rows
+
+    physical = make_item(db, quantity=16, location="A1")
+    organic = make_item(db, quantity=25, location="B2")
+    db.executemany("UPDATE inventory_items SET category=? WHERE id=?", [("物理化学", physical), ("有机化学", organic)])
+    db.commit()
+    conversation = chat.new_conversation(db, "device")["conversation_id"]
+    question = "上课需要30个100ml玻璃烧杯，去哪里找？"
+    selection = "物理化学的16个用于消耗，剩下的借用有机化学的，帮我登记"
+    extra = "借用人王老师，用于物理化学课，带到314，2030年12月1日17点归还"
+
+    def send(message):
+        return chat.process_message(db, conversation, chat.ChatMessageRequest(message_id=uuid.uuid4().hex, text=message),
+                                    "教师", "device", dispatch, history_rows)
+
+    search = {"name": "inventory_search", "arguments": {"query": "100ml玻璃烧杯"}}
+    scripted_dsh(monkeypatch, db, iter([{"calls": [search]}, {"reply": ""}]))
+    assert send(question)["tool_results"][0]["result"]["total_count"] == 2
+    scripted_dsh(monkeypatch, db, iter([{"reply": "好的，我来处理"}, {"calls": [search]},
+                                         {"reply": '{"missing_fields":["borrower","destination","due_at"]}'}]))
+    followup = send(selection)
+    assert followup["tool_results"] and "借用人" in followup["reply"]
+
+    def preview(payload):
+        context = json.loads(payload["text"])
+        assert [turn["teacher"] for turn in context["history"]] == [question, selection]
+        assert context["current_message"] == extra
+        rows = context["history"][0]["tool_results"][0]["result"]["rows"]
+        assert {row["id"] for row in rows} == {physical, organic}
+        operations = [
+            {"item_id": physical, "category": "物理化学", "action": "consume", "quantity": 16,
+             "source_quote": "物理化学的16个"},
+            {"item_id": organic, "category": "有机化学", "action": "borrow", "quantity": 14,
+             "source_quote": "剩下的借用有机化学的", "borrower": "王老师", "purpose": "物理化学课",
+             "destination": "314", "due_at": "2030-12-01T17:00:00+08:00"},
+        ]
+        result = chat_runtime.execute_tool(db, payload["runId"], payload["callbackToken"], "business_preview",
+                                           {"kind": "mixed", "payload": {"operations": [
+                                               {"kind": "stock", "payload": line} for line in operations
+                                           ]}}, dispatch, history_rows)
+        assert result.get("status") == "pending_confirmation", result
+        return {"status": "completed", "reply": ""}
+
+    monkeypatch.setattr(chat_runtime, "run_dsh", preview)
+    assert send(extra)["status"] == "pending_confirmation"
+    assert [stock.view(db, item)["ready"] for item in (physical, organic)] == ["16", "25"]
+
+
 def test_chat_preparation_attachment_is_committed_with_its_tool_record(db, monkeypatch, tmp_path):
     from consumable_assistant import chat
 
@@ -2011,6 +2063,7 @@ def test_chat_retries_saved_message_after_ai_outage(db, monkeypatch):
     replies = iter(
         [
             None,
+            {"calls": [{"name": "inventory_search", "arguments": {"query": "烧杯"}}]},
             {"reply": "已查询当前校内记录。", "calls": [], "_provider": "Qwen"},
         ]
     )
