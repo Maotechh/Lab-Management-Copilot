@@ -113,7 +113,7 @@ let runningPage;
  response=page.waitForResponse(r=>r.url().endsWith('/api/actions/execute_schedule'));
  await page.locator(`[data-workflow=execute][data-id="${schedule.id}"]`).click();const execution=await response;assert.equal(execution.status(),200,await execution.text());await confirmPreview(await execution.json());
  await pollJson('/api/items/'+itemId,item=>item.ready==='30');
- await tab('admin');await page.locator('#batchUploadFile').setInputFiles(uploadPath);
+ await tab('admin');await page.locator('#batchUploadMode').selectOption('add');await page.locator('#batchUploadFile').setInputFiles(uploadPath);
  response=page.waitForResponse(r=>r.url().endsWith('/api/import/upload'));await page.locator('#batchUploadBtn').click();assert.equal((await response).status(),200);
  response=page.waitForResponse(r=>r.url().endsWith('/api/actions/import')&&r.request().method()==='POST');
  await page.locator('#confirmImportBtn').click();await confirmPreview(await (await response).json());await page.waitForFunction(()=>document.querySelector('#confirmImportBtn').disabled);

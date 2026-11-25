@@ -140,6 +140,11 @@ def execute_tool(conn, run_id: str, token: str, name: str, arguments: dict, disp
                 attachment = chat._find_attachment(attachments, args.get("attachment_id") or "")
                 if attachment and attachment["content_type"].startswith("image/") and attachment["id"] not in request.attachments:
                     raise ValueError("请把要识别的照片随当前消息一起发送")
+            if name == "prepare_attachment":
+                for field, value in chat.checklist_chat_scope(conn, request.text).items():
+                    if args.get(field) and str(args[field]).strip().casefold() != str(value).casefold():
+                        raise ValueError("清单参数与消息中指定的取用科目、房间或柜位不一致，请重新核对")
+                    args[field] = value
             result = chat._cached_tool_result(conn, row["message_id"], name, args)
             if result is None:
                 if name == "business_preview":

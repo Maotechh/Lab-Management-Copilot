@@ -884,6 +884,64 @@ def test_chat_preparation_attachment_is_committed_with_its_tool_record(db, monke
     assert db.execute("SELECT COUNT(*) FROM chat_tool_calls WHERE name='prepare_attachment'").fetchone()[0] == 1
 
 
+def test_chat_classroom_uses_teacher_cabinet_even_when_model_omits_scope(db, tmp_path):
+    from consumable_assistant import chat, chat_runtime
+    from consumable_assistant.server import dispatch, history_rows
+
+    right = make_item(db, quantity=8, location="07-Ad3")
+    wrong = make_item(db, quantity=20, location="14-Ab5")
+    db.execute("UPDATE inventory_items SET category='有机化学',lab='307/310' WHERE id=?", (right,))
+    db.execute("UPDATE inventory_items SET category='物理化学',lab='314' WHERE id=?", (wrong,))
+    path = tmp_path / "class.xlsx"
+    sheet(path, ["耗材名称", "规格", "数量", "单位", "使用方式"],
+          [["玻璃烧杯", "100mL", 2, "个", "消耗"]])
+    conversation = chat.new_conversation(db, "teacher")["conversation_id"]
+    attachment_id = uuid.uuid4().hex
+    db.execute(
+        "INSERT INTO chat_attachments(id,conversation_id,filename,content_type,size,sha256,path) VALUES (?,?,?,?,?,?,?)",
+        (attachment_id, conversation, path.name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+         path.stat().st_size, "teacher-test", str(path)),
+    )
+    db.commit()
+    unscoped = chat._run_read_tool(
+        db, conversation, "prepare_attachment", {"attachment_id": attachment_id, "lab": "314"},
+        [{"id": attachment_id, "filename": path.name, "path": str(path), "content_type": "application/octet-stream"}],
+        history_rows,
+    )
+    assert unscoped["rows"][0]["locations"][0]["item_id"] == wrong
+    message_id = db.execute(
+        "INSERT INTO chat_messages(conversation_id,request_id,role,content) VALUES (?,?,'user','先核对清单')",
+        (conversation, uuid.uuid4().hex),
+    ).lastrowid
+    chat._record_tool_call(db, conversation, message_id, "prepare_attachment", {}, unscoped, "test")
+    db.commit()
+
+    message = chat.ChatMessageRequest(
+        message_id=uuid.uuid4().hex, attachments=[attachment_id],
+        text="请登记物理化学实验的课上消耗，从有机化学 307 房间 07-Ad3 柜取用。",
+    )
+    chat_runtime.enqueue(db, conversation, message, "Teacher", "teacher")
+    run = chat_runtime.claim(db)
+
+    def tool(name, arguments):
+        return chat_runtime.execute_tool(db, run["id"], run["callback_token"], name, arguments, dispatch, history_rows)
+
+    bad_preview = tool("business_preview", {"kind": "prepare", "payload": {
+        "preview_id": unscoped["preview_id"], "selected_rows": [2],
+    }})
+    assert "不在指定科目" in bad_preview["error"]
+    conflict = tool("prepare_attachment", {"attachment_id": attachment_id, "lab": "314"})
+    assert "不一致" in conflict["error"]
+    result = tool("prepare_attachment", {"attachment_id": attachment_id})
+    assert result["rows"][0]["locations"][0]["item_id"] == right
+    preview = tool("business_preview", {"kind": "prepare", "payload": {
+        "preview_id": result["preview_id"], "selected_rows": [2],
+    }})
+    assert preview["status"] == "pending_confirmation"
+    assert [change["item_id"] for change in preview["preview"]["changes"]] == [right]
+    assert [stock.view(db, key)["ready"] for key in (right, wrong)] == ["8", "20"]
+
+
 def test_photo_checklist_keeps_unmatched_rows_and_source_coordinates(db, tmp_path):
     from PIL import Image
 

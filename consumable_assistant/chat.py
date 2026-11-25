@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -14,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from . import ledger as stock
 from . import workflows as flow
 from .chat_contracts import prompt_contracts, validate_payload
-from .matching import physical_room
+from .matching import SCOPE_FIELDS, cabinet_codes, physical_room, require_scope
 from .services import (
     list_alerts,
     normalize_history_filters,
@@ -483,6 +484,7 @@ def _business_task(
         message = conn.execute('SELECT content FROM chat_messages WHERE id=? AND conversation_id=?', (message_id, conversation_id)).fetchone()
         if message:
             bind_chat_scope(conn, kind, payload, message['content'])
+            check_saved_classroom_scope(conn, kind, payload, message['content'])
     payload = _fill_versions(conn, kind, payload)
     if kind == "location_details":
         photo_id = str(payload.pop("photo_attachment_id", "") or "")
@@ -523,8 +525,6 @@ def _business_task(
 
 
 def inventory_search_scope(conn, category, lab):
-    import re
-
     if not lab:
         return category, lab
     for row in conn.execute("SELECT DISTINCT category FROM inventory_items WHERE category IS NOT NULL"):
@@ -536,10 +536,54 @@ def inventory_search_scope(conn, category, lab):
     return category, match[1] if match else lab
 
 
-def bind_chat_scope(conn, kind, payload, message):
-    import re
+def checklist_chat_scope(conn, message):
+    # The course name may precede the source cabinet in the same sentence.
+    clauses = re.findall(r"(?:从|取自|取用科目[为是：:]?)\s*([^。！？；;]+)", message)
+    source = clauses[-1] if clauses else message
+    rooms = set(re.findall(r"(\d{3})\s*(?:房间|实验室)", source))
+    rooms.update(re.findall(r"(?:房间|实验室)\s*(\d{3})(?![A-Za-z0-9-])", source))
+    cabinets = {
+        match.casefold() for match in re.findall(r"(?<![A-Za-z0-9-])([A-Za-z0-9][A-Za-z0-9-]*)\s*(?:号\s*)?柜", source)
+    }
+    if not clauses and not (rooms or cabinets):
+        return {}
+    sites = conn.execute("SELECT DISTINCT category,location_code FROM inventory_items")
+    subjects, codes = set(), set()
+    for site in sites:
+        if clauses and site['category'] and site['category'] in source:
+            subjects.add(site['category'])
+        codes.update(code for code in cabinet_codes(site['location_code']) if code.casefold() in cabinets)
+    scope = {}
+    if len(subjects) == 1:
+        scope['category'] = next(iter(subjects))
+    if len(rooms) == 1:
+        scope['lab'] = next(iter(rooms))
+    if len(cabinets) == 1:
+        scope['location_code'] = next(iter(codes)) if len(codes) == 1 else next(iter(cabinets))
+    return scope
 
-    from .matching import SCOPE_FIELDS, in_scope, physical_room, require_scope
+
+def check_saved_classroom_scope(conn, kind, payload, message):
+    if kind == "mixed":
+        for step in payload["operations"]:
+            check_saved_classroom_scope(conn, step["kind"], step["payload"], message)
+    if kind != "prepare":
+        return
+    scope = checklist_chat_scope(conn, message)
+    if not scope:
+        return
+    preview = conn.execute("SELECT rows FROM upload_previews WHERE id=? AND mode='prepare'",
+                           (payload["preview_id"],)).fetchone()
+    if not preview:
+        return
+    for row in json.loads(preview["rows"]):
+        if row["row_number"] in payload["selected_rows"]:
+            for location in row["locations"]:
+                require_scope(stock.ensure_balance(conn, location["item_id"]), scope)
+
+
+def bind_chat_scope(conn, kind, payload, message):
+    from .matching import in_scope
 
     if kind == 'mixed':
         for step in payload['operations']:
@@ -1175,6 +1219,10 @@ def confirm_task(
             raise stock.Conflict("待确认内容已经变化，请重新预览")
         if live_plan.get("context_hash") and live_plan["context_hash"] != _context_hash(conn, live_plan["kind"], live_plan["payload"]):
             raise PlanChanged(_refresh_stale_plan(conn, live, live_plan, actor, request_id, dispatch_fn))
+        if live_plan["kind"] in {"prepare", "mixed"}:
+            message = conn.execute("SELECT content FROM chat_messages WHERE id=?", (live["message_id"],)).fetchone()
+            if message:
+                check_saved_classroom_scope(conn, live_plan["kind"], live_plan["payload"], message["content"])
         dispatch_started = True
         result = stock.write_in_transaction(
             conn,
