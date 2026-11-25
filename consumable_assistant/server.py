@@ -591,6 +591,8 @@ def dispatch(conn: sqlite3.Connection, kind: str, data: dict, actor: str) -> dic
         return teacher_uploads.undo_batch(conn, data, actor)
     if kind == 'archive_item':
         return teacher_uploads.archive_item(conn, data, actor)
+    if kind == 'restore_item':
+        return teacher_uploads.restore_item(conn, data, actor)
     if kind == 'save_reference':
         return teacher_uploads.save_reference(conn, data, actor)
     if kind == 'remove_reference':
@@ -790,7 +792,8 @@ def dispatch(conn: sqlite3.Connection, kind: str, data: dict, actor: str) -> dic
     raise ValueError("未知操作")
 
 
-def form_preview(conn, kind: str, payload: dict, request: Request, conversation_id: str | None = None) -> dict:
+def form_preview(conn, kind: str, payload: dict, request: Request, conversation_id: str | None = None, *,
+                 checklist_source: bool = False) -> dict:
     request_id = request.headers.get("x-request-id", "")
     if not 8 <= len(request_id) <= 100:
         raise ValueError("请使用有效请求编号生成预览")
@@ -815,6 +818,8 @@ def form_preview(conn, kind: str, payload: dict, request: Request, conversation_
             conn.commit()
             conversation_id = chat_session.new_conversation(conn, request.headers.get("x-device-id", ""))["conversation_id"]
             conn.execute("BEGIN IMMEDIATE")
+        if checklist_source:
+            chat_session._validate_record_references(conn, conversation_id, kind, {"preview_id": payload["preview_id"]})
         actor = actor_name(request)
         chat_runtime.expire_plans(conn, conversation_id, request_id)
         operation_label = ACTION_LABELS.get(str(payload.get("action", "")), "库存变更") if kind == "stock" else {
@@ -822,7 +827,9 @@ def form_preview(conn, kind: str, payload: dict, request: Request, conversation_
             "execute_schedule": "执行实验安排", "cancel_schedule": "取消实验安排",
             "metadata": "修改耗材资料", "create_item": "新增耗材", "transfer": "位置转移",
             "location_details": "修改位置资料", "alert": "调整提醒", "import": "表格导入",
-            "prepare": "清单处理", "undo": "撤销操作",
+            "prepare": "清单处理", "undo": "撤销操作", "undo_batch": "撤销上传条目",
+            "archive_item": "停用耗材", "restore_item": "恢复耗材",
+            "save_reference": "保存历史参考", "remove_reference": "移除历史参考",
         }.get(kind, "业务变更")
         cursor = conn.execute("INSERT INTO chat_messages(conversation_id,request_id,role,content,request_hash,actor,device_id) VALUES (?,?,'user',?,?,?,?)", (conversation_id, request_id, "通过表单登记" + operation_label, digest, actor, request.headers.get("x-device-id", "")))
         attachments = [dict(row) for row in conn.execute("SELECT * FROM chat_attachments WHERE conversation_id=?", (conversation_id,))]
@@ -840,6 +847,21 @@ def form_preview(conn, kind: str, payload: dict, request: Request, conversation_
 def action(kind: str, payload: dict, request: Request):
     with connect() as conn:
         return form_preview(conn, kind, payload, request)
+
+
+@app.post("/api/chat/conversations/{conversation_id}/checklists/{preview_id}/plan")
+def checklist_plan(conversation_id: str, preview_id: str, payload: dict, request: Request):
+    with connect() as conn:
+        return form_preview(conn, "prepare", {**payload, "preview_id": preview_id}, request,
+                            conversation_id, checklist_source=True)
+
+
+@app.post("/api/prepare/remap")
+def remap_checklist(payload: dict):
+    payload = chat_session.validate_payload("prepare_remap", payload)
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        return dispatch(conn, "prepare_remap", payload, "清单核对")
 
 
 @app.get("/api/operations/{request_id}")
@@ -987,6 +1009,22 @@ def upload_batch(batch_id: str):
 
     with connect() as conn:
         return {'rows': batch_detail(conn, batch_id)}
+
+
+@app.get('/api/uploads/archived-items')
+def get_archived_items(q: str = ''):
+    from .teacher_uploads import archived_items
+
+    with connect() as conn:
+        return {'rows': archived_items(conn, q)}
+
+
+@app.get('/api/reference-files')
+def get_reference_files():
+    from .teacher_uploads import reference_files
+
+    with connect() as conn:
+        return {'rows': reference_files(conn)}
 
 
 @app.get('/api/reference-positions')

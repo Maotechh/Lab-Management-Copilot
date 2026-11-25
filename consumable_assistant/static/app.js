@@ -45,7 +45,7 @@ async function api(path, options = {}) {
   if (state.chatConversationId) headers.set('X-Conversation-ID', state.chatConversationId);
   const chatToken = localStorage.getItem('lab-chat-token');
   if (chatToken && path.startsWith('/api/chat/')) headers.set('X-Chat-Token', chatToken);
-  const previewOnly = ['/api/transactions/preview','/api/prepare/preview','/api/prepare/export','/api/import/preview','/api/import/upload','/api/locations/preview','/api/ai/check'].includes(path);
+  const previewOnly = ['/api/transactions/preview','/api/prepare/preview','/api/prepare/remap','/api/prepare/export','/api/import/preview','/api/import/upload','/api/locations/preview','/api/ai/check'].includes(path);
   const writing = options.method && options.method !== 'GET' && !previewOnly;
   let requestId;
   const finishPending=()=>{
@@ -497,14 +497,113 @@ function renderToolResult(entry) {
   if (data.type === 'history') {
     return `<div class="chat-result"><strong>操作记录</strong>${tableHtml(['时间','耗材','动作','数量','操作人'],rows.slice(0,30).map(row=>[formatDate(row.created_at),escapeHtml(row.item_name),escapeHtml(row.action_label),formatDelta(row.delta_quantity,row.unit),escapeHtml(row.actor)]))}</div>`;
   }
-  if (data.type === 'preparation') {
-    return `<div class="chat-result"><strong>实验准备清单</strong>${tableHtml(['项目','规格','需求','可用','还需采购','位置','使用方式'],rows.slice(0,100).map(row=>[escapeHtml(row.name),escapeHtml(row.spec || '需确认'),formatQuantity(row.required_quantity,row.unit),formatQuantity(row.available_quantity,row.unit),formatQuantity(row.purchase_quantity,row.purchase_unit),escapeHtml((row.locations||[]).map(item=>`${item.lab} ${item.location_code}`).join('、') || '未匹配'),escapeHtml(row.action || '待确认')]))}</div>`;
-  }
-  if (data.type === 'inventory_import') {
-    return `<div class="chat-result"><strong>库存导入预览</strong><p>新增或匹配 ${data.rows?.length || 0} 行，错误 ${data.errors?.length || 0} 行${data.duplicate_file ? '，检测到重复文件' : ''}。</p>${tableHtml(['行','耗材','单位','数量','重复'],(data.rows||[]).slice(0,30).map(row=>[row.row_number,escapeHtml(row.item_name),escapeHtml(row.unit),escapeHtml(row.quantity),row.duplicate_row?'是':'否']))}</div>`;
-  }
+  if (data.type === 'preparation') return renderChatChecklist(data);
+  if (data.type === 'inventory_import') return renderImportResult(data);
+  const workflow = renderWorkflowResult(data);
+  if (workflow) return workflow;
   if (data.type === 'export') return `<div class="chat-result"><a class="button secondary" href="${escapeHtml(data.url)}"><i data-lucide="download" class="icon-sm"></i>${escapeHtml(data.filename || '下载结果')}</a></div>`;
   return `<div class="chat-result">${tableHtml(['记录','内容'],rows.slice(0,30).map(row=>[escapeHtml(row.id ?? row.name ?? ''),escapeHtml(row.item_name ?? row.name ?? row.status ?? '')]))}</div>`;
+}
+
+const importModeLabels = {add:'新购入库',overwrite:'覆盖库存',count:'部分实盘',count_full:'整柜实盘',reference:'历史参考'};
+const recordStatuses = {draft:'采购草案',ordered:'已订购',partial:'部分到货',received:'已到货',
+  cancelled:'已取消',reserved:'已预留',executed:'已取用',awaiting_procurement:'仍需采购',completed:'已完成'};
+
+function renderImportResult(data) {
+  const errors = data.errors || [];
+  const rows = data.rows || [];
+  const source = row => [row.source_sheet, `第 ${row.source_row ?? row.row_number} 行`].filter(Boolean).join(' ');
+  const textCells = values => values.map(escapeHtml);
+  const reference = data.mode === 'reference';
+  const counted = ['count','count_full'].includes(data.mode);
+  const rowTable = reference
+    ? tableHtml(['来源','耗材','规格','科目','房间与柜位','原行数量'], rows.map(row=>textCells([
+        source(row),row.name,row.spec,row.category,`${row.lab || ''} ${row.location_code || '待核对'}`,formatQuantity(row.quantity,row.unit)])))
+    : tableHtml(['来源','耗材与规格','科目','房间与柜位','变更前','表内数量','处理方式'],rows.map(row=>textCells([
+        source(row),`${row.item_name} ${row.spec || ''}`,row.category,`${row.lab || ''} ${row.location_code || ''}`,
+        formatQuantity(row.before,row.unit),formatQuantity(row.count_total ?? row.quantity,row.unit),
+        row.duplicate_row?'忽略重复行':row.count_part?'并入同物合计':row.restore?'恢复使用并清点':!row.item_id?'新增耗材':counted?'按实盘更新':'更新库存'])));
+  const affected = (data.affected || []).map(row=>textCells([
+    row.item_name,row.spec,row.category,`${row.lab || ''} ${row.location_code || ''}`,formatQuantity(row.ready,row.unit),
+    row.action==='reference'?'旧合计转历史参考，各柜数量待实盘':'本柜可用库存归零']));
+  return `<section class="chat-result"><strong>${escapeHtml(importModeLabels[data.mode] || '上传预览')}</strong>
+    <p>${rows.length} 行，${errors.length} 行需修正${data.duplicate_file?'，发现相同的上传记录':''}。</p>
+    ${errors.length?tableHtml(['来源','需修正'],errors.map(row=>textCells([source(row),row.error]))):''}
+    ${rows.length?`<details><summary>查看表格条目</summary>${rowTable}</details>`:''}
+    ${affected.length?`<details open><summary>同时处理的 ${affected.length} 条旧记录</summary>
+      ${tableHtml(['耗材','规格','科目','房间与柜位','当前数量','处理方式'],affected)}</details>`:''}</section>`;
+}
+
+function renderChatChecklist(data) {
+  const rows = data.rows || [];
+  const count = status => rows.filter(row=>row.status===status).length;
+  const field = (key,label,value) => `<label>${label}<input data-checklist-field="${key}" data-original="${escapeHtml(value)}" value="${escapeHtml(value)}"></label>`;
+  const list = rows.map(row=>{
+    const options = (row.candidates || []).map(item=>`<option value="${Number(item.id)}" ${item.id===row.selected_item_id?'selected':''}>${escapeHtml([
+      item.item_name,item.spec,item.category,item.lab,item.location_code,item.unit].filter(Boolean).join(' · '))}</option>`).join('');
+    const positions = (row.locations || []).map(item=>`${item.category || ''} ${item.lab || ''} ${item.location_code || ''}（可用 ${formatQuantity(item.quantity,item.unit)}，本次 ${formatQuantity(item.allocated_quantity,item.unit)}）`);
+    const source = [row.source_file,row.source_sheet,`第 ${row.source_row} 行`].filter(Boolean).join(' · ');
+    const status = row.status === '需要采购' ? `需要采购 ${formatQuantity(row.purchase_quantity,row.purchase_unit)}` : row.status;
+    return `<fieldset data-checklist-row="${Number(row.row_number)}" data-previous-consumption="${Boolean(row.previously_consumed)}" data-previous-loan="${Boolean(row.previously_borrowed)}">
+      <legend>${escapeHtml([row.name,row.spec].filter(Boolean).join(' '))}</legend>
+      <div class="checklist-row-summary"><label class="inline-check"><input type="checkbox" data-checklist-select>本次登记此项</label>
+        <p class="muted small-text">${escapeHtml([source,status,...positions].filter(Boolean).join(' · '))}</p></div>
+      <div class="form-grid"><label>本次数量（${escapeHtml(row.unit || '单位待填写')}）
+        <input type="text" inputmode="decimal" data-checklist-field="required_quantity" data-original="${escapeHtml(row.required_quantity)}" value="${escapeHtml(row.required_quantity)}"></label>
+        <label>使用方式<select data-checklist-action><option value="">请选择</option><option value="consume" ${row.action==='consume'?'selected':''}>消耗</option>
+          <option value="borrow" ${row.action==='borrow'?'selected':''}>借用</option></select></label>
+        ${options?`<label>取用位置与物品<select data-checklist-item><option value="">按清单原始范围匹配</option>${options}</select></label>`:''}
+      </div>
+      <details><summary>更正名称、规格或单位</summary><div class="form-grid">${field('name','耗材名称',row.name)}${field('spec','规格',row.spec)}${field('unit','单位',row.unit)}</div></details>
+      ${row.previously_consumed || row.previously_borrowed?'<p class="small-text">检测到可能重复登记，请核对是否为另一次取用。</p>':''}
+    </fieldset>`;
+  }).join('');
+  return `<section class="chat-result"><strong>清单核对 · ${rows.length} 项</strong>
+    <p>可用数量足够 ${count('足够')} 项，待核对 ${count('需要确认匹配') + count('需要核对数量')} 项，需要采购 ${count('需要采购')} 项，等待到货 ${count('等待到货')} 项。</p>
+    ${data.preview_id && rows.length?`<details><summary>选择条目并更正清单</summary>
+      <form class="chat-checklist-form" data-checklist-preview="${escapeHtml(data.preview_id)}">
+        <p class="muted">只选择本次实际取用的条目。生成预览后，再确认一次。</p>
+        ${list}
+        <div class="form-grid"><label>再次登记原因（如确为另一次取用）<input name="repeat_reason" maxlength="300"></label></div>
+        <div class="form-grid" data-checklist-loan hidden>
+          <label>借用人<input name="borrower"></label><label>用途<input name="purpose"></label>
+          <label>目标位置<input name="destination"></label><label>预计归还（上海时间）<input name="due_at" type="datetime-local"></label>
+        </div>
+        <p class="form-error notice danger" role="alert" hidden></p><button type="submit" class="primary">生成取用预览</button>
+      </form></details>`:''}</section>`;
+}
+
+function renderWorkflowResult(data) {
+  const rows = data.rows || [];
+  const place = item => [item?.category,item?.lab,item?.location_code].filter(Boolean).join(' ');
+  const item = row => [row.item?.item_name || row.item_name || row.name,row.item?.spec || row.spec].filter(Boolean).join(' ');
+  const amount = (row, key) => formatQuantity(row[key],row.item?.unit || row.unit);
+  const status = row => recordStatuses[row.status] || row.status || '已登记';
+  const views = {
+    loans:['借用与归还',['编号','耗材','来源位置','借用人','用途与目标位置','借出数量','未归还','预计归还','状态'],row=>[
+      row.id,item(row),place(row.item),row.borrower,[row.purpose,row.destination].filter(Boolean).join(' · '),
+      amount(row,'quantity'),amount(row,'outstanding'),formatDate(row.due_at),row.overdue?'已逾期':Number(row.outstanding)>0?'未归还完毕':'已处理']],
+    purchases:['采购记录',['编号','耗材','入库位置','负责人','订购数量','已到货','预计到货','状态'],row=>[
+      row.id,item(row),place(row.item),row.actor,amount(row,'quantity'),amount(row,'received'),formatDate(row.expected_at),status(row)]],
+    procurement:['采购需求',['编号','耗材','需求数量','已到货','预计到货','状态'],row=>[
+      row.id,item(row),amount(row,'quantity'),amount(row,'received'),formatDate(row.expected_at),status(row)]],
+    schedules:['实验安排',['编号','实验','课程','地点','开始','结束','状态'],row=>[
+      row.id,row.name,row.course,row.venue,formatDate(row.starts_at),formatDate(row.ends_at),status(row)]],
+    preparations:['实验准备',['编号','实验','课程','地点','开始','结束','状态'],row=>[
+      row.id,row.name,row.course,row.venue,formatDate(row.starts_at),formatDate(row.ends_at),status(row)]],
+    counts:['实盘记录',['编号','耗材','位置','清点前','实际数量','原因','操作人','时间'],row=>[
+      row.id,item(row),place(row.item),amount(row,'before_quantity'),amount(row,'actual_quantity'),row.reason,row.actor,formatDate(row.created_at)]],
+    templates:['实验模板',['编号','模板','课程','条目数'],row=>[row.id,row.name,row.course,(row.lines || []).length]],
+    archived_items:['已停用耗材',['编号','耗材','位置','单位'],row=>[row.id,item(row),place(row),row.unit]],
+    reference_files:['历史参考附件',['编号','附件','科目','登记人','时间'],row=>[row.file_id,row.filename,row.category,row.actor,formatDate(row.created_at)]],
+    upload_batches:['库存上传批次',['编号','附件','类型','时间','可核对记录'],row=>[
+      row.id,row.filename,importModeLabels[row.mode],formatDate(row.created_at),row.tracked?'有':'旧批次无逐笔关联']],
+    upload_batch:[`上传影响 · ${data.filename || ''}`,['耗材','位置','上传前','上传后','处理状态'],
+      row=>[item(row),place(row),amount(row,'before'),amount(row,'after'),row.status]],
+  };
+  const view = Object.hasOwn(views,data.type) ? views[data.type] : null;
+  return view?`<section class="chat-result"><strong>${escapeHtml(view[0])} · ${rows.length} 条</strong>
+    ${tableHtml(view[1],rows.map(row=>view[2](row).map(escapeHtml)))}</section>`:'';
 }
 
 function tableHtml(headers, rows) {
@@ -527,7 +626,7 @@ function businessPreviewHtml(preview) {
 }
 
 function renderRecordChanges(records, completed = false) {
-  const tables = {inventory_items:'耗材资料',stock_balances:'库存与状态',loans:'借用记录',purchase_orders:'采购记录',schedules:'实验安排',reservations:'预留分配',lesson_templates:'实验模板',stock_counts:'清点记录',location_details:'位置资料',alert_states:'提醒状态',preparations:'实验准备任务',preparation_schedules:'准备与实验关联',preparation_purchases:'准备与采购关联',preparation_revisions:'准备更正记录',stock_events:'业务流水',inventory_transactions:'原始库存流水',source_rows:'附件来源',item_aliases:'耗材别名',import_jobs:'导入记录',upload_previews:'清单核对记录',notification_events:'通知事件'};
+  const tables = {inventory_items:'耗材资料',stock_balances:'库存与状态',loans:'借用记录',purchase_orders:'采购记录',schedules:'实验安排',reservations:'预留分配',lesson_templates:'实验模板',stock_counts:'清点记录',location_details:'位置资料',alert_states:'提醒状态',preparations:'实验准备任务',reference_files:'历史参考附件',reference_positions:'历史参考位置',preparation_schedules:'准备与实验关联',preparation_purchases:'准备与采购关联',preparation_revisions:'准备更正记录',stock_events:'业务流水',inventory_transactions:'原始库存流水',source_rows:'附件来源',item_aliases:'耗材别名',import_jobs:'导入记录',upload_previews:'清单核对记录',notification_events:'通知事件'};
   const labels = {id:'记录编号',item_id:'耗材编号',item_name:'耗材名称',spec:'规格',brand:'品牌',category:'类别',lab:'实验室',location_code:'位置',unit:'单位',quantity:'数量',threshold:'预警数量',ready:'可用状态数量',cleaning:'待清洗数量',repair:'维修数量',quarantine:'待核对数量',active:'是否使用',usage_type:'使用方式',conversions:'单位换算',review_reason:'待核对原因',original_quantity:'原始数量',outstanding:'尚未归还数量',borrower:'借用人',purpose:'用途',destination:'存放地点',due_at:'预计归还时间',actor:'操作人',device_id:'设备编号',schedule_id:'实验安排编号',preparation_id:'准备任务编号',order_id:'采购编号',received:'已到货数量',expected_at:'预计到货时间',status:'状态',note:'说明',name:'名称',course:'课程',venue:'地点',starts_at:'开始时间',ends_at:'结束时间',people:'人数',group_size:'每组人数',lines:'耗材项目',action:'操作',description:'位置说明',photo_path:'位置照片',before_quantity:'原有数量',actual_quantity:'实际数量',reason:'原因',event_id:'业务流水编号',acknowledged:'已知悉',snooze_until:'暂缓至',is_low:'数量不足',last_reminded_at:'上次提醒时间',changes:'数量变化',related_id:'关联编号',reversed_by:'撤销记录',created_at:'记录时间',kind:'事件类型',remark:'备注',source_file:'来源文件',source_sheet:'来源工作表',source_row_number:'来源行号',alias:'别名',filename:'文件名',mode:'导入方式',committed:'已执行',rows:'清单条目',errors:'清单核对要求'};
   Object.assign(labels,{results:'各项操作结果',transactions:'库存操作记录',item:'耗材当前记录',type:'记录类型',available_quantity:'当前可用数量',owned_quantity:'当前总拥有数量',ready_quantity:'可用状态数量',borrowed_quantity:'已借出数量',reserved_quantity:'已预留数量',required_quantity:'需求数量',unmet_quantity:'尚未满足数量',purchase_draft_id:'采购草案编号',purchase_draft_ids:'采购草案编号',purchases:'关联采购记录',schedules:'关联实验安排',locations:'各位置分配',calculation_unit:'计算单位',per_person:'每人数量',per_group:'每组数量',fixed:'固定数量',spare:'备用数量',delta_quantity:'数量变化',event:'业务流水',operation:'操作内容',target:'目标位置',source:'来源位置',retired:'是否已被替代',selected_rows:'已处理清单行',skipped:'未处理条目',outcomes:'实际处理结果'});
   const hidden = new Set(['ok','item_key','normalized_name','normalized_alias','version','updated_at','snapshot','raw_json','content_hash','file_hash','row_hash','request_id']);
@@ -549,8 +648,8 @@ function renderRecordChanges(records, completed = false) {
 }
 
 function renderBusinessOperation(operation, changes) {
-  const labels = {mixed:'组合业务计划',preparation:'完整实验准备',preparation_update:'实验准备变更',stock:'库存变更',bulk:'批量库存变更',purchase:'采购操作',schedule:'实验安排',execute_schedule:'执行实验安排',cancel_schedule:'取消实验安排',template:'实验模板',count:'库存清点',state:'物品状态',metadata:'物品资料',create_item:'新增耗材',transfer:'位置转移',archive_location:'停用位置',location_details:'位置资料',alert:'提醒设置',import:'表格导入',prepare:'准备清单执行',prepare_remap:'清单匹配',undo:'撤销库存记录'};
-  const names = {item_ids:'各位置耗材编号',source:'原始清单来源',preparation_id:'准备任务编号',payload:'操作内容',kind:'操作类型',item_id:'耗材编号',item_name:'耗材名称',spec:'规格',lab:'实验室',location_code:'位置',quantity:'数量',unit:'单位',action:'操作',owner:'负责人',expected_at:'预计到货时间',order_id:'采购记录',schedule_id:'实验安排',template_id:'实验模板',name:'名称',course:'课程',venue:'地点',starts_at:'开始时间',ends_at:'结束时间',people:'人数',group_size:'每组人数',borrower:'借用人',purpose:'用途',destination:'存放地点',due_at:'预计归还时间',loan_id:'借用记录',return_state:'归还状态',from_state:'当前状态',to_state:'目标状态',note:'原因',threshold:'预警数量',target_lab:'目标实验室',target_location:'目标位置',state:'库存状态',description:'位置说明',preview_id:'表格预览编号',selected_rows:'清单行号',allow_duplicate:'允许重复导入',event_id:'库存记录',row_number:'清单行号',lines:'耗材项目',operations:'操作项目',per_person:'每人数量',per_group:'每组数量',fixed:'固定数量',spare:'备用数量'};
+  const labels = {mixed:'组合业务计划',preparation:'完整实验准备',preparation_update:'实验准备变更',stock:'库存变更',bulk:'批量库存变更',purchase:'采购操作',schedule:'实验安排',execute_schedule:'执行实验安排',cancel_schedule:'取消实验安排',template:'实验模板',count:'库存清点',state:'物品状态',metadata:'物品资料',create_item:'新增耗材',transfer:'位置转移',archive_location:'停用位置',location_details:'位置资料',alert:'提醒设置',import:'表格导入',prepare:'准备清单执行',prepare_remap:'清单匹配',undo:'撤销库存记录',undo_batch:'撤销上传条目',archive_item:'停用耗材',restore_item:'恢复耗材',save_reference:'保存历史参考',remove_reference:'移除历史附件'};
+  const names = {item_ids:'各位置耗材编号',source:'原始清单来源',preparation_id:'准备任务编号',payload:'操作内容',kind:'操作类型',item_id:'耗材编号',item_name:'耗材名称',spec:'规格',lab:'实验室',location_code:'位置',quantity:'数量',unit:'单位',action:'操作',owner:'负责人',expected_at:'预计到货时间',order_id:'采购记录',schedule_id:'实验安排',template_id:'实验模板',name:'名称',course:'课程',venue:'地点',starts_at:'开始时间',ends_at:'结束时间',people:'人数',group_size:'每组人数',borrower:'借用人',purpose:'用途',destination:'存放地点',due_at:'预计归还时间',loan_id:'借用记录',return_state:'归还状态',from_state:'当前状态',to_state:'目标状态',note:'原因',threshold:'预警数量',target_lab:'目标实验室',target_location:'目标位置',state:'库存状态',description:'位置说明',preview_id:'表格预览编号',selected_rows:'清单行号',edits:'更正的清单资料',actions:'使用方式',repeat_reason:'再次登记的原因',batch_id:'上传批次',file_id:'历史附件编号',required_quantity:'本次数量',allow_duplicate:'允许重复导入',event_id:'库存记录',row_number:'清单行号',lines:'耗材项目',operations:'操作项目',per_person:'每人数量',per_group:'每组数量',fixed:'固定数量',spare:'备用数量'};
   const values = {draft:'采购草案，尚未订购',place:'登记订购',replenish:'补充预留',inbound:'入库',consume:'消耗',borrow:'借出',return:'归还',adjust:'修正',count:'清点',threshold:'设置预警',order:'下单',receive:'登记到货',cancel:'取消',ready:'可用',cleaning:'待清洗',repair:'维修中',quarantine:'待核对',damaged:'破损',lost:'遗失'};
   const display = value => {
     if (Array.isArray(value)) return `<ol>${value.map(item => `<li>${display(item)}</li>`).join('')}</ol>`;
@@ -758,7 +857,7 @@ function teacherStockTable(rows) {
 
 function referenceTable(rows) {
   return rows.length?tableHtml(['科目','耗材','规格','房间','柜位','实盘状态','来源'],rows.map(row=>[
-    row.category,row.item_name,row.spec,row.lab,row.location_code,row.counted?'已实盘':'待核对',`${row.filename} · ${row.sheet} 第 ${row.source_row} 行（原位置：${row.original_location||'未注明'}；原行总量：${row.original_quantity??'未注明'} ${row.unit||''}）`
+    row.category,row.item_name,row.spec,row.lab,row.location_code,row.counted?'已实盘':'待核对',`${row.filename}${row.source_row?` · ${row.sheet || ''} 第 ${row.source_row} 行`:''}（原位置：${row.original_location||'未注明'}；原行总量：${row.original_quantity??'未注明'} ${row.unit||''}）`
   ].map(value=>escapeHtml(value||'未注明')))):'暂无匹配参考记录';
 }
 
@@ -1157,7 +1256,7 @@ function renderPrepareRows(rows) {
     ? rows.filter((row) => `${row.course}||${row.experiment}` === state.prepareGroup)
     : rows;
   const sourceRows = state.prepareOnlyMissing
-    ? groupRows.filter((row) => Number(row.missing_quantity || 0) > 0)
+    ? groupRows.filter((row) => row.status === '需要采购')
     : groupRows;
   const sortedRows = [...sourceRows].sort((a, b) => Number(b.missing_quantity || 0) - Number(a.missing_quantity || 0));
   renderPrepareSummary(rows);
@@ -1167,7 +1266,7 @@ function renderPrepareRows(rows) {
       `${escapeHtml(item.category || "")} ${escapeHtml(item.lab || "")} ${escapeHtml(item.location_code || "")}：本次 ${formatQuantity(item.allocated_quantity, item.unit)}`
     ).join("<br>");
     const statusClass = row.status === "足够" ? "ok" : "danger";
-    const enough = Number(row.missing_quantity || 0) <= 0;
+    const enough = row.status === '足够';
     const selected = state.prepareSelectedRows.has(String(row.row_number));
     const source = row.source_sheet && row.source_row
       ? `${row.source_file ? `${row.source_file} · ` : ""}${row.source_sheet} 第 ${row.source_row} 行`
@@ -1181,7 +1280,7 @@ function renderPrepareRows(rows) {
         <td data-label="需求">${formatQuantity(row.required_quantity, row.unit)}</td>
         <td data-label="使用方式"><select data-prepare-action="${row.row_number}" aria-label="${escapeHtml(row.name)}使用方式"><option value="">请选择</option><option value="consume" ${(state.prepareActions[row.row_number]||row.action)==='consume'?'selected':''}>消耗</option><option value="borrow" ${(state.prepareActions[row.row_number]||row.action)==='borrow'?'selected':''}>借用</option></select></td>
         <td data-label="可用">${formatQuantity(row.available_quantity, row.unit)}<div class="muted small-text">本次分配 ${formatQuantity(row.allocated_quantity || 0, row.unit)}</div></td>
-        <td data-label="还需采购">${formatQuantity(row.missing_quantity, row.unit)}</td>
+        <td data-label="尚缺数量">${row.locations?.length ? formatQuantity(row.missing_quantity, row.unit) : "待核对匹配"}</td>
         <td data-label="建议采购">${formatQuantity(row.purchase_quantity, row.purchase_unit)}</td>
         <td data-label="位置">${locations || '<span class="muted">无匹配位置</span>'}${row.status==='需要确认匹配'||row.selected_item_id?`<select data-prepare-match="${row.row_number}" aria-label="${escapeHtml(row.name)}匹配物品"><option value="">选择具体物品</option>${(row.candidates||[]).map(item=>`<option value="${item.id}" ${item.id===row.selected_item_id?'selected':''}>${escapeHtml(item.item_name)} ${escapeHtml(item.spec)} · ${escapeHtml(item.lab)} ${escapeHtml(item.location_code)} · ${escapeHtml(item.unit)}</option>`).join('')}</select>`:''}</td>
         <td data-label="状态"><span class="badge ${statusClass}">${escapeHtml(row.status)}</span>${row.previously_consumed ? '<div class="small-text">此表格行已登记消耗</div>' : ''}</td>
@@ -1192,10 +1291,11 @@ function renderPrepareRows(rows) {
 }
 
 function renderPrepareSummary(rows) {
-  const needRows = rows.filter((row) => Number(row.missing_quantity || 0) > 0);
+  const needRows = rows.filter(row => row.status === '需要采购');
+  const unmatched = rows.filter(row => row.status === '需要确认匹配').length;
   const locationCount = rows.reduce((sum, row) => sum + Number(row.match_count || 0), 0);
   $("#prepareSummary").innerHTML = rows.length
-    ? `共 ${rows.length} 个条目，${new Set(rows.map((row) => `${row.course}||${row.experiment}`)).size} 个课程实验，${needRows.length} 个需要采购，匹配到 ${locationCount} 个库存位置。已选 ${state.prepareSelectedRows.size} 个库存足够的条目，可按课程实验批量扣减。`
+    ? `共 ${rows.length} 个条目，${new Set(rows.map((row) => `${row.course}||${row.experiment}`)).size} 个课程实验，${needRows.length} 个需要采购，${unmatched} 个待核对匹配，匹配到 ${locationCount} 个库存位置。已选 ${state.prepareSelectedRows.size} 个库存足够的条目，可按课程实验批量扣减。`
     : "上传课程实验清单后显示各实验的库存数量和需要采购的条目。";
 }
 
@@ -1389,12 +1489,9 @@ async function batchUploadInventory() {
     if (file !== $('#batchUploadFile').files[0] || [...form].some(([field,val])=>({mode:$('#batchUploadMode').value,category:$('#batchUploadCategory').value,lab:$('#countLab').value.trim(),location_code:$('#countLocation').value.trim(),sum_parts:String($('#sumCountParts').checked)})[field] !== val && field!=='file')) return;
     window.importPreview = result;
     result.reference=form.get('mode')==='reference';
-    const sourcePosition = row => `${row.source_sheet ? `${row.source_sheet} ` : ""}第 ${row.source_row ?? row.row_number} 行`;
-    $('#batchUploadLog').textContent = `${result.rows.length} 行，${result.errors.length} 行错误${result.duplicate_file ? '，这份表格已经导入过' : ''}\n` + result.rows.map(row=>`${sourcePosition(row)}：${row.item_name}，原数量 ${row.before}，表格数量 ${row.quantity}${row.unit}，${row.item_id?'已有物品':'新增物品'}${row.duplicate_row?'，表内重复行将忽略':''}`).join('\n') + '\n' + result.errors.map(row=>`${sourcePosition(row)}：${row.error}`).join('\n');
-    if ($('#batchUploadMode').value==='count') $('#batchUploadLog').textContent += '\n'+result.rows.filter(row=>row.count_total!==undefined).map(row=>`${row.category} · ${row.lab} ${row.location_code} · ${row.item_name}：实盘合计 ${row.count_total}${row.unit}`).join('\n');
-    if(result.reference) $('#batchUploadLog').textContent=result.rows.map(row=>`${sourcePosition(row)}：${row.category} · ${row.name} ${row.spec||''} · ${row.lab||'房间待核对'} ${row.location_code||'柜位待核对'} · 待实盘`).join('\n');
-    $('#confirmImportBtn').disabled = !result.rows.length || !!result.errors.length;
-    toast('库存表预览已生成，请核对后确认');
+    $('#batchUploadLog').innerHTML = renderImportResult(result);
+    $('#confirmImportBtn').disabled = !(result.affected?.length || result.rows.length) || !!result.errors.length;
+    toast('表格预览已生成，请核对后继续');
   } catch (err) {
     toast(err.message || "批量上传失败");
   } finally {
@@ -1478,7 +1575,7 @@ function bindEvents() {
     const match=event.target.closest('select[data-prepare-match]');
     if(match && match.value){
       try{
-        const data=await api('/api/actions/prepare_remap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({preview_id:state.preparePreviewId,row_number:Number(match.dataset.prepareMatch),item_id:Number(match.value)})});
+        const data=await api('/api/prepare/remap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({preview_id:state.preparePreviewId,row_number:Number(match.dataset.prepareMatch),item_id:Number(match.value)})});
         state.preparePreviewId=data.preview_id;state.prepareRows=data.rows;state.prepareSelectedRows.clear();renderPrepareRows(data.rows);persistPreviews();
       }catch(error){toast(error.message);}
       return;

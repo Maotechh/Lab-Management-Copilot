@@ -13,6 +13,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import ledger as stock
+from . import teacher_uploads as uploads
 from . import workflows as flow
 from .chat_contracts import prompt_contracts, validate_payload
 from .matching import SCOPE_FIELDS, cabinet_codes, physical_room, require_scope
@@ -33,11 +34,11 @@ inventory_search 的 query 使用教师给出的完整耗材名称，规格可�
 每个工具参数使用 arguments 对象。缺少规格、位置、单位、用途、时间或人员时先查询或追问，不自行选择其他规格或猜测包装换算。
 工具说明：
 - inventory_search：query，可选 lab、category、limit、offset、starts_at、ends_at。返回 total_count 和 next_offset；需要完整清单时逐页读取直到 next_offset 为空，也可 export_inventory。指定单个房间时不得扩大到合并房间。返回真实物品、位置、状态和可用数量。询问记录总数、位置总数或数量合计时使用 summary=true，服务器统计全部匹配记录并按单位分别计算，不受明细条数限制。统计全部库存时 query 留空，不把“库存”“全部”等描述作为耗材名称搜索。
-- workflow_query：kind 为 loans、schedules、preparations、purchases、procurement、templates、counts 或 alerts，可选 query、overdue_only、limit。
+- workflow_query：kind 为 loans、schedules、preparations、purchases、procurement、templates、counts、alerts、upload_batches（库存上传批次）、upload_batch（指定 batch_id，查看影响和撤销状态）、reference_files（历史参考文件）或 archived_items（可恢复的停用耗材），可选 query、overdue_only、limit。
 - history_search：可选 q、actor、action、from_date、to_date、limit。操作类型 action 使用业务代码，例如 consume（消耗）、borrow（借出）、return（归还）、inbound（入库）。export_history 使用相同筛选定义。教师指定耗材名称时，q 必须完整保留该名称及其中的编号、前缀和限定词，不得只使用通用名称。首次调用前核对所有指定筛选条件，不得先导出扩大范围的文件。直接导出请求应一次传入完整筛选条件，生成符合要求的文件后结束，不重复导出。
 - read_attachment：attachment_id，读取表格及来源。图片由当前消息输入，模糊字段需要教师核对。
-- prepare_attachment：attachment_id 和可选 course，生成清单核对预览，不扣减库存。照片必须调用此工具并在 payload.rows 传入识别的全部条目，每行填写 name、spec、unit、required_quantity、action（borrow、consume 或留空）、source_row。表格自动读取，也可通过 payload.rows 整理不规则表格。保留所有未知耗材，不能因为没有匹配库存而省略。清单可在界面修改后重新核对。
-- inventory_import_preview：实际清点用 mode=count，必须填写 category、lab、location_code；新购入库才用 add。旧表参考不是入库，不用 add 或 overwrite 导入。课堂耗用先调用 prepare_attachment，再用 business_preview 的 prepare 保存所选行。重复行需教师亲自说明再次登记原因。每次只生成预览，不直接记账。
+- prepare_attachment：attachment_id 和可选 course，生成清单核对预览，不扣减库存。照片必须调用此工具并在 payload.rows 传入识别的全部条目，每行填写 name、spec、unit、required_quantity、action（borrow、consume 或留空）、source_row。表格自动读取，也可通过 payload.rows 整理不规则表格。保留所有未知耗材，不能因为没有匹配库存而省略。照片中看不清的数量使用 null，名称看不清时填“名称待核对”，由教师在清单上更正。清单可在界面修改后重新核对。
+- inventory_import_preview：部分实盘用 count，只处理表内项目。仅当教师明确说明已清点整个柜位且表外项目为零时，使用 count_full。实盘均须指定 category、lab、location_code。教师明确说明同一耗材多行需合计时，才可传 sum_parts=true。新购入库用 add。旧表用 reference，再通过 save_reference 保存为历史位置参考。移除历史附件用 remove_reference，撤销上传用 undo_batch，停用及恢复耗材用 archive_item 和 restore_item，均须先查询对应记录。课堂耗用先调用 prepare_attachment，再用 prepare 预览所选行，可用 edits 更正数量、识别文字或选择物品。借用须取得借用人、用途、地点与预计归还时间。重复行需教师亲自说明再次登记原因。
 - business_preview：kind 和 payload，格式见业务 JSON Schema。编号必须来自当前对话中已查询的记录。一次完整任务使用一个计划，混合操作使用 mixed。
 - analyze_attachments：attachment_ids 和 code（Python 程序），仅分析选定附件，输出文件写入 /output。分析结果不能直接修改业务数据，正式数量由服务器校验。
 - export_inventory：可选 query、lab、category。export_history：可选 q、actor、action、from_date、to_date，导出实际业务历史。export_task：task_id，导出服务器保存的计划和实际结果。
@@ -84,6 +85,8 @@ class ToolArguments(BaseModel):
     attachment_ids: list[str] = Field(default_factory=list, max_length=8)
     code: str | None = Field(default=None, max_length=50000)
     task_id: str | None = Field(default=None, max_length=100)
+    batch_id: str | None = Field(default=None, max_length=100)
+    sum_parts: bool = False
 
 def json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
@@ -256,9 +259,7 @@ def _run_read_tool(
                   "summary": _inventory_summary(all_rows),
                   "search": {"q": query, "category": category, "lab": lab,
                              "starts_at": starts_at, "ends_at": ends_at, "location_code": args.get("location_code")}}
-        from .teacher_uploads import references
-
-        reference_rows = references(conn, category or '', query, lab or '', args.get('location_code') or '')
+        reference_rows = uploads.references(conn, category or '', query, lab or '', args.get('location_code') or '')
         result['reference_count'] = len(reference_rows)
         result['reference_rows'] = reference_rows[offset:offset + limit]
         if not rows and lab and not args.get("location_code"):
@@ -315,6 +316,16 @@ def _run_read_tool(
                 if alert:
                     item.update(dict(alert))
             return {"type": "alerts", "rows": data[:limit]}
+        if kind == "upload_batch":
+            batch = next((row for row in uploads.batches(conn) if row["id"] == args.get("batch_id")), None)
+            if not batch:
+                raise ValueError("请先查询上传批次，再填写实际批次编号")
+            return {"type": kind, "batch_id": batch["id"], "filename": batch["filename"],
+                    "rows": uploads.batch_detail(conn, batch["id"])}
+        if kind in {"upload_batches", "reference_files", "archived_items"}:
+            records = {"upload_batches": uploads.batches, "reference_files": uploads.reference_files,
+                       "archived_items": uploads.archived_items}[kind](conn)
+            return {"type": kind, "rows": [row for row in records if needle in json_text(row).casefold()][:limit]}
         if kind not in tables:
             raise ValueError("请选择借还、实验安排、采购、模板、清点或预警记录")
         table, item_field = tables[kind]
@@ -358,7 +369,7 @@ def _run_read_tool(
             raise ValueError("附件不存在，请选择此对话中的附件")
         if attachment["content_type"].startswith("image/"):
             return {"type": "image_attachment", "attachment_id": attachment["id"], "filename": attachment["filename"],
-                    "instruction": "使用当前图片输入识别完整清单，调用 prepare_attachment，payload.rows 填写 name、spec、unit、required_quantity、action、source_row。无法看清的字段必须询问教师，不猜测。"}
+                    "instruction": "使用当前图片输入识别完整清单，调用 prepare_attachment，payload.rows 填写 name、spec、unit、required_quantity、action、source_row。看不清的数量使用 null，名称看不清时填“名称待核对”。请教师更正，不猜测。"}
         data = tables(Path(attachment["path"]), arithmetic=True)
         encoded = json_text(data)
         if len(encoded.encode()) > 500_000:
@@ -380,15 +391,19 @@ def _run_read_tool(
                 result["attachment_id"] = attachment["id"]
             return {"type": "preparation", **result}
         mode = str(args.get("mode") or "add")
-        if mode not in ("add", "overwrite", "count"):
-            raise ValueError("导入方式必须是入库、覆盖或分批实盘")
+        if attachment["content_type"].startswith("image/"):
+            raise ValueError("库存实盘和历史参考请使用 XLS、XLSX 或 CSV 文件")
+        if mode == "reference":
+            result = uploads.preview_reference(conn, path, attachment["filename"], args.get("category") or "",
+                                               args.get("lab") or "", commit=False)
+            return {"type": "inventory_import", **result}
         result = flow.preview_import(
             conn,
             path,
             attachment["filename"],
             mode,
             str(args.get("category") or ""),
-            commit=False, lab=args.get("lab"), location_code=args.get("location_code"),
+            commit=False, lab=args.get("lab"), location_code=args.get("location_code"), sum_parts=args.get("sum_parts", False),
         )
         return {"type": "inventory_import", **result}
     if name == "export_inventory":
@@ -470,9 +485,12 @@ def _business_task(
         "prepare",
         "prepare_remap",
         "undo",
+        "undo_batch",
+        "archive_item",
+        "restore_item",
+        "save_reference",
+        "remove_reference",
     }
-    if not validate_references:
-        allowed.update({'undo_batch', 'archive_item', 'save_reference', 'remove_reference'})
     if kind not in allowed or not isinstance(payload, dict):
         raise ValueError("业务操作类型或参数无效")
     if kind in {"count", "state"}:
@@ -585,6 +603,12 @@ def check_saved_classroom_scope(conn, kind, payload, message):
 def bind_chat_scope(conn, kind, payload, message):
     from .matching import in_scope
 
+    if kind == "prepare":
+        for field, value in checklist_chat_scope(conn, message).items():
+            if payload.get(field) and payload[field] != value:
+                raise ValueError("清单参数与消息中指定的取用范围不一致")
+            payload[field] = value
+        return
     if kind == 'mixed':
         for step in payload['operations']:
             bind_chat_scope(conn, step['kind'], step['payload'], message)
@@ -857,7 +881,7 @@ BUSINESS_TABLES = (
     "preparation_schedules", "preparation_purchases", "preparation_revisions",
     "procurement_demands", "procurement_receipts",
     "stock_events", "inventory_transactions", "source_rows", "item_aliases",
-    "import_jobs", "upload_previews", "notification_events",
+    "import_jobs", "upload_previews", "notification_events", "reference_files", "reference_positions",
 )
 
 
@@ -926,6 +950,8 @@ def _item_ids(conn, kind: str, payload: dict) -> list[int]:
                             (demand_id,),
                         )
                     )
+    elif kind == "undo_batch":
+        values.extend(payload["item_ids"])
     elif kind == "bulk":
         values.extend(int(row["item_id"]) for row in payload.get("operations", []))
     else:
@@ -958,7 +984,7 @@ def _item_ids(conn, kind: str, payload: dict) -> list[int]:
                 values.append(int(row["item_id"]))
         elif kind == "import" and payload.get("preview_id"):
             row = conn.execute(
-                "SELECT rows FROM upload_previews WHERE id=?",
+                "SELECT rows,scope_json FROM upload_previews WHERE id=?",
                 (payload["preview_id"],),
             ).fetchone()
             if row:
@@ -967,19 +993,24 @@ def _item_ids(conn, kind: str, payload: dict) -> list[int]:
                     for entry in json.loads(row["rows"])
                     if entry.get("item_id")
                 )
+                values.extend(int(item["id"]) for item in json.loads(row["scope_json"]).get("affected", []))
         elif kind == "prepare" and payload.get("preview_id"):
+            values.extend(edit["item_id"] for edit in payload.get("edits", {}).values() if edit.get("item_id"))
             row = conn.execute(
                 "SELECT rows FROM upload_previews WHERE id=? AND mode='prepare'",
                 (payload["preview_id"],),
             ).fetchone()
             if row:
-                selected = {int(value) for value in payload.get("selected_rows", [])}
+                selected = set(payload["selected_rows"])
                 for entry in json.loads(row["rows"]):
-                    if not selected or int(entry["row_number"]) in selected:
-                        values.extend(
-                            int(location["item_id"])
-                            for location in entry.get("locations", [])
-                        )
+                    if entry["row_number"] not in selected:
+                        continue
+                    values.extend(location["item_id"] for location in entry["locations"])
+                    edit = payload.get("edits", {}).get(str(entry["row_number"]), {})
+                    scope = {field: payload.get(field) or entry.get(field) for field in SCOPE_FIELDS}
+                    _, candidates = flow.strict_matches(conn, edit.get("name", entry["name"]),
+                                                         edit.get("spec", entry["spec"]), edit.get("unit", entry["unit"]), scope)
+                    values.extend(item["id"] for item in candidates)
     return list(dict.fromkeys(values))
 
 
@@ -1065,6 +1096,8 @@ def _validate_record_references(conn, conversation_id: str, kind: str, payload: 
         "template_id": {"workflow_query"},
         "event_id": {"history_search", "workflow_query"},
         "preview_id": {"prepare_attachment", "inventory_import_preview"},
+        "file_id": {"workflow_query"},
+        "batch_id": {"workflow_query"},
     }
     surfaced: dict[str, set[str]] = {key: set() for key in references}
     for call in conn.execute(
@@ -1088,7 +1121,7 @@ def _validate_record_references(conn, conversation_id: str, kind: str, payload: 
             for key, item in value.items():
                 if key in references and item not in (None, ""):
                     if str(item) not in surfaced[key]:
-                        raise ValueError(f"{key} 必須來自本次對話已查詢的記錄")
+                        raise ValueError(f"{key} 必须来自当前对话已查询的记录")
                 elif key == "item_ids":
                     if any(str(value) not in surfaced["item_id"] for value in item):
                         raise ValueError("物品编号必须来自当前对话已经查询的记录")
@@ -1109,7 +1142,13 @@ def _collect_refs(value: Any, tool_name: str, surfaced: dict[str, set[str]]) -> 
         if tool_name == "workflow_query":
             kind = value.get("type")
             key = {"loans": "loan_id", "purchases": "order_id", "procurement": "demand_id", "schedules": "schedule_id", "templates": "template_id", "preparations": "preparation_id", "alerts": "event_id"}.get(kind)
+            if kind == "upload_batch" and value.get("batch_id"):
+                surfaced["batch_id"].add(str(value["batch_id"]))
             for row in value.get("rows", []):
+                if kind == "reference_files":
+                    surfaced["file_id"].add(str(row["file_id"]))
+                if kind == "archived_items":
+                    surfaced["item_id"].add(str(row["id"]))
                 record_id = row.get("event_id") if kind == "alerts" else row.get("id")
                 if key and record_id is not None:
                     surfaced[key].add(str(record_id))
@@ -1339,11 +1378,25 @@ def _cached_tool_result(conn, message_id: int, name: str, arguments: dict) -> di
 
 
 def _is_confirm(text: str) -> bool:
-    return text.strip().strip("。！! ").casefold() in {"确认", "确认执行", "执行"}
+    phrase = re.sub(r"[，,。！!\s]+", "", text)
+    return phrase in {"确认", "确认执行", "执行", "确认按这个来", "按这个来",
+                      "这个没问题可以执行", "确认可以执行", "可以执行", "同意执行"}
+
+
+def _edits_plan(text: str) -> bool:
+    return bool(re.match(
+        r"^\s*(?:请\s*)?(?:改成|改为|更正|重做|重新预览|暂不执行|先别执行|先不要执行|"
+        r"(?:不对|等一下|确认)[，,。 ]*(?:但|还是|请|先)?(?:改成|改为|暂不执行)|"
+        r"(?:把|将)?(?:刚才|上一个|当前|这)(?:的|个|项)?(?:计划|预览).{0,15}(?:改|调整|取消)|"
+        r"(?:人数|用量|数量|规格|科目|时间|房间|柜位|位置|范围).{0,8}(?:改成|改为|改到|换成|换到|调整为))",
+        text,
+    ))
 
 
 def _is_cancel(text: str) -> bool:
-    return text.strip().strip("。！! ").casefold() in {"取消", "取消计划", "不要了"}
+    return text.strip().strip("。！! ").casefold() in {
+        "取消", "取消计划", "不要了", "取消当前计划", "取消这项计划", "取消这项待确认计划",
+    }
 
 
 def _context_hash(conn, kind: str, payload: dict) -> str:
@@ -1365,6 +1418,9 @@ def _context_hash(conn, kind: str, payload: dict) -> str:
             state.append(dict(row) if row else None)
         if step["kind"] == "alert":
             row = conn.execute("SELECT * FROM alert_states WHERE item_id=?", (data.get("item_id"),)).fetchone()
+            state.append(dict(row) if row else None)
+        if step["kind"] == "remove_reference":
+            row = conn.execute("SELECT * FROM reference_files WHERE id=?", (data["file_id"],)).fetchone()
             state.append(dict(row) if row else None)
         if step['kind'] == 'undo_batch':
             from .teacher_uploads import batch_detail

@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import uuid
 from datetime import datetime
@@ -75,8 +76,8 @@ def enqueue(conn, conversation_id: str, request: chat.ChatMessageRequest, actor:
         )
         run_id = uuid.uuid4().hex
         conn.execute("INSERT INTO chat_runs(id,conversation_id,message_id,status,request_json,actor,device_id) VALUES (?,?,?,'queued',?,?,?)", (run_id, conversation_id, cursor.lastrowid, chat.json_text(payload), actor, device_id))
-        if not chat._is_confirm(request.text) and not chat._is_cancel(request.text):
-            expire_plans(conn, conversation_id, request.message_id)
+        if chat._edits_plan(request.text):
+            expire_plans(conn, conversation_id, request.message_id, through=cursor.lastrowid)
         conn.execute("UPDATE chat_conversations SET version=version+1,updated_at=CURRENT_TIMESTAMP WHERE id=?", (conversation_id,))
         event(conn, conversation_id, "message", {"message_id": cursor.lastrowid, "run_id": run_id})
         event(conn, conversation_id, "run", {"run_id": run_id, "status": "queued"})
@@ -88,8 +89,12 @@ def enqueue(conn, conversation_id: str, request: chat.ChatMessageRequest, actor:
         raise
 
 
-def expire_plans(conn, conversation_id: str, request_id: str) -> None:
-    for task in conn.execute("SELECT id,status FROM chat_tasks WHERE conversation_id=? AND status IN ('pending_confirmation','awaiting_details')", (conversation_id,)).fetchall():
+def expire_plans(conn, conversation_id: str, request_id: str, *, through: int | None = None) -> None:
+    tasks = conn.execute(
+        "SELECT id,status FROM chat_tasks WHERE conversation_id=? AND status IN ('pending_confirmation','awaiting_details') "
+        "AND (? IS NULL OR message_id<=?)", (conversation_id, through, through),
+    ).fetchall()
+    for task in tasks:
         conn.execute("UPDATE chat_tasks SET status='expired',updated_at=CURRENT_TIMESTAMP WHERE id=?", (task["id"],))
         chat._record_task_event(conn, task["id"], task["status"], "expired", "superseded_by_message", request_id)
 
@@ -140,7 +145,12 @@ def execute_tool(conn, run_id: str, token: str, name: str, arguments: dict, disp
                 attachment = chat._find_attachment(attachments, args.get("attachment_id") or "")
                 if attachment and attachment["content_type"].startswith("image/") and attachment["id"] not in request.attachments:
                     raise ValueError("请把要识别的照片随当前消息一起发送")
-            if name == "prepare_attachment":
+            if name == "inventory_import_preview" and args.get("mode") == "count_full":
+                if not re.search(r"整柜|全柜|整个柜|全部清点|表外.*(?:归零|为零|没有)|未列.*(?:归零|为零)", request.text):
+                    raise ValueError("整柜实盘会把表外同科目库存归零，请在消息中明确说明已经清点整个柜位")
+                if re.search(r"不要|不能|暂不|只清点部分|部分实盘", request.text):
+                    raise ValueError("这条消息未明确要求整柜实盘，请说明本次清点范围")
+            if name == "prepare_attachment" or (name == "inventory_import_preview" and args.get("mode") in chat.flow.COUNT_MODES):
                 for field, value in chat.checklist_chat_scope(conn, request.text).items():
                     if args.get(field) and str(args[field]).strip().casefold() != str(value).casefold():
                         raise ValueError("清单参数与消息中指定的取用科目、房间或柜位不一致，请重新核对")
@@ -148,9 +158,17 @@ def execute_tool(conn, run_id: str, token: str, name: str, arguments: dict, disp
             result = chat._cached_tool_result(conn, row["message_id"], name, args)
             if result is None:
                 if name == "business_preview":
-                    newer = conn.execute("SELECT 1 FROM chat_runs WHERE conversation_id=? AND message_id>? AND status IN ('queued','running')", (row["conversation_id"], row["message_id"])).fetchone()
-                    if newer:
-                        raise stock.Conflict("有更新的消息等待处理，本条消息的计划已失效")
+                    newer = conn.execute(
+                        "SELECT request_json FROM chat_runs WHERE conversation_id=? AND message_id>? "
+                        "AND status IN ('queued','running')", (row["conversation_id"], row["message_id"]),
+                    )
+                    if any(chat._edits_plan(json.loads(other["request_json"])["text"]) for other in newer):
+                        raise stock.Conflict("已有更新的修改说明，本条消息的计划已失效")
+                    if conn.execute(
+                        "SELECT 1 FROM chat_tasks WHERE conversation_id=? AND message_id>? AND status='pending_confirmation'",
+                        (row["conversation_id"], row["message_id"]),
+                    ).fetchone():
+                        raise stock.Conflict("已有较新的确认计划，请查看当前计划")
                     steps = (args.get("payload") or {}).get("operations", []) if args.get("kind") == "mixed" else [args]
                     selected = chat._attachments(conn, row["conversation_id"], request.attachments)
                     if selected and any(
@@ -167,7 +185,15 @@ def execute_tool(conn, run_id: str, token: str, name: str, arguments: dict, disp
                             reason = str((step.get("payload") or {}).get("repeat_reason") or "").strip()
                             if reason and reason not in request.text:
                                 raise ValueError("请在本条消息中说明再次登记的实际原因")
-                    result = chat._business_task(conn, row["conversation_id"], row["message_id"], request.message_id, args, attachments, dispatch_fn, row["actor"])
+                    conn.execute("SAVEPOINT replace_plan")
+                    try:
+                        expire_plans(conn, row["conversation_id"], request.message_id, through=row["message_id"])
+                        result = chat._business_task(conn, row["conversation_id"], row["message_id"], request.message_id, args, attachments, dispatch_fn, row["actor"])
+                    except Exception:
+                        conn.execute("ROLLBACK TO replace_plan")
+                        raise
+                    finally:
+                        conn.execute("RELEASE replace_plan")
                 elif name == "analyze_attachments":
                     from . import analysis
 
@@ -197,16 +223,19 @@ def execute_tool(conn, run_id: str, token: str, name: str, arguments: dict, disp
 def process_run(conn, run: dict, dispatch_fn, history_fn) -> dict:
     request = chat.ChatMessageRequest.model_validate_json(run["request_json"])
     conversation_id = run["conversation_id"]
-    pending = conn.execute("SELECT * FROM chat_tasks WHERE conversation_id=? AND status='pending_confirmation' ORDER BY created_at DESC LIMIT 1", (conversation_id,)).fetchone()
+    pending = conn.execute(
+        "SELECT * FROM chat_tasks WHERE conversation_id=? AND id=?",
+        (conversation_id, request.task_id),
+    ).fetchone()
     try:
         if chat._is_confirm(request.text):
-            if not pending or request.task_id != pending["id"] or request.plan_hash != pending["plan_hash"]:
-                response = {"status": "needs_details", "reply": "请先查看当前完整预览，再确认执行。"}
+            if request.attachments or not pending or request.plan_hash != pending["plan_hash"]:
+                response = {"status": "needs_details", "reply": "请先查看当前完整预览，再单独发送确认文字或使用确认按钮。"}
             else:
                 result = chat.confirm_task(conn, pending, run["actor"], run["device_id"], request.message_id, dispatch_fn, expected_plan_hash=request.plan_hash, run_id=run["id"])
                 response = {"status": "completed", "task_id": pending["id"], "result": result, "reply": "已完成确认的操作。以下结果来自实际业务记录。"}
         elif chat._is_cancel(request.text):
-            if not pending or request.task_id != pending["id"] or request.plan_hash != pending["plan_hash"]:
+            if request.attachments or not pending or request.plan_hash != pending["plan_hash"]:
                 response = {"status": "needs_details", "reply": "请查看要取消的计划，再使用该计划的取消按钮。"}
             else:
                 response = chat.cancel_task(conn, pending["id"], request.message_id, request.plan_hash)
@@ -222,6 +251,8 @@ def process_run(conn, run: dict, dispatch_fn, history_fn) -> dict:
                     "current_message": request.text,
                     "current_attachment_ids": request.attachments,
                     "history": chat._recent_history(conn, conversation_id),
+                    "current_plan": json.loads(pending["plan_json"]) if pending and pending["status"] == "pending_confirmation" else None,
+                    "plan_to_revise": json.loads(pending["plan_json"]) if pending and pending["status"] == "expired" and chat._edits_plan(request.text) else None,
                     "attachments": [{key: value for key, value in dict(item).items() if key != "path"} for item in conn.execute("SELECT * FROM chat_attachments WHERE conversation_id=?", (conversation_id,))],
                     "current_time": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
                 }),
@@ -231,12 +262,20 @@ def process_run(conn, run: dict, dispatch_fn, history_fn) -> dict:
             payload["images"] = [image_payload(Path(item["path"]), item["filename"]) for item in selected if item["content_type"].startswith("image/")]
             result = run_dsh(payload)
             # The preview is the business server's result, never a model claim.
-            saved = conn.execute("SELECT result_json FROM chat_tool_calls WHERE run_id=? AND name='business_preview' ORDER BY id DESC LIMIT 1", (run["id"],)).fetchone()
-            preview = json.loads(saved[0]) if saved else None
-            if preview and preview.get("status") == "pending_confirmation":
-                response = preview
+            saved = conn.execute(
+                "SELECT * FROM chat_tasks WHERE message_id=? AND status='pending_confirmation' ORDER BY rowid DESC LIMIT 1",
+                (run["message_id"],),
+            ).fetchone()
+            tools = [{"tool": item["name"], "result": json.loads(item["result_json"])}
+                     for item in conn.execute("SELECT name,result_json FROM chat_tool_calls WHERE run_id=? ORDER BY id", (run["id"],))]
+            if saved:
+                response = {
+                    "status": "pending_confirmation", "task_id": saved["id"], "plan_hash": saved["plan_hash"],
+                    "expires_at": saved["expires_at"], "preview": json.loads(saved["preview_json"]),
+                    "tool_results": [tool for tool in tools if tool["tool"] in {"prepare_attachment", "inventory_import_preview"}],
+                    "reply": "已按当前数据生成预览。请核对物品、位置、数量和状态，再确认执行。",
+                }
             elif result.get("status") == "completed":
-                tools = [{"tool": item["name"], "result": json.loads(item["result_json"])} for item in conn.execute("SELECT name,result_json FROM chat_tool_calls WHERE run_id=? ORDER BY id", (run["id"],))]
                 response = {"status": "answered", "reply": verified_reply(result.get("reply") or "", tools), "tool_results": tools}
             else:
                 response = {"status": "failed", "reply": "本次对话处理未完成，输入和任务已保存。可以发送继续说明。"}

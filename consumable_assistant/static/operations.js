@@ -100,15 +100,17 @@ for (const id of ['prepareCategory','prepareLab','prepareLocation','courseName']
 
 async function showBatch(batchId) {
   const result=await api('/api/uploads/batches/'+encodeURIComponent(batchId));
-  const eligible=result.rows.filter(row=>row.status==='可撤销').map(row=>row.item_id);
-  $('#batchDetails').innerHTML=tableHtml(['耗材','科目','位置','上传前','上传后','处理'],result.rows.map(row=>[row.item_name,row.category,`${row.lab||''} ${row.location_code||''}`,row.before,row.after,row.status].map(val=>esc(val??''))))+
-    (eligible.length?`<button data-undo-batch="${esc(batchId)}" data-item-ids="${eligible.join(',')}">预览撤销 ${eligible.length} 条</button>`:'没有可直接撤销的条目');
+  const eligible=result.rows.filter(row=>row.status==='可撤销');
+  $('#batchDetails').innerHTML=tableHtml(['选择','耗材','科目','位置','上传前','上传后','处理'],result.rows.map(row=>[
+    row.status==='可撤销'?`<input type="checkbox" checked data-batch-item="${Number(row.item_id)}" aria-label="撤销 ${esc(row.item_name)}"> `:'',
+    ...[row.item_name,row.category,`${row.lab||''} ${row.location_code||''}`,row.before,row.after,row.status].map(esc),
+  ]))+(eligible.length?`<button data-undo-batch="${esc(batchId)}">预览撤销已选条目</button>`:'没有可直接撤销的条目');
 }
 
 document.addEventListener('click',async event=>{
   const button=event.target.closest('button');if(!button)return;
   const data=button.dataset;
-  if(!['loadBatches','loadReferences'].includes(button.id)&&!['stockMore','chatReferences','archiveItem','batchDetail','undoBatch','removeReference'].some(key=>key in data))return;
+  if(!['loadBatches','loadReferences','loadArchived'].includes(button.id)&&!['stockMore','chatReferences','archiveItem','restoreItem','batchDetail','undoBatch','removeReference'].some(key=>key in data))return;
   button.disabled=true;
   try {
     if('stockMore' in data){
@@ -118,19 +120,90 @@ document.addEventListener('click',async event=>{
     }else if('chatReferences' in data){
       const result=await api('/api/reference-positions?'+data.chatReferences);button.nextElementSibling.innerHTML=referenceTable(result.rows);button.hidden=true;
     }else if('archiveItem' in data){
-      const note=window.prompt('停用此条耗材记录的原因');if(!note?.trim())return;
+      const note=await window.requestOperationNote('停用此条耗材记录的原因');if(!note?.trim())return;
       await perform('archive_item',{item_id:Number(data.archiveItem),note});await refreshAll();
+    }else if(button.id==='loadArchived'){
+      const result=await api('/api/uploads/archived-items');
+      $('#archivedList').innerHTML=renderWorkflowResult({type:'archived_items',rows:result.rows})
+        +result.rows.map(row=>`<p><button data-restore-item="${Number(row.id)}">恢复 ${esc(row.item_name)} ${esc(row.spec)} · ${esc(row.lab)} ${esc(row.location_code)}</button></p>`).join('');
+    }else if('restoreItem' in data){
+      const note=await window.requestOperationNote('恢复此条耗材记录的原因');if(!note?.trim())return;
+      await perform('restore_item',{item_id:Number(data.restoreItem),note});
+      $('#loadArchived').click();await refreshAll();
     }else if(button.id==='loadBatches'){
       const result=await api('/api/uploads/batches');$('#batchDetails').replaceChildren();
-      $('#batchList').innerHTML=result.rows.length?tableHtml(['上传时间','文件','操作'],result.rows.map(row=>[esc(formatDate(row.created_at)),esc(row.filename),row.tracked?`<button data-batch-detail="${esc(row.id)}">查看影响</button>`:'旧批次无逐笔关联，请实盘更正'])):'暂无库存上传批次';
+      $('#batchList').innerHTML=result.rows.length?tableHtml(['上传时间','文件','操作'],result.rows.map(row=>[esc(formatDate(row.created_at)),esc(`${row.filename}（${importModeLabels[row.mode] || row.mode}）`),row.tracked?`<button data-batch-detail="${esc(row.id)}">查看影响</button>`:'旧批次无逐笔关联，请实盘更正'])):'暂无库存上传批次';
     }else if('batchDetail' in data){await showBatch(data.batchDetail);
-    }else if('undoBatch' in data){await perform('undo_batch',{batch_id:data.undoBatch,item_ids:data.itemIds.split(',').map(Number)});await showBatch(data.undoBatch);await refreshAll();
+    }else if('undoBatch' in data){
+      const item_ids=[...$('#batchDetails').querySelectorAll('[data-batch-item]:checked')].map(input=>Number(input.dataset.batchItem));
+      if(!item_ids.length)throw new Error('请选择要撤销的条目');
+      await perform('undo_batch',{batch_id:data.undoBatch,item_ids});await showBatch(data.undoBatch);await refreshAll();
     }else if(button.id==='loadReferences'){
-      const result=await api('/api/reference-positions');const files=new Map(result.rows.map(row=>[row.file_id,row]));
-      $('#referenceFiles').innerHTML=files.size?tableHtml(['文件','科目','操作'],Array.from(files.values(),row=>[esc(row.filename),esc(row.category),`<button data-remove-reference="${Number(row.file_id)}">移除参考附件</button>`])):'暂无历史附件';
+      const result=await api('/api/reference-files');
+      $('#referenceFiles').innerHTML=result.rows.length?tableHtml(['文件','科目','操作'],result.rows.map(row=>[esc(row.filename),esc(row.category),
+        `<button data-remove-reference="${Number(row.file_id)}">移除参考附件</button>`])):'暂无历史附件';
     }else if('removeReference' in data){await perform('remove_reference',{file_id:Number(data.removeReference)});$('#loadReferences').click();await refreshAll();}
   }catch(error){showError(error);}finally{button.disabled=false;}
 });
+function selectedChecklistRows(form) {
+  return [...form.querySelectorAll('[data-checklist-row]')].filter(row=>row.querySelector('[data-checklist-select]').checked);
+}
+
+$('#chatMessages').addEventListener('change',event=>{
+  const form=event.target.closest('.chat-checklist-form');
+  if(!form)return;
+  const hasLoan=selectedChecklistRows(form).some(row=>row.querySelector('[data-checklist-action]').value==='borrow');
+  form.querySelector('[data-checklist-loan]').hidden=!hasLoan;
+});
+
+$('#chatMessages').addEventListener('submit',async event=>{
+  const form=event.target.closest('.chat-checklist-form');
+  if(!form)return;
+  event.preventDefault();
+  const button=form.querySelector('button[type=submit]');
+  const notice=form.querySelector('.form-error');
+  const conversationId=state.chatConversationId;
+  button.disabled=true;
+  notice.hidden=true;
+  try{
+    const rows=selectedChecklistRows(form);
+    if(!rows.length)throw new Error('请至少选择一项本次实际取用的条目');
+    const data={selected_rows:[],actions:{},edits:{}};
+    for(const row of rows){
+      const key=row.dataset.checklistRow;
+      const action=row.querySelector('[data-checklist-action]').value;
+      if(!action)throw new Error(`请为「${row.querySelector('legend').textContent}」选择消耗或借用`);
+      data.selected_rows.push(Number(key));
+      data.actions[key]=action;
+      const edits=Object.fromEntries([...row.querySelectorAll('[data-checklist-field]')]
+        .filter(input=>input.value.trim()!==input.dataset.original).map(input=>[input.dataset.checklistField,input.value.trim()]));
+      const item=Number(row.querySelector('[data-checklist-item]')?.value || 0);
+      if(item)edits.item_id=item;
+      if(Object.keys(edits).length)data.edits[key]=edits;
+    }
+    const fields=new FormData(form);
+    data.repeat_reason=String(fields.get('repeat_reason')||'').trim();
+    if(data.repeat_reason==='')delete data.repeat_reason;
+    if(Object.values(data.actions).includes('borrow')){
+      for(const [key,label] of [['borrower','借用人'],['purpose','用途'],['destination','目标位置'],['due_at','预计归还时间']]){
+        const value=String(fields.get(key)||'').trim();
+        if(!value)throw new Error(`请填写${label}`);
+        data[key]=key==='due_at'?shanghaiTime(value):value;
+      }
+    }
+    await api(`/api/chat/conversations/${encodeURIComponent(conversationId)}/checklists/${encodeURIComponent(form.dataset.checklistPreview)}/plan`,
+      {...jsonOptions,body:JSON.stringify(data)});
+    if(state.chatConversationId===conversationId){
+      await updateChatSnapshot(conversationId);
+    }
+  }catch(error){
+    notice.textContent=error.message;
+    notice.hidden=false;
+  }finally{
+    button.disabled=false;
+  }
+});
+
 function itemOptions() {return [['','选择物品'],...ops.items.map(item=>[item.id,`${item.item_name} ${item.spec||''} · ${item.lab||''} ${item.location_code||''} · 可用 ${item.available_quantity}${item.unit||''}${item.review_reason?' · 待核对':''}`])];}
 function addLessonLine(line={}) {
   const id=newRequestId();const element=document.createElement('div');element.className='lesson-line form-grid';element.dataset.line=id;

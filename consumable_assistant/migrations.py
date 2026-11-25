@@ -4,14 +4,21 @@ import json
 import sqlite3
 from pathlib import Path
 
-SCHEMA = """
+UPLOAD_PREVIEW_SCHEMA = """
+CREATE TABLE IF NOT EXISTS upload_previews(
+ id TEXT PRIMARY KEY, file_hash TEXT NOT NULL, content_hash TEXT NOT NULL, filename TEXT NOT NULL,
+ mode TEXT NOT NULL, rows TEXT NOT NULL, errors TEXT NOT NULL, committed INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+"""
+
+SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT DEFAULT CURRENT_TIMESTAMP, report TEXT);
 CREATE TABLE IF NOT EXISTS stock_balances(
  item_id INTEGER PRIMARY KEY REFERENCES inventory_items(id),
  ready TEXT NOT NULL, cleaning TEXT NOT NULL DEFAULT '0', repair TEXT NOT NULL DEFAULT '0',
  quarantine TEXT NOT NULL DEFAULT '0', version INTEGER NOT NULL DEFAULT 1,
  review_reason TEXT, original_quantity TEXT, active INTEGER NOT NULL DEFAULT 1,
- usage_type TEXT NOT NULL DEFAULT 'unclassified', conversions TEXT NOT NULL DEFAULT '{}');
+ usage_type TEXT NOT NULL DEFAULT 'unclassified', conversions TEXT NOT NULL DEFAULT '{{}}');
 CREATE TABLE IF NOT EXISTS operation_requests(
  request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL,
  actor TEXT NOT NULL, device_id TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
@@ -50,10 +57,7 @@ CREATE TABLE IF NOT EXISTS stock_counts(
 CREATE TABLE IF NOT EXISTS location_details(
  lab TEXT NOT NULL, location_code TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
  photo_path TEXT, version INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(lab,location_code));
-CREATE TABLE IF NOT EXISTS upload_previews(
- id TEXT PRIMARY KEY, file_hash TEXT NOT NULL, content_hash TEXT NOT NULL, filename TEXT NOT NULL,
- mode TEXT NOT NULL, rows TEXT NOT NULL, errors TEXT NOT NULL, committed INTEGER NOT NULL DEFAULT 0,
- created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+{UPLOAD_PREVIEW_SCHEMA}
 CREATE TABLE IF NOT EXISTS alert_states(
  item_id INTEGER PRIMARY KEY REFERENCES inventory_items(id), is_low INTEGER NOT NULL,
  event_id INTEGER, acknowledged INTEGER NOT NULL DEFAULT 0, snooze_until TEXT,
@@ -92,6 +96,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         migrate_procurement(conn)
         migrate_teacher_uploads(conn)
         migrate_classroom_consumption(conn)
+        migrate_teacher_reconciliation(conn)
         return
     database = conn.execute("PRAGMA database_list").fetchone()[2]
     if database:
@@ -126,6 +131,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         migrate_procurement(conn)
         migrate_teacher_uploads(conn)
         migrate_classroom_consumption(conn)
+        migrate_teacher_reconciliation(conn)
     except Exception:
         conn.rollback()
         raise
@@ -473,3 +479,33 @@ def migrate_classroom_consumption(conn):
         conn.execute("""CREATE INDEX idx_classroom_consumption_source
             ON classroom_consumption_rows(file_hash,source_sheet,source_row)""")
         conn.execute("INSERT INTO schema_migrations(version,report) VALUES (11,'{\"classroom_consumption_sources\":true}')")
+
+def migrate_teacher_reconciliation(conn):
+    from .workflows import classroom_signature
+
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=12").fetchone():
+            return
+        conn.execute(UPLOAD_PREVIEW_SCHEMA)
+        conn.execute("ALTER TABLE upload_previews ADD COLUMN scope_json TEXT NOT NULL DEFAULT '{}'")
+        conn.execute("ALTER TABLE classroom_consumption_rows ADD COLUMN signature TEXT")
+        conn.execute("CREATE INDEX idx_classroom_signature ON classroom_consumption_rows(signature)")
+        signatures = {}
+        for preview in conn.execute("SELECT file_hash,rows FROM upload_previews WHERE mode='prepare' AND committed=1"):
+            for row in json.loads(preview["rows"]):
+                if not row.get("locations") or not row.get("source_sheet") or not row.get("source_row"):
+                    continue
+                key = (preview["file_hash"], row["source_sheet"], row["source_row"])
+                for location in row["locations"]:
+                    signatures.setdefault((*key, location["item_id"]), set()).add(classroom_signature(row, location))
+        updates = []
+        if signatures:
+            for event in conn.execute("""SELECT r.*,e.item_id FROM classroom_consumption_rows r
+                                          JOIN stock_events e ON e.id=r.event_id"""):
+                matches = signatures.get((event["file_hash"], event["source_sheet"], event["source_row"], event["item_id"]), ())
+                if len(matches) == 1:
+                    updates.append((next(iter(matches)), event["event_id"]))
+        conn.executemany("UPDATE classroom_consumption_rows SET signature=? WHERE event_id=?", updates)
+        conn.execute("INSERT INTO schema_migrations(version,report) VALUES (12,?)",
+                     (json.dumps({"teacher_reconciliation": True}),))

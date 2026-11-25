@@ -29,6 +29,8 @@ from .normalization import (
 )
 
 ACTION_LABELS = {
+    "stocktake_reference": "旧合计转为历史参考",
+    "restore_item": "恢复耗材使用",
     "inbound": "入库",
     "consume": "消耗",
     "borrow": "借出",
@@ -1330,7 +1332,7 @@ def export_prepare_workbook(rows: list[dict[str, Any]]) -> bytes:
             "需求数量",
             "单位",
             "可用数量",
-            "还需采购",
+            "尚缺数量",
             "采购数量",
             "采购单位",
             "位置",
@@ -1349,8 +1351,8 @@ def export_prepare_workbook(rows: list[dict[str, Any]]) -> bytes:
                 row.get("required_quantity"),
                 row.get("unit"),
                 row.get("available_quantity"),
-                row.get("missing_quantity"),
-                row.get("purchase_quantity"),
+                row.get("missing_quantity") if row.get("locations") else None,
+                row.get("purchase_quantity") if row.get("locations") else None,
                 row.get("purchase_unit"),
                 locations,
                 row.get("status"),

@@ -3140,3 +3140,189 @@ def test_conversation_event_cursor_matches_its_read_snapshot(db):
     refreshed = chat.conversation_view(db, conversation)
     assert len(refreshed["messages"]) == 1
     assert refreshed["last_event_id"] > 0
+
+
+def test_whole_cabinet_replaces_only_selected_subject_and_preserves_shared_reference(db, tmp_path):
+    from consumable_assistant.teacher_uploads import batch_detail, references
+
+    def item(name, cabinet, quantity, category="普通化学"):
+        item_id = make_item(db, name, quantity=quantity, location=cabinet)
+        db.execute("UPDATE inventory_items SET category=? WHERE id=?", (category, item_id))
+        return item_id
+
+    shared = item("烧杯", "A1、A2", 10)
+    omitted = item("玻璃棒", "A1", 8)
+    elsewhere = item("玻璃棒", "A2", 6)
+    other_subject = item("漏斗", "A1", 7, "有机化学")
+    path = tmp_path / "count.xlsx"
+    sheet(path, ["耗材名称", "规格", "单位", "数量"], [["烧杯", "100mL", "个", 4]])
+    scope = {"category": "普通化学", "lab": "实验室", "location_code": "A1"}
+    partial = flow.preview_import(db, path, path.name, "count", **scope)
+    assert [(row["id"], row["action"]) for row in partial["affected"]] == [(shared, "reference")]
+    full = flow.preview_import(db, path, path.name, "count_full", **scope)
+    assert {(row["id"], row["action"]) for row in full["affected"]} == {(shared, "reference"), (omitted, "zero")}
+    assert stock.view(db, shared)["ready"] == "10"
+    write(db, "import", {"preview_id": full["preview_id"]})
+    matches = [row for row in references(db, "普通化学", "烧杯") if row["file_id"] is None]
+    assert [(row["location_code"], row["original_quantity"], row["counted"]) for row in matches] == [
+        ("A1", "10", True), ("A2", "10", False),
+    ]
+    assert stock.view(db, shared)["active"] == 0
+    assert [stock.view(db, value)["ready"] for value in (shared, omitted, elsewhere, other_subject)] == ["0", "0", "6", "7"]
+    details = {row["item_id"]: row for row in batch_detail(db, full["preview_id"])}
+    assert details[shared]["status"] == "需重新清点" and details[omitted]["status"] == "可撤销"
+    with pytest.raises(ValueError):
+        write(db, "undo_batch", {"batch_id": full["preview_id"], "item_ids": [shared]})
+    write(db, "undo_batch", {"batch_id": full["preview_id"], "item_ids": [omitted]})
+    assert stock.view(db, omitted)["ready"] == "8"
+
+
+def test_restore_directly_or_by_verified_partial_count(db, tmp_path):
+    from consumable_assistant.teacher_uploads import archived_items
+
+    scope = {"category": "普通化学", "lab": "实验室", "location_code": "A1"}
+    item_id = flow.create_item(db, {**scope, "item_name": "烧杯", "spec": "100mL", "unit": "个"})
+    db.commit()
+    write(db, "archive_item", {"item_id": item_id, "version": 1, "note": "暂时停用"})
+    assert [row["id"] for row in archived_items(db)] == [item_id]
+    write(db, "restore_item", {"item_id": item_id, "version": 2, "note": "重新使用"})
+    assert stock.view(db, item_id)["active"] == 1
+    write(db, "archive_item", {"item_id": item_id, "version": 3, "note": "清点前停用"})
+    path = tmp_path / "count.xlsx"
+    sheet(path, ["耗材名称", "规格", "单位", "数量"], [["烧杯", "100毫升", "个", 4]])
+    batch = flow.preview_import(db, path, path.name, "count", **scope)
+    assert batch["rows"][0]["restore"]
+    write(db, "import", {"preview_id": batch["preview_id"]})
+    assert stock.view(db, item_id)["ready"] == "4"
+    write(db, "undo_batch", {"batch_id": batch["preview_id"], "item_ids": [item_id]})
+    assert stock.view(db, item_id)["active"] == 0
+
+
+def test_empty_full_count_requires_headers_and_rejects_late_inventory(db, tmp_path):
+    scope = {"category": "普通化学", "lab": "实验室", "location_code": "A1"}
+    item_id = flow.create_item(db, {**scope, "item_name": "烧杯", "unit": "个"})
+    operation(db, item_id, "inbound", 3)
+    path = tmp_path / "empty.xlsx"
+    sheet(path, ["耗材名称"], [])
+    with pytest.raises(ValueError, match="表头"):
+        flow.preview_import(db, path, path.name, "count_full", **scope)
+    sheet(path, ["耗材名称", "数量", "数量单位"], [])
+    batch = flow.preview_import(db, path, path.name, "count_full", **scope)
+    assert [row["id"] for row in batch["affected"]] == [item_id]
+    added = flow.create_item(db, {**scope, "item_name": "量筒", "unit": "个"})
+    operation(db, added, "inbound", 4)
+    with pytest.raises(stock.Conflict):
+        write(db, "import", {"preview_id": batch["preview_id"]})
+    assert stock.view(db, item_id)["ready"] == "3"
+    latest = flow.preview_import(db, path, path.name, "count_full", **scope)
+    write(db, "import", {"preview_id": latest["preview_id"]})
+    assert [stock.view(db, value)["ready"] for value in (item_id, added)] == ["0", "0"]
+
+
+def test_workbook_metadata_resave_warns_only_for_resolved_repeated_usage(db, tmp_path):
+    from openpyxl import load_workbook
+
+    item = make_item(db, quantity=18)
+    path = tmp_path / "lesson.xlsx"
+    sheet(path, ["耗材名称", "规格", "数量", "单位", "使用方式"], [
+        ["玻璃烧杯", "100mL", 2, "个", "消耗"],
+        ["不存在的耗材", "10mL", 4, "个", "消耗"],
+    ])
+    original = flow.preparation(db, path, "普通化学")
+    assert original["rows"][1]["status"] == "需要确认匹配" and original["rows"][1]["purchase_quantity"] is None
+    write(db, "prepare", {"preview_id": original["preview_id"], "selected_rows": [2]})
+    book = load_workbook(path)
+    book.properties.creator = "不同的工作簿属性"
+    book.save(path)
+    book.close()
+    updated = flow.preparation(db, path, "普通化学")
+    assert updated["rows"][0]["previously_consumed"]
+    payload = {"preview_id": updated["preview_id"], "selected_rows": [2]}
+    with pytest.raises(ValueError, match="再次登记原因"):
+        write(db, "prepare", payload)
+    write(db, "prepare", {**payload, "repeat_reason": "下一班学生实际取用"})
+    assert stock.view(db, item)["ready"] == "14"
+
+
+def test_chat_query_preserves_confirmation_and_text_requires_matching_visible_plan(db, monkeypatch):
+    from consumable_assistant import chat, chat_runtime
+    from consumable_assistant.server import dispatch, history_rows
+
+    item, conversation, _, running, plan = queued_preview(db)
+    chat_runtime.finish(db, running, plan)
+
+    def send(message, attachments=(), bound=True):
+        request = chat.ChatMessageRequest(
+            message_id=uuid.uuid4().hex, text=message, attachments=list(attachments),
+            task_id=plan["task_id"] if bound else None, plan_hash=plan["plan_hash"] if bound else None,
+        )
+        return chat.process_message(db, conversation, request, "另一位老师", "phone", dispatch, history_rows)
+
+    scripted_dsh(monkeypatch, db, iter([
+        {"calls": [{"name": "inventory_search", "arguments": {"query": "烧杯"}}]},
+        {"reply": "{}", "calls": []},
+    ]))
+    assert send("请顺便查询烧杯库存", bound=False)["status"] == "answered"
+    assert send("确认，按这个来", bound=False)["status"] == "needs_details"
+    assert stock.view(db, item)["ready"] == "100"
+    assert send("这个没问题，可以执行")["status"] == "completed"
+    assert send("确认，按这个来")["status"] == "completed"
+    assert stock.view(db, item)["ready"] == "98"
+    assert db.execute("SELECT COUNT(*) FROM stock_events").fetchone()[0] == 1
+
+
+def test_explicit_edit_revokes_old_plan_before_native_model_response(db):
+    from consumable_assistant import chat, chat_runtime
+    from consumable_assistant.server import dispatch
+
+    item, conversation, _, running, plan = queued_preview(db)
+    chat_runtime.finish(db, running, plan)
+    request = chat.ChatMessageRequest(
+        message_id=uuid.uuid4().hex, text="数量改成三个", task_id=plan["task_id"], plan_hash=plan["plan_hash"],
+    )
+    chat_runtime.enqueue(db, conversation, request, "另一位教师", "phone")
+    old = db.execute("SELECT * FROM chat_tasks WHERE id=?", (plan["task_id"],)).fetchone()
+    with pytest.raises(stock.Conflict):
+        chat.confirm_task(db, old, "测试教师", "desktop", uuid.uuid4().hex, dispatch, expected_plan_hash=plan["plan_hash"])
+    assert stock.view(db, item)["ready"] == "100"
+
+
+def test_chat_checklist_editor_previews_edits_and_only_records_after_confirmation(db, monkeypatch):
+    from consumable_assistant import chat, server
+
+    item = make_item(db, quantity=12)
+    conversation = chat.new_conversation(db, "old-device")["conversation_id"]
+    another = chat.new_conversation(db, "other-device")["conversation_id"]
+    preview = flow.checklist(db, [
+        {"name": "玻璃烧杯", "spec": "100mL", "unit": "个", "required_quantity": 3, "row_number": 1},
+        {"name": "玻璃烧杯", "spec": "100mL", "unit": "个", "required_quantity": 99, "row_number": 2},
+    ], "课堂清单.xlsx")
+    message = db.execute(
+        "INSERT INTO chat_messages(conversation_id,request_id,role,content) VALUES (?,?,'user','核对清单')",
+        (conversation, uuid.uuid4().hex),
+    ).lastrowid
+    chat._record_tool_call(db, conversation, message, "prepare_attachment", {}, preview, "tests")
+    db.commit()
+    database = Path(db.execute("PRAGMA database_list").fetchone()[2])
+    monkeypatch.setattr(server, "connect", lambda: connect(database))
+    headers = {"X-Device-ID": "phone", "X-Actor": "Teacher"}
+    body = {"selected_rows": [1], "actions": {"1": "borrow"}, "edits": {"1": {"item_id": item, "required_quantity": "2.5"}},
+            "borrower": "Teacher", "purpose": "普通化学实验", "destination": "实验台",
+            "due_at": "2027-01-01T12:00:00+08:00"}
+    with TestClient(server.app) as client:
+        route = f"/checklists/{preview['preview_id']}/plan"
+        invalid = client.post(f"/api/chat/conversations/{another}{route}",
+                              headers={**headers, "X-Request-ID": uuid.uuid4().hex}, json=body)
+        assert invalid.status_code == 400
+        response = client.post(f"/api/chat/conversations/{conversation}{route}",
+                               headers={**headers, "X-Request-ID": uuid.uuid4().hex}, json=body)
+        assert response.status_code == 200, response.text
+        task = response.json()
+        assert task["preview"]["changes"][0]["after"]["available_quantity"] == "9.5"
+        assert stock.view(db, item)["ready"] == "12"
+        confirmed = client.post(f"/api/chat/tasks/{task['task_id']}/confirm", headers=headers,
+                                json={"request_id": uuid.uuid4().hex, "plan_hash": task["plan_hash"]})
+        assert confirmed.status_code == 200, confirmed.text
+        assert stock.view(db, item)["ready"] == "9.5"
+        assert db.execute("SELECT outstanding FROM loans").fetchone()[0] == "2.5"
+        assert db.execute("SELECT action FROM stock_events").fetchone()[0] == "borrow"

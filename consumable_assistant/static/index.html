@@ -139,9 +139,10 @@
                 <h2>批量上传库存</h2>
                 <p class="muted small-text">表格至少需要“耗材名称”和“数量”，建议同时填写类别、实验室、位置、规格型号、数量单位和库存预警。</p>
                 <div class="toolbar upload-form">
-                  <label class="file-picker" for="batchUploadFile">库存数据表<input id="batchUploadFile" type="file" accept=".xlsx,.xls" /></label>
+                  <label class="file-picker" for="batchUploadFile">库存数据表<input id="batchUploadFile" type="file" accept=".xlsx,.xls,.csv" /></label>
                   <select id="batchUploadMode" aria-label="批量上传方式">
-                    <option value="count">实盘：柜内实际还剩</option>
+                    <option value="count">部分实盘：只更新表内耗材</option>
+                    <option value="count_full">整柜实盘：表外同科目耗材归零</option>
                     <option value="add">入库：新购数量累加</option>
                     <option value="reference">历史参考：列为待实盘，不入库</option>
                   </select>
@@ -152,12 +153,13 @@
                   <button type="button" class="tab secondary" data-tab="prepare">课堂耗用</button>
                   <button id="batchUploadBtn" class="primary"><i data-lucide="upload" class="icon-sm"></i>上传库存表</button>
                 </div>
-                <div class="toolbar"><label class="inline-check"><input id="allowDuplicateImport" type="checkbox" />确认再次登记相同表格</label><label>登记原因<input id="importNote" /></label><button id="confirmImportBtn" disabled><i data-lucide="check" class="icon-sm"></i>确认导入</button></div>
-                <pre id="batchUploadLog"></pre>
+                <div class="toolbar"><label class="inline-check"><input id="allowDuplicateImport" type="checkbox" />确认再次登记相同表格</label><label>登记原因<input id="importNote" /></label><button id="confirmImportBtn" disabled><i data-lucide="check" class="icon-sm"></i>生成确认预览</button></div>
+                <div id="batchUploadLog" aria-live="polite"></div>
               </div>
               <div class="surface">
                 <h2>上传更正</h2><button id="loadBatches" class="secondary"><i data-lucide="history" class="icon-sm"></i>查看上传批次</button><div id="batchList"></div><div id="batchDetails" aria-live="polite"></div>
                 <h2>历史参考附件</h2><button id="loadReferences" class="secondary"><i data-lucide="files" class="icon-sm"></i>查看附件</button><div id="referenceFiles"></div>
+                <h2>已停用耗材</h2><button id="loadArchived" type="button" class="secondary">查看可恢复记录</button><div id="archivedList" aria-live="polite"></div>
                 <h2>位置批量操作</h2>
                 <div class="toolbar location-form">
                   <select id="sourceLocationSelect" aria-label="原位置"><option value="">选择原位置</option></select>

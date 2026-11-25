@@ -12,7 +12,7 @@ from .services import resolve_upload_column
 def batches(conn):
     return [dict(row) for row in conn.execute("""SELECT p.id,p.filename,p.mode,p.created_at,
         EXISTS(SELECT 1 FROM upload_events u WHERE u.batch_id=p.id) AS tracked
-        FROM upload_previews p WHERE p.committed=1 AND p.mode IN ('add','overwrite','count')
+        FROM upload_previews p WHERE p.committed=1 AND p.mode IN ('add','overwrite','count','count_full')
         ORDER BY p.created_at DESC,p.rowid DESC""")]
 
 
@@ -26,12 +26,13 @@ def batch_detail(conn, batch_id):
             'created_item': bool(row['created_item']), 'reversed': 0})
         entry['after'] = snapshot['quantity_after']
         entry['events'].append(row['id'])
+        entry['shared_reference'] = entry.get('shared_reference', False) or row['action'] == 'stocktake_reference'
         entry['reversed'] += int(bool(row['reversed_by']))
     for entry in groups.values():
         later = conn.execute("SELECT 1 FROM stock_events WHERE item_id=? AND id>? LIMIT 1",
                              (entry['item_id'], entry['events'][-1])).fetchone()
         entry['status'] = ('已撤销' if entry['reversed'] == len(entry['events']) else '需重新清点'
-                           if later or entry['reversed'] else '可撤销')
+                           if later or entry['reversed'] or entry['shared_reference'] else '可撤销')
     return list(groups.values())
 
 
@@ -40,31 +41,73 @@ def archive_item(conn, data, actor):
     stock.check_version(item, data.get('version'))
     if not item['active'] or item['review_reason'] or stock.number(item['owned_quantity']) or stock.number(item['reserved_quantity']):
         raise ValueError('请先清点并处理库存、借用和预留，再停用该记录')
-    if conn.execute("SELECT 1 FROM purchase_orders WHERE item_id=? AND status IN ('draft','ordered')", (item['item_id'],)).fetchone():
+    if conn.execute("SELECT 1 FROM purchase_orders WHERE item_id=? AND status IN ('draft','ordered','partial')", (item['item_id'],)).fetchone():
         raise ValueError('此记录还有未完成的采购')
     conn.execute('UPDATE stock_balances SET active=0,version=version+1 WHERE item_id=?', (item['item_id'],))
     stock.event(conn, item['item_id'], 'archive', {}, actor, stock.required(data, 'note'))
+    stock.alerts_changed(conn, item['item_id'])
     return {'ok': True}
 
 
+def restore_item(conn, data, actor):
+    item = stock.view(conn, data["item_id"])
+    stock.check_version(item, data.get("version"))
+    if item["active"]:
+        raise ValueError("此耗材仍在使用")
+    last = conn.execute("SELECT action FROM stock_events WHERE item_id=? ORDER BY id DESC LIMIT 1",
+                        (item["item_id"],)).fetchone()
+    if not last or last["action"] != "archive":
+        raise ValueError("此记录已转为历史参考，请按实际柜位登记实盘")
+    conn.execute("UPDATE stock_balances SET active=1,version=version+1 WHERE item_id=?", (item["item_id"],))
+    stock.event(conn, item["item_id"], "restore_item", {}, actor, stock.required(data, "note"))
+    stock.alerts_changed(conn, item["item_id"])
+    return {"ok": True, "item_id": item["item_id"]}
+
+
+def retire_shared_balance(conn, item_id, actor, filename):
+    item = stock.view(conn, item_id)
+    if stock.number(item["owned_quantity"]) != stock.number(item["ready"]) or stock.number(item["reserved_quantity"]):
+        raise ValueError(f"{item['item_name']}的多柜合计有借用、预留或待处理状态，请先核对")
+    if conn.execute("SELECT 1 FROM purchase_orders WHERE item_id=? AND status IN ('draft','ordered','partial')",
+                    (item_id,)).fetchone():
+        raise ValueError(f"{item['item_name']}的多柜合计还有未完成采购")
+    conn.execute("UPDATE stock_balances SET active=0 WHERE item_id=?", (item_id,))
+    changes = {"ready": stock.text(-stock.number(item["ready"])), "original_quantity": item["ready"]}
+    stock.update_states(conn, item, changes)
+    return stock.event(conn, item_id, "stocktake_reference", changes, actor, f"多柜旧库存转为历史参考，来源 {filename}")
+
+
+def archived_items(conn, query=""):
+    rows = conn.execute("""SELECT i.id,i.item_name,i.spec,i.unit,i.category,i.lab,i.location_code,b.version
+        FROM inventory_items i JOIN stock_balances b ON b.item_id=i.id
+        WHERE b.active=0 AND (SELECT action FROM stock_events WHERE item_id=i.id ORDER BY id DESC LIMIT 1)='archive'
+        ORDER BY i.id DESC""")
+    needle = normalize_text(query)
+    return [row for row in map(dict, rows)
+            if needle in normalize_text(" ".join(str(value or "") for value in row.values()))]
+
 def undo_batch(conn, data, actor):
     rows = batch_detail(conn, data['batch_id'])
+    preview = conn.execute("SELECT rows FROM upload_previews WHERE id=?", (data["batch_id"],)).fetchone()
+    restored = {row["item_id"] for row in json.loads(preview["rows"]) if row.get("restore")} if preview else set()
     eligible = [row for row in rows if row['status'] == '可撤销']
-    if not eligible or {row['item_id'] for row in eligible} != set(data['item_ids']):
+    selected = set(data['item_ids'])
+    if not selected or not selected <= {row['item_id'] for row in eligible}:
         raise stock.Conflict('可撤销范围已经变化，请重新查看上传批次')
+    eligible = [row for row in eligible if row['item_id'] in selected]
     for row in eligible:
         ignored = set()
         for event_id in reversed(row['events']):
             item = stock.ensure_balance(conn, row['item_id'])
             inverse = stock.undo(conn, event_id, actor, item['version'], later_batch_events=ignored)
             ignored.update((event_id, inverse['id']))
-        if row['created_item']:
+        if row['created_item'] or row['item_id'] in restored:
             item = stock.ensure_balance(conn, row['item_id'])
-            archive_item(conn, {'item_id': row['item_id'], 'version': item['version'], 'note': '撤销上传新增记录'}, actor)
+            archive_item(conn, {'item_id': row['item_id'], 'version': item['version'], 'note': '撤销上传时启用的记录'}, actor)
     return {'ok': True, 'reversed_items': len(eligible), 'needs_count': [row['item_id'] for row in rows if row['status'] == '需重新清点']}
 
 
-def preview_reference(conn, path, filename, category, default_lab=""):
+def preview_reference(conn, path, filename, category, default_lab="", *, commit=True):
     if not category.strip():
         raise ValueError('请选择旧表所属科目')
     frame = uploaded_frame(path)
@@ -84,8 +127,9 @@ def preview_reference(conn, path, filename, category, default_lab=""):
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     conn.execute("INSERT INTO upload_previews(id,file_hash,content_hash,filename,mode,rows,errors) VALUES (?,?,'',?,'reference',?,'[]')",
                  (token, digest, filename, json.dumps(rows, ensure_ascii=False)))
-    conn.commit()
-    return {'preview_id': token, 'rows': rows, 'errors': []}
+    if commit:
+        conn.commit()
+    return {'preview_id': token, 'rows': rows, 'errors': [], 'mode': 'reference'}
 
 
 def save_reference(conn, data, actor):
@@ -101,13 +145,29 @@ def save_reference(conn, data, actor):
     conn.executemany('INSERT INTO reference_positions(file_id,sheet,source_row,item_name,spec,unit,lab,location_code,original_location,original_quantity) VALUES (?,?,?,?,?,?,?,?,?,?)',
                      [(file_id, *(row[key] for key in ('source_sheet','source_row','name','spec','unit','lab','location_code','location','quantity'))) for row in rows])
     conn.execute('UPDATE upload_previews SET committed=1 WHERE id=?', (preview['id'],))
-    return {'ok': True, 'filename': preview['filename'], 'positions': len(rows)}
+    return {'ok': True, 'file_id': file_id, 'filename': preview['filename'], 'positions': len(rows)}
+
+
+def reference_files(conn):
+    return [dict(row) for row in conn.execute(
+        "SELECT id AS file_id,filename,category,actor,created_at FROM reference_files WHERE active=1 ORDER BY id DESC"
+    )]
 
 
 def references(conn, category='', query='', lab='', location_code=''):
     rows = [dict(row) for row in conn.execute("""SELECT p.*,f.category,f.filename FROM reference_positions p
         JOIN reference_files f ON p.file_id=f.id WHERE f.active=1 AND (?='' OR f.category=?)
         ORDER BY f.category,f.id,p.source_row,p.id""", (category, category))]
+    for event in conn.execute("""SELECT e.snapshot,e.changes FROM stock_events e JOIN stock_balances b ON b.item_id=e.item_id
+                                 WHERE e.action='stocktake_reference' AND b.active=0"""):
+        old = json.loads(event["snapshot"])
+        if category and old["category"] != category:
+            continue
+        for cabinet in cabinet_codes(old["location_code"]):
+            rows.append({**old, "file_id": None, "filename": "多柜旧库存", "sheet": None, "source_row": None,
+                         "original_location": old["location_code"], "location_code": cabinet,
+                         "lab": physical_room({**old, "location_code": cabinet}),
+                         "original_quantity": json.loads(event["changes"])["original_quantity"]})
     output = []
     for row in rows:
         if location_code and not matches_cabinet(row['location_code'], location_code):

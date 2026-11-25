@@ -109,6 +109,7 @@ def tables(path: Path, *, arithmetic: bool = False) -> list[dict]:
 
 def uploaded_frame(path: Path, *, arithmetic: bool = False) -> pd.DataFrame:
     records, sources = [], []
+    recognized_columns = set()
     for sheet in tables(path, arithmetic=arithmetic):
         if sheet["formulas"]:
             raise ValueError(f"工作表 {sheet['sheet']} 包含公式（{'、'.join(sheet['formulas'][:10])}），请核对并改为明确数值后上传")
@@ -116,6 +117,7 @@ def uploaded_frame(path: Path, *, arithmetic: bool = False) -> pd.DataFrame:
             if any(any(v is not None and v != "" for v in row) for row in sheet["rows"]):
                 raise ValueError(f"工作表 {sheet['sheet']} 未识别名称列，请核对表头")
             continue
+        recognized_columns.update(ALIASES.get(key, key) for key in sheet["columns"])
         for row in sheet["records"]:
             values = {}
             for key, value in row["values"].items():
@@ -128,6 +130,7 @@ def uploaded_frame(path: Path, *, arithmetic: bool = False) -> pd.DataFrame:
             sources.append({"source_sheet": row["source_sheet"], "source_row": row["source_row"]})
     frame = pd.DataFrame(records)
     frame.attrs["sources"] = sources
+    frame.attrs["recognized_columns"] = recognized_columns
     return frame
 
 

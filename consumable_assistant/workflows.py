@@ -11,7 +11,14 @@ from pathlib import Path
 
 from . import ledger as stock
 from .importer import add_aliases
-from .matching import SCOPE_FIELDS, in_scope, require_scope
+from .matching import (
+    SCOPE_FIELDS,
+    cabinet_codes,
+    in_scope,
+    matches_cabinet,
+    require_scope,
+    same_material,
+)
 from .normalization import normalize_text, stable_key
 
 
@@ -206,6 +213,9 @@ def archive_location(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
     return {"ok": True, "archived_count": len(rows)}
 
 
+COUNT_MODES = {"count", "count_full"}
+
+
 def preview_import(
     conn: sqlite3.Connection,
     path: Path,
@@ -215,17 +225,21 @@ def preview_import(
     commit: bool = True,
     *, lab="", location_code="", sum_parts=False,
 ) -> dict:
-    from .services import map_upload_row
+    from .services import map_upload_row, resolve_upload_column
 
-    if mode not in ("add", "overwrite", "count"):
+    if mode not in {"add", "overwrite", *COUNT_MODES}:
         raise ValueError("上传方式无效")
     scope = {"category": category, "lab": lab, "location_code": location_code}
-    if mode == "count" and not all(str(value or "").strip() for value in scope.values()):
+    if mode in COUNT_MODES and (not all(str(value or "").strip() for value in scope.values()) or len(cabinet_codes(location_code)) != 1):
         raise ValueError("分批实盘必须选择科目、房间和柜位")
     from .attachments import uploaded_frame
 
     df = uploaded_frame(path, arithmetic=True).dropna(how="all")
     df.columns = [str(col).strip() for col in df.columns]
+    if mode == "count_full" and df.empty and not all(
+        resolve_upload_column(df.attrs["recognized_columns"], field) for field in ("name", "quantity", "unit")
+    ):
+        raise ValueError("空柜整柜实盘需要保留耗材名称、数量和单位表头")
     rows, errors, seen = [], [], set()
     parts = {}
     for index, row in df.iterrows():
@@ -233,10 +247,12 @@ def preview_import(
         try:
             mapped = map_upload_row(row.to_dict(), list(df.columns), category)
             if not mapped:
+                if mode == "count_full":
+                    raise ValueError("此行存在内容但未识别耗材记录，请核对名称、数量和单位")
                 continue
             if not mapped["unit"]:
                 raise ValueError("必须填写数量单位")
-            if mode == "count":
+            if mode in COUNT_MODES:
                 for field in SCOPE_FIELDS:
                     if mapped[field] and mapped[field] != scope[field]:
                         raise ValueError("表格条目不在本次清点范围")
@@ -247,6 +263,8 @@ def preview_import(
                     raise ValueError("本柜有多条符合记录，请在表格补全规格、品牌")
                 mapped["item_key"] = matches[0]["item_key"] if matches else stable_key([
                     mapped[key] for key in (*SCOPE_FIELDS, "item_name", "spec", "brand", "unit")])
+                if not matches and conn.execute("SELECT 1 FROM inventory_items WHERE item_key=?", (mapped["item_key"],)).fetchone():
+                    raise ValueError("此耗材记录已停用，请先恢复使用，再重新清点")
             if (
                 mapped["threshold"] is not None
                 and stock.number(mapped["threshold"]) < 0
@@ -263,15 +281,16 @@ def preview_import(
                 {
                     "row_number": int(index) + 2,
                     **source,
-                    "duplicate_row": signature in seen if mode != "count" else False,
+                    "duplicate_row": signature in seen if mode not in COUNT_MODES else False,
                     "item_id": old["id"] if old else None,
                     "version": balance["version"] if balance else None,
                     "before": balance["ready"] if balance else "0",
+                    "restore": bool(balance and not balance["active"] and mode in COUNT_MODES),
                 }
             )
             seen.add(signature)
             rows.append(mapped)
-            if mode == "count":
+            if mode in COUNT_MODES:
                 group = parts.setdefault(mapped["item_key"], [])
                 group.append(mapped)
                 if len(group) > 1 and not sum_parts:
@@ -282,27 +301,34 @@ def preview_import(
         group[0]["count_total"] = stock.text(sum(stock.number(row["quantity"]) for row in group))
         for row in group[1:]:
             row["count_part"] = True
+    affected = []
+    if mode in COUNT_MODES and not errors and (rows or (mode == "count_full" and df.empty)):
+        affected = count_scope_changes(conn, scope, rows, full=mode == "count_full")
+    metadata = {"scope": scope, "affected": affected} if mode in COUNT_MODES else {}
+    if mode == "count_full" and not rows and not df.empty and not errors:
+        errors.append({"error": "清单含有未识别的条目，请核对名称、数量和单位"})
     token = uuid.uuid4().hex
     file_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     normalized = [
         {
             key: value
             for key, value in row.items()
-            if key not in ("version", "item_id", "before")
+            if key not in ("version", "item_id", "before", "restore")
         }
         for row in rows
     ]
     content_hash = hashlib.sha256(
-        json.dumps(normalized, sort_keys=True, ensure_ascii=False).encode()
+        json.dumps([mode, scope, normalized] if mode == "count_full" else normalized,
+                   sort_keys=True, ensure_ascii=False).encode()
     ).hexdigest()
     duplicate = bool(
         conn.execute(
-            "SELECT 1 FROM upload_previews WHERE mode!='prepare' AND committed=1 AND (file_hash=? OR content_hash=?)",
-            (file_hash, content_hash),
+            "SELECT 1 FROM upload_previews WHERE mode=? AND committed=1 AND (content_hash=? OR (? AND file_hash=?))",
+            (mode, content_hash, mode not in COUNT_MODES, file_hash),
         ).fetchone()
     )
     conn.execute(
-        "INSERT INTO upload_previews(id,file_hash,content_hash,filename,mode,rows,errors) VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO upload_previews(id,file_hash,content_hash,filename,mode,rows,errors,scope_json) VALUES (?,?,?,?,?,?,?,?)",
         (
             token,
             file_hash,
@@ -311,6 +337,7 @@ def preview_import(
             mode,
             json.dumps(rows, ensure_ascii=False),
             json.dumps(errors, ensure_ascii=False),
+            json.dumps(metadata, ensure_ascii=False),
         ),
     )
     if commit:
@@ -320,28 +347,59 @@ def preview_import(
         "rows": rows,
         "errors": errors,
         "duplicate_file": duplicate,
+        "mode": mode, "affected": affected,
     }
 
 
 def count_matches(conn, row):
-    candidates = conn.execute("""SELECT i.id,i.item_key,i.category,i.lab,i.location_code FROM inventory_items i JOIN stock_balances b ON b.item_id=i.id
-        WHERE b.active=1 AND i.category=? AND i.location_code=? AND i.normalized_name=? AND i.unit=?
-        AND (? IS NULL OR i.spec=?) AND (? IS NULL OR i.brand=?)""",
-        tuple(row[key] for key in ("category", "location_code", "normalized_name", "unit", "spec", "spec", "brand", "brand")))
-    return [item for item in candidates if in_scope(dict(item), row)]
+    candidates = conn.execute("""SELECT i.*,b.active FROM inventory_items i JOIN stock_balances b ON b.item_id=i.id
+        WHERE i.category=? AND i.location_code=? COLLATE NOCASE AND i.normalized_name=? AND i.unit=?
+        AND (b.active=1 OR (SELECT action FROM stock_events WHERE item_id=i.id ORDER BY id DESC LIMIT 1)='archive')
+        ORDER BY b.active DESC,i.id""",
+        tuple(row[key] for key in ("category", "location_code", "normalized_name", "unit")))
+    matches = [item for item in map(dict, candidates)
+               if in_scope({**item, "location_code": row["location_code"]}, row)
+               and (not row["spec"] or same_material(row["item_name"], row["spec"], item["item_name"], item["spec"]))
+               and (not row["brand"] or normalize_text(row["brand"]) == normalize_text(item["brand"]))]
+    return [item for item in matches if item["active"]] or matches
+
+
+def count_scope_changes(conn, scope, rows, *, full):
+    location = scope["location_code"]
+    candidates = conn.execute("""SELECT i.*,b.version,b.ready FROM inventory_items i JOIN stock_balances b ON b.item_id=i.id
+        WHERE b.active=1 AND i.category=? ORDER BY i.id""", (scope["category"],))
+    uploaded = {row["item_id"] for row in rows}
+    changes = []
+    for item in map(dict, candidates):
+        if item["id"] in uploaded or not matches_cabinet(item["location_code"], location):
+            continue
+        if not in_scope({**item, "location_code": location}, scope):
+            continue
+        shared = len(cabinet_codes(item["location_code"])) > 1
+        overlap = shared and any(
+            row["normalized_name"] == item["normalized_name"] and row["unit"] == item["unit"]
+            and (not row["spec"] or same_material(row["item_name"], row["spec"], item["item_name"], item["spec"]))
+            and (not row["brand"] or normalize_text(row["brand"]) == normalize_text(item["brand"]))
+            for row in rows
+        )
+        if full or overlap:
+            changes.append({key: item[key] for key in (
+                "id", "item_name", "spec", "brand", "category", "lab", "location_code", "unit", "version", "ready",
+            )} | {"action": "reference" if shared else "zero"})
+    return changes
 
 
 def commit_import(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
     preview = conn.execute(
-        "SELECT * FROM upload_previews WHERE id=? AND mode IN ('add','overwrite','count')", (data.get("preview_id"),)
+        "SELECT * FROM upload_previews WHERE id=? AND mode IN ('add','overwrite','count','count_full')", (data.get("preview_id"),)
     ).fetchone()
     if not preview or preview["committed"]:
         raise ValueError("上传预览不存在或已执行")
     if json.loads(preview["errors"]):
         raise ValueError("请先修正表格中的错误行")
     old = conn.execute(
-        "SELECT 1 FROM upload_previews WHERE mode!='prepare' AND committed=1 AND (file_hash=? OR content_hash=?)",
-        (preview["file_hash"], preview["content_hash"]),
+        "SELECT 1 FROM upload_previews WHERE mode=? AND committed=1 AND (content_hash=? OR (? AND file_hash=?))",
+        (preview["mode"], preview["content_hash"], preview["mode"] not in COUNT_MODES, preview["file_hash"]),
     ).fetchone()
     if old and not (
         data.get("allow_duplicate") and str(data.get("note") or "").strip()
@@ -349,10 +407,16 @@ def commit_import(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
         raise stock.Conflict("该表格已导入，再次登记需要明确确认及填写原因")
     all_rows = json.loads(preview["rows"])
     rows = [row for row in all_rows if not row["duplicate_row"] and not row.get("count_part")]
-    if not rows:
+    metadata = json.loads(preview["scope_json"])
+    if not rows and not (preview["mode"] == "count_full" and metadata.get("affected")):
         raise ValueError("没有可导入的记录")
+    if preview["mode"] in COUNT_MODES:
+        scope = metadata.get("scope") or {field: rows[0][field] for field in SCOPE_FIELDS}
+        affected = count_scope_changes(conn, scope, rows, full=preview["mode"] == "count_full")
+        if affected != metadata.get("affected", []):
+            raise stock.Conflict("清点涉及的旧记录已变化，请重新上传并核对")
     for row in rows:
-        if preview["mode"] == "count":
+        if preview["mode"] in COUNT_MODES:
             matches = count_matches(conn, row)
             if [item["id"] for item in matches] != ([row["item_id"]] if row["item_id"] else []):
                 raise stock.Conflict("清点范围内的记录已变化，请重新预览")
@@ -362,10 +426,27 @@ def commit_import(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
             stock.check_version(
                 stock.ensure_balance(conn, row["item_id"]), row["version"]
             )
+    if preview["mode"] in COUNT_MODES:
+        for item in affected:
+            if item["action"] == "reference":
+                from .teacher_uploads import retire_shared_balance
+
+                event_id = retire_shared_balance(conn, item["id"], actor, preview["filename"])
+            else:
+                event_id = stock.operate(conn, {"item_id": item["id"], "version": item["version"],
+                                               "action": "count", "quantity": "0",
+                                               "note": f"整柜实盘遗漏项目核对为零，来源 {preview['filename']}"}, actor)["id"]
+            conn.execute("INSERT INTO upload_events VALUES (?,?,?,0)", (preview["id"], event_id, item["id"]))
     for row in rows:
         item_id = row["item_id"] or create_item(conn, {**row, "threshold": None})
         item = stock.ensure_balance(conn, item_id)
-        if item["review_reason"] and preview["mode"] != "count":
+        if row.get("restore"):
+            from .teacher_uploads import restore_item
+
+            restore_item(conn, {"item_id": item_id, "version": item["version"],
+                                "note": f"实盘恢复耗材，来源 {preview['filename']}"}, actor)
+            item = stock.ensure_balance(conn, item_id)
+        if item["review_reason"] and preview["mode"] not in COUNT_MODES:
             raise ValueError("上传涉及待清点物品，请先完成实物清点")
         result = stock.operate(
             conn,
@@ -422,7 +503,7 @@ def commit_import(conn: sqlite3.Connection, data: dict, actor: str) -> dict:
         )
         source_ids.setdefault(identity, cursor.lastrowid)
     conn.execute("UPDATE upload_previews SET committed=1 WHERE id=?", (preview["id"],))
-    return {"ok": True, "imported_rows": len(rows)}
+    return {"ok": True, "imported_rows": len(rows), "affected": affected if preview["mode"] in COUNT_MODES else []}
 
 
 def capacities(value: str) -> list[str]:
@@ -478,7 +559,6 @@ def allocate_preparation(
             require_scope(item, row)
             if not item["active"] or item["review_reason"]:
                 raise ValueError("选定物品需要清点或已经停用")
-            from .matching import same_material
             from .services import exact_item_query
 
             query = " ".join(part for part in (row["name"], row["spec"]) if part)
@@ -537,7 +617,7 @@ def allocate_preparation(
                 (
                     max(stock.number(po["quantity"]) - stock.number(po["received"]), 0)
                     for po in conn.execute(
-                        "SELECT quantity,received FROM purchase_orders WHERE item_id=? AND status='ordered'",
+                        "SELECT quantity,received FROM purchase_orders WHERE item_id=? AND status IN ('ordered','partial')",
                         (item_id,),
                     )
                 ),
@@ -554,7 +634,7 @@ def allocate_preparation(
                 "available_quantity": stock.text(total_available),
                 "allocated_quantity": stock.text(amount - remaining),
                 "missing_quantity": stock.text(remaining),
-                "purchase_quantity": stock.text(max(remaining - outstanding, 0)),
+                "purchase_quantity": stock.text(max(remaining - outstanding, 0)) if matches else None,
                 "purchase_unit": row["unit"],
                 "on_order_quantity": stock.text(outstanding),
                 "locations": locations,
@@ -562,7 +642,11 @@ def allocate_preparation(
                 "candidates": candidates[:30],
                 "status": "需要确认匹配"
                 if not matches
+                else "需要核对数量"
+                if row["required_quantity"] is None
                 else "需要采购"
+                if remaining > outstanding
+                else "等待到货"
                 if remaining
                 else "足够",
             }
@@ -583,6 +667,7 @@ def remap_preparation(conn: sqlite3.Connection, data: dict) -> dict:
     )
     for row in rows:
         row["previously_consumed"] = previously_consumed(conn, preview["file_hash"], row)
+        row["previously_borrowed"] = previously_consumed(conn, preview["file_hash"], row, "borrow")
     token = uuid.uuid4().hex
     conn.execute("UPDATE upload_previews SET committed=1 WHERE id=?", (preview["id"],))
     conn.execute(
@@ -648,13 +733,28 @@ def preparation(
                      file_hash=hashlib.sha256(path.read_bytes()).hexdigest())
 
 
-def previously_consumed(conn, file_hash, row):
+def classroom_signature(row, location):
+    # Physical item ID and base-unit quantity survive Excel re-saves, aliases and packaging.
+    identity = [normalize_text(row.get(key)) for key in ("course", "experiment")]
+    identity.extend((location["item_id"], stock.text(stock.number(location["allocated_quantity"]))))
+    return hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
+
+
+def previously_consumed(conn, file_hash, row, action="consume"):
     if not file_hash:
         return False
-    return bool(conn.execute("""SELECT 1 FROM classroom_consumption_rows r
+    if conn.execute("""SELECT 1 FROM classroom_consumption_rows r
         JOIN stock_events e ON e.id=r.event_id WHERE r.file_hash=? AND r.source_sheet=?
-        AND r.source_row=? AND e.reversed_by IS NULL LIMIT 1""",
-        (file_hash, row["source_sheet"], row["source_row"])).fetchone())
+        AND r.source_row=? AND e.action=? AND e.reversed_by IS NULL LIMIT 1""",
+        (file_hash, row["source_sheet"], row["source_row"], action)).fetchone():
+        return True
+    signatures = [classroom_signature(row, site) for site in row["locations"]
+                  if stock.number(site["allocated_quantity"]) > 0]
+    return bool(signatures and conn.execute(
+        f"""SELECT 1 FROM classroom_consumption_rows r JOIN stock_events e ON e.id=r.event_id
+        WHERE r.signature IN ({','.join('?' for _ in signatures)}) AND e.action=? AND e.reversed_by IS NULL LIMIT 1""",
+        [*signatures, action],
+    ).fetchone())
 
 
 def checklist(conn, rows: list[dict], filename: str, *, commit=False, attachment_id=None, replaces=None,
@@ -666,7 +766,7 @@ def checklist(conn, rows: list[dict], filename: str, *, commit=False, attachment
         name: str = Field(min_length=1, max_length=300)
         spec: str | None = Field(default=None, max_length=300)
         unit: str | None = Field(default=None, max_length=50)
-        required_quantity: str | int | float
+        required_quantity: str | int | float | None = None
         action: str = ""
         course: str = "未命名课程"
         category: str | None = None
@@ -687,19 +787,22 @@ def checklist(conn, rows: list[dict], filename: str, *, commit=False, attachment
             if selected and row[field] and selected != row[field]:
                 raise ValueError(f"第 {index + 1} 项与选定取用范围不一致")
             row[field] = selected or row[field]
-        amount = stock.number(row["required_quantity"])
-        if amount <= 0:
+        raw_amount = row["required_quantity"]
+        amount = stock.number(raw_amount) if raw_amount not in (None, "") else None
+        if amount is not None and amount <= 0:
             raise ValueError(f"第 {index + 1} 项需求数量必须大于零")
         if row["action"] not in ("", "borrow", "consume"):
             raise ValueError("使用方式请选择借用或消耗")
         row.update(row_number=index + 1 if attachment_id else row["row_number"],
-                   required_quantity=stock.text(amount), source_file=filename, attachment_id=attachment_id)
+                   required_quantity=stock.text(amount) if amount is not None else None,
+                   source_file=filename, attachment_id=attachment_id)
         prepared.append(row)
     if len({row["row_number"] for row in prepared}) != len(prepared):
         raise ValueError("清单行号不能重复")
     prepared = allocate_preparation(conn, prepared)
     for row in prepared:
         row["previously_consumed"] = previously_consumed(conn, file_hash, row)
+        row["previously_borrowed"] = previously_consumed(conn, file_hash, row, "borrow")
     token = uuid.uuid4().hex
     conn.execute(
         "INSERT INTO upload_previews(id,file_hash,content_hash,filename,mode,rows,errors) VALUES (?,?,'',?,'prepare',?,'[]')",
@@ -720,63 +823,90 @@ def consume_preparation(conn: sqlite3.Connection, data: dict, actor: str) -> dic
     ).fetchone()
     if not preview or preview["committed"]:
         raise ValueError("清单预览不存在或已经执行")
-    selected = {int(value) for value in data.get("selected_rows", [])}
-    rows = [row for row in json.loads(preview["rows"]) if row["row_number"] in selected]
-    if not rows:
-        raise ValueError("请选择清单条目")
+    selected = set(data["selected_rows"])
+    saved_rows = json.loads(preview["rows"])
+    rows = [row for row in saved_rows if row["row_number"] in selected]
+    if not rows or len(rows) != len(selected):
+        raise ValueError("请选择此清单中的实际条目")
+    actions = data.get("actions") or {}
+    edits = data.get("edits") or {}
+    if set(edits) - {str(number) for number in selected}:
+        raise ValueError("只能修改本次选择的清单条目")
+    choices = {}
+    for row in rows:
+        if not all(field in row for field in SCOPE_FIELDS):
+            raise ValueError("旧预览未核对取用范围，请重新上传清单")
+        for location in row["locations"]:
+            stock.check_version(stock.ensure_balance(conn, location["item_id"]), location["version"])
+        for field in SCOPE_FIELDS:
+            if data.get(field):
+                if row.get(field) and row[field] != data[field]:
+                    raise ValueError(f"{row['name']}：与指定的取用范围不一致")
+                row[field] = data[field]
+        key = str(row["row_number"])
+        row["action"] = actions.get(key, row["action"])
+        if row["action"] not in {"consume", "borrow"}:
+            raise ValueError(f"{row['name']}：请选择消耗或借用")
+        edit = edits.get(key, {})
+        if any(field in edit and edit[field] != row.get(field) for field in ("name", "spec", "unit")):
+            row.pop("selected_item_id", None)
+        for field in ("name", "spec", "unit", "required_quantity"):
+            if field in edit:
+                row[field] = edit[field]
+        amount = stock.number(row["required_quantity"])
+        if amount <= 0:
+            raise ValueError(f"{row['name']}：需求数量必须大于零")
+        row["required_quantity"] = stock.text(amount)
+        if edit.get("item_id"):
+            choices[key] = edit["item_id"]
+
+    rows = allocate_preparation(conn, rows, choices)
     file_hash = preview["file_hash"]
-    duplicates = [row for row in rows if previously_consumed(conn, file_hash, row)]
+    duplicates = [row for row in rows if previously_consumed(conn, file_hash, row, row["action"])]
     reason = str(data.get("repeat_reason") or "").strip()
     if duplicates and not reason:
         sources = "、".join(f"{row['source_sheet']} 第 {row['source_row']} 行" for row in duplicates[:8])
-        raise ValueError(f"这些条目已登记消耗：{sources}。如确属另一次取用，请填写再次登记原因。")
-    versions = {
-        location["item_id"]: location["version"]
-        for row in rows
-        for location in row["locations"]
-    }
-    for item_id, version in versions.items():
-        stock.check_version(stock.ensure_balance(conn, item_id), version)
-    results = []
+        raise ValueError(f"这些条目已登记消耗或借用：{sources}。如确属另一次取用，请填写再次登记原因。")
+    loan_details = {}
+    if any(row["action"] == "borrow" for row in rows):
+        loan_details = {key: stock.required(data, key) for key in ("borrower", "purpose", "destination", "due_at")}
     for row in rows:
-        action = (data.get("actions") or {}).get(str(row["row_number"]), row["action"])
-        if not all(field in row for field in SCOPE_FIELDS):
-            raise ValueError("旧预览未核对取用范围，请重新上传清单")
+        if not row["locations"]:
+            raise ValueError(f"{row['name']}：请先核对匹配物品、规格和单位")
         if stock.number(row["missing_quantity"]) > 0:
             raise ValueError(f"{row['name']}：当前可分配 {row['allocated_quantity']}，还差 {row['missing_quantity']}{row['unit'] or ''}；请核对取用位置和需求数量")
-        if (
-            stock.number(row["missing_quantity"]) > 0
-            or not row["locations"]
-            or action != "consume"
-        ):
-            raise ValueError(
-                "只有匹配明确、库存足够且明确标为消耗的条目才能直接扣减；借用请创建实验安排或借用记录"
-            )
+    results = []
+    for row in rows:
+        note = f"{row['course']} / {row['experiment']} · {row['source_file']} · {row['source_sheet']} 第 {row['source_row']} 行"
+        if reason:
+            note += f" · 再次登记原因：{reason}"
         for location in row["locations"]:
-            if stock.number(location["allocated_quantity"]) > 0:
-                note = f"{row['course']} / {row['experiment']} · {row['source_file']} · {row['source_sheet']} 第 {row['source_row']} 行"
-                if reason:
-                    note += f" · 再次登记原因：{reason}"
-                results.append(
-                    stock.operate(
-                        conn,
-                        {
-                            "item_id": location["item_id"],
-                            "action": "consume",
-                            **{field: row.get(field) for field in SCOPE_FIELDS},
-                            "quantity": location["allocated_quantity"],
-                            "unit": location["unit"],
-                            "note": note,
-                        },
-                        actor,
-                        checked=True,
-                    )
+            if stock.number(location["allocated_quantity"]) <= 0:
+                continue
+            result = stock.operate(
+                conn,
+                {
+                    "item_id": location["item_id"],
+                    "action": row["action"],
+                    **loan_details,
+                    **{field: row.get(field) for field in SCOPE_FIELDS},
+                    "quantity": location["allocated_quantity"],
+                    "unit": location["unit"],
+                    "note": note,
+                },
+                actor,
+                checked=True,
+            )
+            results.append(result)
+            if file_hash:
+                conn.execute(
+                    "INSERT INTO classroom_consumption_rows(file_hash,source_sheet,source_row,event_id,signature) VALUES (?,?,?,?,?)",
+                    (file_hash, row["source_sheet"], row["source_row"], result["id"], classroom_signature(row, location)),
                 )
-                if file_hash:
-                    conn.execute("INSERT INTO classroom_consumption_rows VALUES (?,?,?,?)",
-                                 (file_hash, row["source_sheet"], row["source_row"], results[-1]["id"]))
     conn.execute("UPDATE upload_previews SET committed=1 WHERE id=?", (preview["id"],))
-    return {"ok": True, "transaction_count": len(results), "transactions": results}
+    return {"ok": True, "transaction_count": len(results), "transactions": results,
+            "selected_rows": sorted(selected),
+            "skipped": [{"row_number": row["row_number"], "name": row["name"]} for row in saved_rows if row["row_number"] not in selected]}
 
 
 def template_lines(data: dict) -> list[dict]:

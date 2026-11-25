@@ -477,3 +477,46 @@ pre {
   max-height: 280px;
   object-fit: contain;
 }
+
+.chat-checklist-form {
+  display: grid;
+  gap: 1rem;
+  margin-block-start: .75rem;
+}
+
+.chat-checklist-form fieldset {
+  min-inline-size: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: .75rem;
+  margin: 0;
+}
+
+.chat-checklist-form fieldset > legend {
+  max-inline-size: 100%;
+  overflow-wrap: anywhere;
+  padding-inline: .35rem;
+  font-weight: 600;
+}
+
+.chat-checklist-form .form-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr));
+  margin-block: .5rem;
+}
+
+.chat-checklist-form [hidden] {
+  display: none;
+}
+
+.chat-checklist-form input:not([type="checkbox"]),
+.chat-checklist-form select,
+.chat-checklist-form button,
+.chat-checklist-form .inline-check {
+  min-height: 44px;
+}
+
+.chat-checklist-form input,
+.chat-checklist-form select {
+  min-width: 0;
+  max-width: 100%;
+}
