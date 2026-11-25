@@ -867,10 +867,11 @@ def test_followup_without_action_recovers_scoped_mixed_preview(db, monkeypatch):
     search = {"name": "inventory_search", "arguments": {"query": "100ml玻璃烧杯"}}
     scripted_dsh(monkeypatch, db, iter([{"calls": [search]}, {"reply": ""}]))
     assert send(question)["tool_results"][0]["result"]["total_count"] == 2
-    scripted_dsh(monkeypatch, db, iter([{"reply": "好的，我来处理"}, {"calls": [search]},
+    scripted_dsh(monkeypatch, db, iter([{"reply": '{"explanation_topics":["confirmation"]}'},
                                          {"reply": '{"missing_fields":["borrower","destination","due_at"]}'}]))
     followup = send(selection)
-    assert followup["tool_results"] and "借用人" in followup["reply"]
+    assert [tool["tool"] for tool in followup["tool_results"]] == ["inventory_search"]
+    assert "借用人" in followup["reply"]
 
     def preview(payload):
         context = json.loads(payload["text"])

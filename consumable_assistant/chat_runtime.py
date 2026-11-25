@@ -221,6 +221,27 @@ def execute_tool(conn, run_id: str, token: str, name: str, arguments: dict, disp
         raise
 
 
+def _registration_lookup(text: str, history: list[dict]) -> dict | None:
+    if not re.search(r"(?:帮我|请|需要|我要|现在|继续|确认要|直接)(?:把这笔|给我)?登记|帮我记录", text):
+        return None
+    if re.search(r"如何|怎样|怎么|不要|不用|先不|暂不", text):
+        return None
+    for turn in reversed(history):
+        if turn["status"] in {"completed", "pending_confirmation", "cancelled"}:
+            break
+        searches = [entry["result"].get("search") for entry in turn["tool_results"]
+                    if entry["tool"] == "inventory_search" and entry["result"].get("rows")]
+        if searches:
+            if len(searches) != 1 or not searches[0] or not searches[0].get("q"):
+                return None
+            search = searches[0]
+            return {"query": search["q"], **{field: search[field] for field in
+                    ("category", "lab", "location_code", "starts_at", "ends_at") if search.get(field)}}
+        if turn["tool_results"]:
+            break
+    return None
+
+
 def process_run(conn, run: dict, dispatch_fn, history_fn) -> dict:
     request = chat.ChatMessageRequest.model_validate_json(run["request_json"])
     conversation_id = run["conversation_id"]
@@ -263,15 +284,27 @@ def process_run(conn, run: dict, dispatch_fn, history_fn) -> dict:
 
             payload["images"] = [image_payload(Path(item["path"]), item["filename"]) for item in selected if item["content_type"].startswith("image/")]
             result = run_dsh(payload)
+            lookup = _registration_lookup(request.text, history)
+            refreshed = False
             if history and result.get("status") == "completed":
                 calls, cancelled = conn.execute("SELECT tool_calls,cancel_requested FROM chat_runs WHERE id=?",
                                                 (run["id"],)).fetchone()
-                if not calls and not cancelled and not reply_guidance(result.get("reply", "")):
+                if not calls and not cancelled and (lookup or not reply_guidance(result.get("reply", ""))):
+                    retry_context = json.loads(payload["text"])
+                    if lookup:
+                        fresh = execute_tool(conn, run["id"], run["callback_token"], "inventory_search",
+                                             lookup, dispatch_fn, history_fn)
+                        refreshed = True
+                        retry_context["previous_search_rechecked"] = {
+                            "search": fresh.get("search"), "total_count": fresh.get("total_count"),
+                            "rows": chat.context_stock_rows(fresh.get("rows", [])),
+                        }
                     result = run_dsh({
-                        **payload, "conversationId": run["id"],
-                        "systemPrompt": payload["systemPrompt"] + "\n上次处理没有产生业务工具结果或有效追问。"
-                        "请结合 history 和 current_message 接续任务。对取用登记先调用 inventory_search 核实各来源，"
-                        "然后生成 business_preview；资料不足时返回只含实际缺项的 missing_fields。",
+                        **payload, "conversationId": run["id"], "text": chat.json_text(retry_context),
+                        "systemPrompt": payload["systemPrompt"] + "\n上次处理没有产生业务工具结果。"
+                        "请结合 history 和 current_message 接续任务，使用与本次业务对应的工具。对取用登记先核实各来源，"
+                        "已有 previous_search_rechecked 时可直接使用与本次要求相符的记录。"
+                        "生成 business_preview；资料不足时返回只含实际缺项的 missing_fields。",
                     })
             # The preview is the business server's result, never a model claim.
             saved = conn.execute(
@@ -289,7 +322,10 @@ def process_run(conn, run: dict, dispatch_fn, history_fn) -> dict:
                 }
             elif result.get("status") == "completed":
                 reply = result.get("reply") or ""
-                if history and not tools and not reply_guidance(reply):
+                if refreshed and not reply_guidance(reply) and len(tools) == 1:
+                    response = {"status": "needs_details", "tool_results": tools,
+                                "reply": "已复核上次查询的库存。本轮未生成登记预览，请核对取用位置及借用或消耗方式后继续登记。"}
+                elif history and not tools and not reply_guidance(reply):
                     response = {"status": "failed", "error_code": "NO_ACTIONABLE_RESULT",
                                 "reply": "本轮未生成查询、登记预览或具体追问。对话已保留，可以发送继续登记。"}
                 else:
@@ -297,6 +333,8 @@ def process_run(conn, run: dict, dispatch_fn, history_fn) -> dict:
             else:
                 response = {"status": "failed", "reply": "本次对话处理未完成，输入和任务已保存。可以发送继续说明。"}
                 response["error_code"] = result_error_code(result)
+                if refreshed:
+                    response["tool_results"] = tools
         return finish(conn, run, response)
     except chat.PlanChanged as exc:
         return finish(conn, run, exc.response)

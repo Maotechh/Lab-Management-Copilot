@@ -195,6 +195,12 @@ def process_message(conn, conversation_id, request, actor, device_id, dispatch_f
     return chat_runtime.process_run(conn, run, dispatch_fn, history_fn)
 
 
+def context_stock_rows(rows):
+    fields = ("id", "item_name", "spec", "category", "lab", "physical_room",
+              "location_code", "unit", "available_quantity")
+    return [{key: row.get(key) for key in fields} for row in rows[:30]]
+
+
 def _recent_history(conn, conversation_id: str, message_id: int) -> list[dict]:
     turns = conn.execute(
         """SELECT u.content AS teacher, a.content AS reply, a.result_json
@@ -214,10 +220,8 @@ def _recent_history(conn, conversation_id: str, message_id: int) -> list[dict]:
         for call in result.get("tool_results", []):
             data = call["result"]
             if data.get("type") == "inventory":
-                fields = ("id", "item_name", "spec", "category", "lab", "physical_room",
-                          "location_code", "unit", "available_quantity")
                 data = {"search": data.get("search"), "total_count": data.get("total_count"),
-                        "rows": [{key: row.get(key) for key in fields} for row in data["rows"][:30]]}
+                        "rows": context_stock_rows(data.get("rows", []))}
             record = {"tool": call["tool"], "result": data}
             if len(json_text([*evidence, record])) <= 10000:
                 evidence.append(record)
