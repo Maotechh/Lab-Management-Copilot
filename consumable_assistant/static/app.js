@@ -975,7 +975,7 @@ function renderPreview(data) {
   const engineLabel = data.engine && data.engine !== 'heuristic'
     ? `${data.engine}${data.model_name ? ` · ${data.model_name}` : ''}${data.local_split_used ? ' + 规则校验' : ''}`
     : (data.local_split_used ? "本地多条规则" : "本地规则");
-  const modelWarning = data.model_enabled && data.engine !== "deepseek-pro" && !data.local_split_used
+  const modelWarning = data.model_enabled && !data.model_name && !data.local_split_used
     ? `<span class="badge warn">模型未返回可用结果，已使用本地规则</span>`
     : "";
   let html = `<div class="toolbar compact"><span class="badge">${escapeHtml(engineLabel)}</span>${modelWarning}</div>`;

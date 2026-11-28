@@ -8,7 +8,12 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from consumable_assistant.settings import SCHOOL_RESPONSE_URL
+from consumable_assistant.settings import (
+    DEFAULT_BASE_URL,
+    DEFAULT_PROVIDER_NAME,
+    QUALIFIED_MODELS,
+    resolve_response_gateway,
+)
 
 
 def values(lines: list[str]) -> dict[str, str]:
@@ -20,22 +25,34 @@ def values(lines: list[str]) -> dict[str, str]:
 
 
 def preflight(path: Path) -> None:
-    env = {key: value.strip("\"'") for key, value in values(path.read_text(encoding="utf-8").splitlines()).items()}
-    if not env.get("GENAI_API_KEY", "").strip() or env.get("GENAI_BASE_URL") != SCHOOL_RESPONSE_URL:
-        raise SystemExit("Set a replacement GENAI_API_KEY and the exact school HTTPS GENAI_BASE_URL in the protected application environment before deployment")
-    if env.get("GENAI_MODE", "responses") != "responses" or env.get("GENAI_MODEL", "deepseek-pro") != "deepseek-pro":
-        raise SystemExit("Set GENAI_MODE=responses and GENAI_MODEL=deepseek-pro before deployment")
-    endpoint = urlsplit(SCHOOL_RESPONSE_URL)
+    env = {key: value.strip('"\'') for key, value in values(path.read_text(encoding="utf-8").splitlines()).items()}
+    upstream_url = resolve_response_gateway(env.get("GENAI_BASE_URL", ""))
+    if not env.get("GENAI_API_KEY", "").strip() or not upstream_url:
+        raise SystemExit("Set a replacement GENAI_API_KEY and an approved HTTPS GENAI_BASE_URL in the protected application environment before deployment")
+    model = env.get("GENAI_MODEL", "deepseek-flash").strip() or "deepseek-flash"
+    if env.get("GENAI_MODE", "responses") != "responses" or model not in QUALIFIED_MODELS:
+        raise SystemExit("Set GENAI_MODE=responses and a qualified GENAI_MODEL before deployment")
+    endpoint = urlsplit(upstream_url)
     connection = http.client.HTTPSConnection(endpoint.hostname, timeout=45)
     try:
-        connection.request("POST", endpoint.path, json.dumps({"model": "deepseek-pro", "input": "Reply OK.",
-                           "instructions": "Answer briefly.", "stream": False, "temperature": 0.5, "max_output_tokens": 1000}),
-                           {"Content-Type": "application/json", "Authorization": "Bearer " + env["GENAI_API_KEY"]})
+        connection.request(
+            "POST",
+            endpoint.path,
+            json.dumps({
+                "model": model,
+                "input": "Reply OK.",
+                "instructions": "Answer briefly.",
+                "stream": False,
+                "temperature": 0.5,
+                "max_output_tokens": 4096,
+            }),
+            {"Content-Type": "application/json", "Authorization": "Bearer " + env["GENAI_API_KEY"]},
+        )
         with connection.getresponse() as response:
             if response.status != 200:
-                raise SystemExit(f"School preflight returned HTTP {response.status}; production writers have not been paused")
+                raise SystemExit(f"Model preflight returned HTTP {response.status}; production writers have not been paused")
     except (http.client.HTTPException, OSError, ValueError):
-        raise SystemExit("School HTTPS preflight failed; production writers have not been paused") from None
+        raise SystemExit("Model HTTPS preflight failed; production writers have not been paused") from None
     finally:
         connection.close()
 
@@ -45,12 +62,12 @@ def configure(path: Path) -> None:
     existing = values(lines)
     updates = {
         "GENAI_REQUIRED": "1",
-        "GENAI_MODEL": "deepseek-pro",
+        "GENAI_MODEL": "deepseek-flash",
         "GENAI_MODE": "responses",
-        "GENAI_PRIMARY_NAME": "学校 DeepSeek",
-        "GENAI_BASE_URL": SCHOOL_RESPONSE_URL,
+        "GENAI_PRIMARY_NAME": DEFAULT_PROVIDER_NAME,
+        "GENAI_BASE_URL": DEFAULT_BASE_URL,
         "GENAI_API_KEY": "",
-        "GENAI_MAX_OUTPUT_TOKENS": "1000",
+        "GENAI_MAX_OUTPUT_TOKENS": "16384",
         "GENAI_TEMPERATURE": "0.5",
         "GENAI_TOTAL_TIMEOUT": "300",
         "GENAI_PROVIDER_TIMEOUT": "300",
@@ -60,13 +77,13 @@ def configure(path: Path) -> None:
         "PUBLIC_BASE_URL": "https://10.15.21.115",
         "VAPID_SUBJECT": "https://github.com/Maotechh/Lab-Management-Copilot/issues",
     }
-    if existing.get("GENAI_API_KEY", "").strip("\"'"):
-        endpoint = urlsplit(existing.get("GENAI_BASE_URL", "").strip("\"'"))
+    if existing.get("GENAI_API_KEY", "").strip('"\''):
+        endpoint = urlsplit(existing.get("GENAI_BASE_URL", "").strip('"\''))
         if (endpoint.scheme != "https" or not endpoint.hostname or endpoint.username is not None
                 or endpoint.password is not None or endpoint.query or endpoint.fragment):
             raise ValueError("A keyed model requires an explicit HTTPS GENAI_BASE_URL without credentials or query parameters")
         for key in ("GENAI_API_KEY", "GENAI_BASE_URL", "GENAI_MODE", "GENAI_MODEL", "GENAI_PRIMARY_NAME"):
-            if existing.get(key, "").strip("\"'"):
+            if existing.get(key, "").strip('"\''):
                 del updates[key]
     if not existing.get("VAPID_PRIVATE_KEY"):
         updates["VAPID_PRIVATE_KEY"] = "/etc/lab-management/push/vapid-private.pem"

@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 
 from .settings import (
+    DEFAULT_PROVIDER_NAME,
     GENAI_API_KEY,
     GENAI_BASE_URL,
     GENAI_COMPLETION_URL,
@@ -23,6 +24,7 @@ from .settings import (
     GENAI_RESPONSE_URL,
     GENAI_TEMPERATURE,
     GENAI_TOTAL_TIMEOUT,
+    QUALIFIED_MODELS,
 )
 
 AI_REQUIRED = os.environ.get("GENAI_REQUIRED", "1") != "0"
@@ -69,11 +71,6 @@ def status() -> dict[str, Any]:
             ).fetchone()
         if row:
             result.update(dict(row))
-            checked = datetime.fromisoformat(row["checked_at"])
-            if checked.tzinfo is None:
-                checked = checked.replace(tzinfo=UTC)
-            if (datetime.now(UTC) - checked).total_seconds() > 600:
-                result["status"] = "stale"
     except (sqlite3.Error, ValueError):
         LOGGER.warning("Unable to read AI health status")
     if not result["configured"]:
@@ -121,7 +118,7 @@ def _check_health() -> dict[str, Any]:
                         if isinstance(op, dict)
                     )
                 ),
-                max_output_tokens=min(GENAI_MAX_OUTPUT_TOKENS, 1000),
+                max_output_tokens=GENAI_MAX_OUTPUT_TOKENS,
             )
             if not parsed:
                 raise AIUnavailable("模型没有返回可用操作")
@@ -180,7 +177,7 @@ def valid_inventory_result(value: dict[str, Any]) -> bool:
 
 def provider_entries() -> list[dict[str, Any]]:
     primary = {
-        "name": os.environ.get("GENAI_PRIMARY_NAME", "上海科技大学 GenAI"),
+        "name": os.environ.get("GENAI_PRIMARY_NAME", DEFAULT_PROVIDER_NAME),
         "model": GENAI_MODEL,
         "base_url": GENAI_BASE_URL,
         "mode": GENAI_MODE,
@@ -188,18 +185,16 @@ def provider_entries() -> list[dict[str, Any]]:
         "primary": True,
     }
     url = primary["base_url"].strip().rstrip("/")
-    entries = [primary] if url and (not url.endswith("/response") or primary["api_key"].strip()) else []
-    # A configured endpoint is not evidence of native tools and image support.
-    # Only the school DeepSeek integration is qualified for this release.
+    entries = [primary] if url and (not url.startswith("https://") or primary["api_key"].strip()) else []
     raw = os.environ.get("GENAI_FALLBACK_PROVIDERS_JSON", "").strip()
     try:
         fallbacks = json.loads(raw) if raw else []
     except json.JSONDecodeError as exc:
         raise AIUnavailable("GENAI_FALLBACK_PROVIDERS_JSON 格式无效") from exc
     if fallbacks or os.environ.get("GENAI_FALLBACK_MODELS", "").strip():
-        raise AIUnavailable("备用模型尚未完成工具调用与图片能力验证，请使用学校 DeepSeek")
-    if GENAI_MODEL != "deepseek-pro":
-        raise AIUnavailable("本版本仅使用已经验证的学校 deepseek-pro")
+        raise AIUnavailable("备用模型尚未完成工具调用与图片能力验证，请使用已验证主模型")
+    if GENAI_MODEL not in QUALIFIED_MODELS:
+        raise AIUnavailable("本版本仅使用已经验证的 deepseek-flash 或 deepseek-pro 模型")
     return entries
 
 
@@ -260,17 +255,21 @@ def request_json(
                 parsed["_model"] = extract_model(body) or provider["model"]
                 parsed["_provider"] = provider["name"]
                 record_provider_check(provider, "available", started, None)
+                record_health("available", str(provider["name"]))
                 return parsed
             except (httpx.HTTPError, ValueError, AIUnavailable) as exc:
                 errors.append(type(exc).__name__)
                 record_provider_check(provider, "unavailable", started, type(exc).__name__)
-                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (401, 403):
-                    LOGGER.warning("Institutional model rejected credentials for %s", provider["name"])
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (401, 403, 429):
+                    LOGGER.warning("Model rejected credentials or rate-limited (%s) for %s", exc.response.status_code, provider["name"])
+                    if provider in attempted:
+                        attempted.remove(provider)
             if time.monotonic() >= deadline:
                 break
         if calls >= MAX_PROVIDER_CALLS or time.monotonic() >= deadline:
             break
     LOGGER.warning("All configured school model providers failed: %s", ",".join(errors[-8:]))
+    record_health("unavailable", "模型请求未成功")
     return None
 
 

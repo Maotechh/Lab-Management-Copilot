@@ -111,7 +111,8 @@ def test_volatile_profile_contains_no_persistent_state(tmp_path, monkeypatch):
     assert school['timeoutMs'] == '300000'
     assert school['compat']['supportsDeveloperRole'] == 'false'
     assert 'supportsMaxOutputTokens' not in school['compat']
-    assert school['models'][0]['maxTokens'] == '1000'
+    assert [m['id'] for m in school['models']] == ['deepseek-flash', 'deepseek-pro']
+    assert all(m['maxTokens'] == '16384' for m in school['models'])
     assert 'synthetic-relay-token' not in overlay
     assert json.loads((profile / 'package.json').read_text())['dsh']['profile']['bundles'] == ['lab']
 

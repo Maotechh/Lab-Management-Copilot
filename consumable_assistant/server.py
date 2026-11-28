@@ -214,7 +214,7 @@ def list_chat_conversations(before: int | None = None, limit: int = 100):
     with connect() as conn:
         rows = conn.execute(
             "SELECT c.rowid AS cursor,c.id,c.version,c.updated_at,(SELECT content FROM chat_messages m WHERE m.conversation_id=c.id ORDER BY m.id LIMIT 1) AS title "
-            "FROM chat_conversations c WHERE (? IS NULL OR c.rowid<?) ORDER BY c.rowid DESC LIMIT ?", (before, before, min(max(limit, 1), 100)),
+            "FROM chat_conversations c WHERE c.device_id NOT LIKE 'ai-check-%' AND (? IS NULL OR c.rowid<?) ORDER BY c.rowid DESC LIMIT ?", (before, before, min(max(limit, 1), 100)),
         )
         values = [dict(row) for row in rows]
         return {"conversations": values, "shared": True, "next_before": values[-1]["cursor"] if len(values) == min(max(limit, 1), 100) else None}
@@ -229,7 +229,9 @@ def list_shared_chat_tasks(before: int | None = None, limit: int = 100):
             "SELECT t.rowid AS cursor,t.id,t.conversation_id,t.status,t.kind,"
             "t.initiator,t.expires_at,t.created_at,m.content AS title "
             "FROM chat_tasks t JOIN chat_messages m ON m.id=t.message_id "
-            "WHERE t.status IN ('awaiting_details','pending_confirmation') "
+            "JOIN chat_conversations c ON c.id=t.conversation_id "
+            "WHERE c.device_id NOT LIKE 'ai-check-%' "
+            "AND t.status IN ('awaiting_details','pending_confirmation') "
             "AND (? IS NULL OR t.rowid<?) ORDER BY t.rowid DESC LIMIT ?",
             (before, before, page_size + 1),
         ).fetchall()

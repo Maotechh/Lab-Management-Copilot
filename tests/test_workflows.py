@@ -1927,7 +1927,9 @@ def test_deployment_uses_only_qualified_school_deepseek_without_primary_key(tmp_
     assert "GENAI_REQUIRED=1" in configured
     assert "GENAI_API_KEY=\n" in configured
     assert "GENAI_MODE=responses\n" in configured
-    assert "GENAI_BASE_URL=https://genaiapi.shanghaitech.edu.cn/api/v1/response\n" in configured
+    assert "GENAI_BASE_URL=https://llm.services.geekpie.club/v1\n" in configured
+    assert "GENAI_MODEL=deepseek-flash\n" in configured
+    assert "GENAI_PRIMARY_NAME=TokenRouter\n" in configured
     assert "GENAI_FALLBACK_PROVIDERS_JSON=[]" in configured
     assert "PUBLIC_BASE_URL=https://10.15.21.115" in configured
 
@@ -3380,3 +3382,141 @@ def test_chat_checklist_editor_previews_edits_and_only_records_after_confirmatio
         assert stock.view(db, item)["ready"] == "9.5"
         assert db.execute("SELECT outstanding FROM loans").fetchone()[0] == "2.5"
         assert db.execute("SELECT action FROM stock_events").fetchone()[0] == "borrow"
+
+
+def test_prompt_contracts_is_compact_and_covers_all_contracts():
+    from consumable_assistant.chat_contracts import CONTRACTS, prompt_contracts
+
+    spec = prompt_contracts()
+    assert len(spec) < 5000
+    for kind in CONTRACTS:
+        assert kind in spec
+
+
+def test_verified_reply_preserves_natural_reply_and_strips_internal_jargon():
+    from consumable_assistant.chat_runtime import verified_reply
+
+    tools = [{"tool": "inventory_search", "result": {"type": "inventory", "rows": [{"id": 1, "item_name": "烧杯", "available_quantity": "12"}]}}]
+    natural = '{"reply": "通过 `inventory_search` 查到化学实验室 `location_code` A1 柜有 **100mL 烧杯** 可用 `12` 个。", "missing_fields": [], "explanation_topics": []}'
+    rendered = verified_reply(natural, tools)
+    assert "100mL 烧杯" in rendered and "12" in rendered
+    assert "inventory_search" not in rendered and "location_code" not in rendered
+
+    ask = '{"reply": "查到两个柜位都有该烧杯，请告知从哪个柜位取用。", "missing_fields": ["location_code", "quantity"], "explanation_topics": []}'
+    rendered_ask = verified_reply(ask, tools)
+    assert "两个柜位" in rendered_ask
+    assert "数量" in rendered_ask
+
+
+def test_multiturn_conversational_followup_and_natural_confirm_cancel(db, monkeypatch):
+    from consumable_assistant import chat
+    from consumable_assistant.server import dispatch, history_rows
+
+    item = make_item(db, quantity=20, location="A1")
+    conversation = chat.new_conversation(db, "device-ui")["conversation_id"]
+    scripted_dsh(monkeypatch, db, iter([
+        {"calls": [{"name": "inventory_search", "arguments": {"query": "烧杯"}}]},
+        {"reply": '{"reply": "目前 A1 柜有 20 个可用。", "missing_fields": [], "explanation_topics": []}'},
+    ]))
+    first = chat.process_message(
+        db, conversation, chat.ChatMessageRequest(message_id=uuid.uuid4().hex, text="查一下烧杯"),
+        "教师", "device-ui", dispatch, history_rows,
+    )
+    assert first["status"] == "answered" and "20 个" in first["reply"]
+
+    scripted_dsh(monkeypatch, db, iter([
+        {"reply": '{"reply": "您可以直接告诉我要消耗还是借用，以及具体数量即可为您生成预览。", "missing_fields": [], "explanation_topics": []}'},
+    ]))
+    second = chat.process_message(
+        db, conversation, chat.ChatMessageRequest(message_id=uuid.uuid4().hex, text="接下来我该怎么登记？"),
+        "教师", "device-ui", dispatch, history_rows,
+    )
+    assert second["status"] == "answered"
+    assert "消耗还是借用" in second["reply"]
+
+    scripted_dsh(monkeypatch, db, iter([
+        {"calls": [{"name": "business_preview", "arguments": {
+            "kind": "stock", "payload": {"item_id": item, "action": "inbound", "quantity": 5, "lab": "化学实验室", "location_code": "A1"}
+        }}]},
+        {"reply": '{"reply": "已为您生成入库 5 个的预览。", "missing_fields": [], "explanation_topics": []}'},
+    ]))
+    preview = chat.process_message(
+        db, conversation, chat.ChatMessageRequest(message_id=uuid.uuid4().hex, text="化学实验室A1柜入库5个"),
+        "教师", "device-ui", dispatch, history_rows,
+    )
+    assert preview["status"] == "pending_confirmation"
+    assert "20" in preview["reply"] and "25" in preview["reply"]
+
+    confirmed = chat.process_message(
+        db, conversation, chat.ChatMessageRequest(
+            message_id=uuid.uuid4().hex, text="好的，确认执行！",
+            task_id=preview["task_id"], plan_hash=preview["plan_hash"],
+        ),
+        "教师", "device-ui", dispatch, history_rows,
+    )
+    assert confirmed["status"] == "completed"
+    assert stock.view(db, item)["available_quantity"] == "25"
+
+
+def test_deployment_probe_conversations_hidden_from_shared_lists(db, monkeypatch):
+    from consumable_assistant import chat, server
+
+    monkeypatch.setattr(server, "connect", lambda: nullcontext_db(db))
+    probe = chat.new_conversation(db, "ai-check-deadbeef")["conversation_id"]
+    teacher = chat.new_conversation(db, "teacher-browser")["conversation_id"]
+    listed = server.list_chat_conversations()
+    ids = [row["id"] for row in listed["conversations"]]
+    assert teacher in ids
+    assert probe not in ids
+
+
+class nullcontext_db:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        return self.conn
+
+    def __exit__(self, *args):
+        return False
+
+
+def test_notifications_has_no_periodic_health_check_and_429_does_not_retry(monkeypatch):
+    import inspect
+
+    import httpx
+
+    from consumable_assistant import genai, notifications
+
+    source = inspect.getsource(notifications)
+    assert "check_health" not in source
+
+    calls = []
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def post(self, url, **kwargs):
+            calls.append(url)
+            request = httpx.Request("POST", url)
+            response = httpx.Response(429, json={"error": "rate limit"}, request=request)
+            raise httpx.HTTPStatusError("429", request=request, response=response)
+
+    monkeypatch.setattr(genai, "GENAI_API_KEY", "test-key")
+    monkeypatch.setattr(genai, "GENAI_BASE_URL", "https://llm.services.geekpie.club/v1")
+    monkeypatch.setattr(genai, "GENAI_MODE", "responses")
+    monkeypatch.setattr(genai, "GENAI_MODEL", "deepseek-flash")
+    monkeypatch.setenv("GENAI_FALLBACK_PROVIDERS_JSON", "[]")
+    monkeypatch.setattr(genai.httpx, "Client", Client)
+    monkeypatch.setattr(genai, "record_health", lambda *args: None)
+    monkeypatch.setattr(genai, "record_provider_check", lambda *args: None)
+    with pytest.raises(genai.AIUnavailable):
+        genai.parse_inventory_message("100mL烧杯入库1个")
+    assert len(calls) == 1

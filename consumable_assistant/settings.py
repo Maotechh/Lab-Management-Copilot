@@ -42,12 +42,21 @@ CHAT_UPLOAD_DIR = Path(
 )
 PHOTO_DEFAULT = DB_PATH.parent / "photos" if DB_PATH.name == "consumables.db" else DB_PATH.parent / f"{DB_PATH.stem}-photos"
 PHOTO_DIR = Path(os.environ.get("CONSUMABLE_PHOTO_DIR", PHOTO_DEFAULT))
+DEFAULT_PROVIDER_NAME = "TokenRouter"
+DEFAULT_BASE_URL = "https://llm.services.geekpie.club/v1"
+SCHOOL_RESPONSE_URL = "https://llm.services.geekpie.club/v1/responses"
+LEGACY_SCHOOL_RESPONSE_URL = "https://genaiapi.shanghaitech.edu.cn/api/v1/response"
+QUALIFIED_MODELS = frozenset({"deepseek-flash", "deepseek-pro"})
+ALLOWED_RESPONSE_GATEWAYS = {
+    DEFAULT_BASE_URL: SCHOOL_RESPONSE_URL,
+    SCHOOL_RESPONSE_URL: SCHOOL_RESPONSE_URL,
+    LEGACY_SCHOOL_RESPONSE_URL: LEGACY_SCHOOL_RESPONSE_URL,
+}
 GENAI_API_KEY = os.environ.get("GENAI_API_KEY", "")
-GENAI_MODEL = os.environ.get("GENAI_MODEL", "deepseek-pro")
+GENAI_MODEL = os.environ.get("GENAI_MODEL", "deepseek-flash")
 GENAI_MODE = os.environ.get("GENAI_MODE", "responses")
-SCHOOL_RESPONSE_URL = "https://genaiapi.shanghaitech.edu.cn/api/v1/response"
 GENAI_RESPONSE_URL = os.environ.get(
-    "GENAI_RESPONSE_URL", SCHOOL_RESPONSE_URL
+    "GENAI_RESPONSE_URL", DEFAULT_BASE_URL
 )
 GENAI_COMPLETION_URL = os.environ.get(
     "GENAI_COMPLETION_URL", "https://genaiapi.shanghaitech.edu.cn/api/v1/start"
@@ -58,9 +67,14 @@ GENAI_BASE_URL = os.environ.get(
 )
 GENAI_TIMEOUT = float(os.environ.get("GENAI_TIMEOUT", "18"))
 GENAI_TEMPERATURE = float(os.environ.get("GENAI_TEMPERATURE", "0.5"))
-GENAI_MAX_OUTPUT_TOKENS = int(os.environ.get("GENAI_MAX_OUTPUT_TOKENS", "1000"))
+GENAI_MAX_OUTPUT_TOKENS = int(os.environ.get("GENAI_MAX_OUTPUT_TOKENS", "16384"))
 GENAI_TOTAL_TIMEOUT = float(os.environ.get("GENAI_TOTAL_TIMEOUT", "300"))
 GENAI_PROVIDER_TIMEOUT = float(os.environ.get("GENAI_PROVIDER_TIMEOUT", "300"))
+
+
+def resolve_response_gateway(base_url: str | None = None) -> str | None:
+    raw = (GENAI_BASE_URL if base_url is None else base_url).strip().rstrip("/")
+    return ALLOWED_RESPONSE_GATEWAYS.get(raw)
 
 
 def ensure_data_dir() -> None:

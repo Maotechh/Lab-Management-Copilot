@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
-from . import chat
+from . import chat, settings
 from . import ledger as stock
 from .dsh_client import DSHUnavailable, result_error_code, run_dsh
 from .genai import parse_model_json
@@ -209,10 +209,10 @@ def execute_tool(conn, run_id: str, token: str, name: str, arguments: dict, disp
                         result = {"status": "cancelled", "reply": "运行已取消，分析记录保留，未修改业务数据。", "job_id": result["job_id"]}
                 else:
                     result = chat._run_read_tool(conn, row["conversation_id"], name, args, attachments, history_fn)
-                chat._record_tool_call(conn, row["conversation_id"], row["message_id"], name, args, result, "school/deepseek-pro", run_id=run_id)
+                chat._record_tool_call(conn, row["conversation_id"], row["message_id"], name, args, result, f"school/{settings.GENAI_MODEL}", run_id=run_id)
         except (ValueError, ValidationError, KeyError, TypeError) as exc:
             result = {"status": "needs_details", "error": str(exc), "reply": str(exc)}
-            chat._record_tool_call(conn, row["conversation_id"], row["message_id"], name, arguments, result, "school/deepseek-pro", run_id=run_id)
+            chat._record_tool_call(conn, row["conversation_id"], row["message_id"], name, arguments, result, f"school/{settings.GENAI_MODEL}", run_id=run_id)
         event(conn, row["conversation_id"], "tool", {"run_id": run_id, "name": name, "result": result})
         conn.commit()
         return result
@@ -222,7 +222,11 @@ def execute_tool(conn, run_id: str, token: str, name: str, arguments: dict, disp
 
 
 def _registration_lookup(text: str, history: list[dict]) -> dict | None:
-    if not re.search(r"(?:帮我|请|需要|我要|现在|继续|确认要|直接)(?:把这笔|给我)?登记|帮我记录", text):
+    if not re.search(
+        r"(?:(?:帮我|请|需要|我要|现在|继续|确认要|直接)(?:把这笔|给我)?(?:登记|办理|生成预览)|"
+        r"帮我记录|(?:就|先)?从这里(?:拿|取|借|领|消耗)|帮我(?:借|领|入库|出库|消耗))",
+        text,
+    ):
         return None
     if re.search(r"如何|怎样|怎么|不要|不用|先不|暂不", text):
         return None
@@ -314,20 +318,21 @@ def process_run(conn, run: dict, dispatch_fn, history_fn) -> dict:
             tools = [{"tool": item["name"], "result": json.loads(item["result_json"])}
                      for item in conn.execute("SELECT name,result_json FROM chat_tool_calls WHERE run_id=? ORDER BY id", (run["id"],))]
             if saved:
+                preview_data = json.loads(saved["preview_json"])
                 response = {
                     "status": "pending_confirmation", "task_id": saved["id"], "plan_hash": saved["plan_hash"],
-                    "expires_at": saved["expires_at"], "preview": json.loads(saved["preview_json"]),
+                    "expires_at": saved["expires_at"], "preview": preview_data,
                     "tool_results": [tool for tool in tools if tool["tool"] in {"prepare_attachment", "inventory_import_preview"}],
-                    "reply": "已按当前数据生成预览。请核对物品、位置、数量和状态，再确认执行。",
+                    "reply": _preview_reply(preview_data, result.get("reply") or ""),
                 }
             elif result.get("status") == "completed":
                 reply = result.get("reply") or ""
-                if refreshed and not reply_guidance(reply) and len(tools) == 1:
+                if refreshed and not reply_guidance(reply, tools) and len(tools) == 1:
                     response = {"status": "needs_details", "tool_results": tools,
-                                "reply": "已复核上次查询的库存。本轮未生成登记预览，请核对取用位置及借用或消耗方式后继续登记。"}
+                                "reply": "已复核上次查询的库存。请补充具体取用柜位，或说明是消耗还是借用（借用需借用人、用途、使用地点及预计归还时间）后继续登记。"}
                 elif history and not tools and not reply_guidance(reply):
-                    response = {"status": "failed", "error_code": "NO_ACTIONABLE_RESULT",
-                                "reply": "本轮未生成查询、登记预览或具体追问。对话已保留，可以发送继续登记。"}
+                    response = {"status": "needs_details", "tool_results": [],
+                                "reply": "本轮暂未生成新的查询或变更预览。请补充具体耗材名称、规格、位置或要办理的操作，我会继续为您处理。"}
                 else:
                     response = {"status": "answered", "reply": verified_reply(reply, tools), "tool_results": tools}
             else:
@@ -375,26 +380,130 @@ EXPLANATIONS = {
 }
 
 
-def reply_guidance(model_text: str) -> str:
-    value = parse_model_json(model_text) or {}
-    topics = value.get("explanation_topics", [])
-    fields = value.get("missing_fields", [])
-    fields = list(dict.fromkeys(field for field in fields if isinstance(field, str) and field in CLARIFICATION_FIELDS)) if isinstance(fields, list) else []
-    explanations = [EXPLANATIONS[topic] for topic in dict.fromkeys(topic for topic in topics if isinstance(topic, str)) if topic in EXPLANATIONS] if isinstance(topics, list) else []
-    if explanations:
-        return "\n\n".join(explanations) + ("\n\n请补充：" + "、".join(CLARIFICATION_FIELDS[field] for field in fields) + "。" if fields else "")
-    if fields:
-        return "请补充以下资料：" + "、".join(CLARIFICATION_FIELDS[field] for field in fields) + "。当前没有执行新的业务变更。"
+_INTERNAL_TERMS = (
+    ("inventory_search", "库存查询"),
+    ("workflow_query", "事务查询"),
+    ("history_search", "历史记录查询"),
+    ("prepare_attachment", "清单核对"),
+    ("inventory_import_preview", "表格导入预览"),
+    ("business_preview", "业务预览"),
+    ("analyze_attachments", "附件分析"),
+    ("export_inventory", "导出库存"),
+    ("export_history", "导出历史"),
+    ("export_task", "导出任务"),
+    ("read_attachment", "读取附件"),
+    ("location_code", "柜位"),
+    ("source_quote", "来源说明"),
+    ("missing_fields", "待补充信息"),
+    ("explanation_topics", "说明主题"),
+    ("item_id", "物品编号"),
+)
+
+_FALSE_EXECUTION_RE = re.compile(
+    r"(?:已为您|已经为您|现已|本次已)?(?:成功)?(?:执行|完成|办好|扣除|扣减)(?:了)?(?:本次)?(?:消耗|入库|出库|借用|借出|归还|清点|转移|停用|撤销|库存变更|登记)"
+)
+
+
+def _sanitize_model_reply(raw: str, tools: list[dict] | None = None) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    for term, label in _INTERNAL_TERMS:
+        text = re.sub(rf"`?\b{re.escape(term)}\b`?", label, text)
+    if _FALSE_EXECUTION_RE.search(text):
+        return ""
+    if tools is not None:
+        if not tools and re.search(r"库存(?:现在|目前|当前|还剩|共有|为|是)\s*\d+", text):
+            return ""
+        inv_calls = [t["result"] for t in tools if t.get("tool") == "inventory_search" and isinstance(t.get("result"), dict)]
+        if inv_calls and all(
+            t.get("type") != "inventory_summary" and not (t.get("rows") or t.get("items"))
+            for t in inv_calls
+        ):
+            if re.search(r"(?:库存|现有|可用|剩余)[^\n。；]{0,12}[1-9]\d*", text):
+                return ""
+    return text.strip()
+
+
+def _preview_reply(preview: dict, model_text: str = "") -> str:
+    changes = preview.get("changes") or []
+    lines = []
+    for item in changes[:8]:
+        title = item.get("item_name") or "耗材"
+        if item.get("spec"):
+            title += f"（{item['spec']}）"
+        place = " · ".join(part for part in (item.get("lab"), item.get("location_code")) if part)
+        unit = item.get("unit") or ""
+        before = (item.get("before") or {}).get("available_quantity", "新增")
+        after = (item.get("after") or {}).get("available_quantity", "停用")
+        prefix = f"[{place}] " if place else ""
+        lines.append(f"- {prefix}**{title}**：可用数量 `{before}` → `{after}` {unit}".rstrip())
+    if len(changes) > 8:
+        lines.append(f"- 其余 {len(changes) - 8} 项变更详见预览卡片")
+    if lines:
+        return (
+            "已为您生成**待确认预览**（当前尚未修改库存）：\n"
+            + "\n".join(lines)
+            + "\n\n请核对预览卡片中的物品、位置和数量，确认无误后点击**确认执行**。"
+        )
+    parsed = parse_model_json(model_text) or {}
+    note = _sanitize_model_reply(parsed.get("reply") if isinstance(parsed.get("reply"), str) else "")
+    if note:
+        return note + "\n\n请核对预览卡片内容，确认无误后点击**确认执行**（当前尚未修改库存）。"
+    return "已按当前数据生成**待确认预览**（当前尚未修改库存）。请核对物品、位置、数量和状态，确认无误后点击**确认执行**。"
+
+
+def reply_guidance(model_text: str, tools: list[dict] | None = None) -> str:
+    parsed = parse_model_json(model_text)
+    if isinstance(parsed, dict):
+        topics = parsed.get("explanation_topics", [])
+        fields = parsed.get("missing_fields", [])
+        fields = list(dict.fromkeys(field for field in fields if isinstance(field, str) and field in CLARIFICATION_FIELDS)) if isinstance(fields, list) else []
+        explanations = [EXPLANATIONS[topic] for topic in dict.fromkeys(topic for topic in topics if isinstance(topic, str)) if topic in EXPLANATIONS] if isinstance(topics, list) else []
+        raw_reply = parsed.get("reply") if isinstance(parsed.get("reply"), str) else ""
+        clean_reply = _sanitize_model_reply(raw_reply, tools)
+        if explanations:
+            base = clean_reply if clean_reply else "\n\n".join(explanations)
+            if fields:
+                missing_labels = [CLARIFICATION_FIELDS[f] for f in fields if CLARIFICATION_FIELDS[f] not in base]
+                if missing_labels:
+                    base += "\n\n请补充：" + "、".join(missing_labels) + "。"
+            return base
+        if fields:
+            labels = [CLARIFICATION_FIELDS[field] for field in fields]
+            if clean_reply:
+                missing_labels = [label for label in labels if label not in clean_reply]
+                if missing_labels:
+                    return clean_reply + "\n\n请补充以下资料：" + "、".join(missing_labels) + "。"
+                return clean_reply
+            return "请补充以下资料：" + "、".join(labels) + "。当前没有执行新的业务变更。"
+        if clean_reply:
+            return clean_reply
+        return ""
+    prose = (model_text or "").strip()
+    if len(prose) >= 12:
+        return _sanitize_model_reply(prose, tools)
     return ""
 
 
 def verified_reply(model_text: str, tools: list[dict]) -> str:
-    guidance = reply_guidance(model_text)
+    if tools:
+        failed_msgs = [
+            str(entry["result"].get("reply") or entry["result"].get("error") or "").strip()
+            for entry in tools
+            if isinstance(entry.get("result"), dict) and entry["result"].get("status") in {"needs_details", "failed"}
+        ]
+        failed_msgs = [msg for msg in dict.fromkeys(failed_msgs) if msg]
+    else:
+        failed_msgs = []
+    guidance = reply_guidance(model_text, tools)
     if guidance:
+        if failed_msgs and not any(msg in guidance for msg in failed_msgs):
+            return guidance + "\n\n提示：" + "；".join(failed_msgs)
         return guidance
     if tools:
-        if any(entry["result"].get("status") in {"needs_details", "failed"} for entry in tools):
-            return "请查看服务器返回的资料核对要求。当前没有执行新的业务变更。"
+        if failed_msgs:
+            return "需要核对以下信息：" + "；".join(failed_msgs) + "。当前没有执行新的业务变更。"
         return "以下内容来自服务器保存的查询或分析结果。业务变更需要另行生成完整预览并确认。"
     return "请说明要查询或处理的耗材、规格、位置和操作内容，也可以添加清单附件。当前没有执行新的业务变更。"
 

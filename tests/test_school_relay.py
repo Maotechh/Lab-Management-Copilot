@@ -84,7 +84,12 @@ async def test_dsh_stream_preserves_function_roundtrip(app, monkeypatch):
         def handler(request):
             assert str(request.url) == relay.settings.SCHOOL_RESPONSE_URL
             assert request.headers["Authorization"] == "Bearer upstream-test"
-            assert json.loads(request.content) == {**expected, "max_output_tokens": 1000, "temperature": 0.5}
+            assert json.loads(request.content) == {
+                **expected,
+                "model": relay.settings.GENAI_MODEL,
+                "max_output_tokens": relay.settings.GENAI_MAX_OUTPUT_TOKENS,
+                "temperature": 0.5,
+            }
             return httpx.Response(200, stream=stream, headers={"Content-Type": "text/event-stream; charset=utf-8"})
 
         upstream = mock_upstream(monkeypatch, handler)
@@ -134,10 +139,15 @@ async def test_disconnect_closes_pending_upstream(app, monkeypatch):
     assert upstream.is_closed
 
 
-@pytest.mark.parametrize("endpoint,key,status", [("http://retired.invalid", "test", None),
-                         (relay.settings.SCHOOL_RESPONSE_URL, "", None), (relay.settings.SCHOOL_RESPONSE_URL, "test", 401),
-                         (relay.settings.SCHOOL_RESPONSE_URL, "test", 200)])
-def test_deployment_preflight_is_read_only(tmp_path, monkeypatch, endpoint, key, status):
+@pytest.mark.parametrize("endpoint,key,status,expected_path", [
+    ("http://retired.invalid", "test", None, None),
+    (relay.settings.SCHOOL_RESPONSE_URL, "", None, None),
+    (relay.settings.SCHOOL_RESPONSE_URL, "test", 401, "/v1/responses"),
+    (relay.settings.SCHOOL_RESPONSE_URL, "test", 200, "/v1/responses"),
+    (relay.settings.DEFAULT_BASE_URL, "test", 200, "/v1/responses"),
+    (relay.settings.LEGACY_SCHOOL_RESPONSE_URL, "test", 200, "/api/v1/response"),
+])
+def test_deployment_preflight_is_read_only(tmp_path, monkeypatch, endpoint, key, status, expected_path):
     path = tmp_path / "environment"
     original = f"GENAI_BASE_URL={endpoint}\nGENAI_API_KEY={key}\n"
     path.write_text(original)
@@ -149,6 +159,6 @@ def test_deployment_preflight_is_read_only(tmp_path, monkeypatch, endpoint, key,
         environment.preflight(path)
     assert path.read_text() == original
     if status:
-        assert calls[0][:2] == ("POST", "/api/v1/response") and calls[0][3]["Authorization"] == "Bearer test"
+        assert calls[0][:2] == ("POST", expected_path) and calls[0][3]["Authorization"] == "Bearer test"
     else:
         assert not calls

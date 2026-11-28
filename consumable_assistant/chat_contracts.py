@@ -1,7 +1,6 @@
 """Explicit model-facing input contracts for the existing business functions."""
 from __future__ import annotations
 
-import json
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, create_model
@@ -239,6 +238,36 @@ def _without_server_versions(value):
     return value
 
 
+CONTRACT_PROMPT_SPEC = """
+业务预览（business_preview）payload 参数规范（严禁传入未定义字段或 version/order_version/item_versions；缺少必填项须先追问，禁止猜测）：
+- 通用枚举：State="ready"|"cleaning"|"repair"|"quarantine"|"damaged"|"lost"；StockState="ready"|"cleaning"|"repair"|"quarantine"。
+- stock（单笔库存操作）：必填 item_id(正整数)、action("inbound"|"consume"|"borrow"|"return"|"adjust"|"count"|"threshold"|"state")、quantity(数字)；可选 category、lab、location_code、source_quote、unit、note。条件必填：borrow 须填 borrower、purpose、destination、due_at；return 须填 loan_id、return_state(State)；state 须填 from_state(State)、to_state(State)；adjust 或 count 须填 note。
+- bulk（批量库存操作）：必填 operations=[stock对象, ...]。
+- mixed（混合多步计划）：必填 operations=[{"kind": 非mixed操作类型, "payload": 对应对象}, ...]。
+- purchase（已有库存耗材采购）：可选 action("draft"|"place"|"order"|"receive"|"cancel"，默认"order")、unit、note。条件必填：draft→item_id、quantity；order→item_id、quantity、owner、expected_at；place→order_id、owner、expected_at；receive→order_id、quantity；cancel→order_id、note。
+- procurement（新耗材独立采购需求）：必填 demand_id、action("place"|"receive"|"cancel")；可选 quantity、owner、expected_at、note、lab、location_code、category（receive 须填实际到货 quantity、lab、location_code）。
+- schedule（实验排课预留）：必填 name、course、venue、starts_at、ends_at、lines=[Line对象]；可选 people(默认0)、group_size(默认1)。Line：必填 item_id、action("consume"|"borrow")；可选 category、lab、location_code、unit、quantity、per_person、per_group、fixed、spare。
+- preparation（完整实验准备）：必填 name、course、venue、starts_at、ends_at、lines=[PreparationLine对象]；可选 people(默认0)、group_size(默认1)。PreparationLine：必填 action("consume"|"borrow")；可选 item_ids(整数列表，无匹配库存的新耗材传[])、item_name、spec、unit、category、lab、location_code、quantity、per_person、per_group、fixed、spare、source。
+- preparation_update（实验准备变更）：必填 preparation_id、action("replenish"|"cancel"|"revise")、note；revise 可选传 name、course、venue、starts_at、ends_at、people、group_size、lines。
+- execute_schedule（执行排课取用）：必填 schedule_id；可选 borrower。
+- cancel_schedule（取消排课）：必填 schedule_id、note。
+- template（课程模板）：必填 name、course、lines=[Line对象]；更新已有模板时可选 template_id。
+- create_item（新增耗材建档）：必填 item_name、unit、lab、location_code；可选 category、spec、brand、remark、threshold(默认"0")。
+- metadata（修改耗材资料）：必填 item_id；可选 item_name、category、lab、location_code、spec、brand、remark、usage_type("consumable"|"reusable"|"unclassified")、conversions({包装单位: 基础单位数量})。
+- transfer（跨位置转移）：必填 item_id、quantity、target_lab、target_location；可选 unit、state(StockState，默认"ready")、note。
+- archive_item / restore_item（停用/恢复耗材）：必填 item_id、note。
+- archive_location（停用位置）：必填 lab、location_code、note。
+- location_details（位置说明与照片）：必填 lab、location_code；可选 description(默认"")、photo_attachment_id。
+- alert（库存提醒处理）：必填 item_id、event_id、action("acknowledge"|"snooze"|"remind")；snooze 必填 until。
+- import（确认表格导入）：必填 preview_id；可选 allow_duplicate(布尔，默认false)、note。
+- prepare（确认课堂清单登记）：必填 preview_id、selected_rows(行号正整数列表)；可选 category、lab、location_code、actions({行号: "consume"|"borrow"})、edits({行号: {required_quantity, item_id, name, spec, unit}})、borrower、purpose、destination、due_at、repeat_reason。
+- prepare_remap（重映射清单条目）：必填 preview_id、row_number、item_id。
+- undo（撤销单笔库存事件）：必填 event_id。
+- undo_batch（撤销导入批次）：必填 batch_id、item_ids(整数列表)。
+- save_reference（保存历史位置参考）：必填 preview_id。
+- remove_reference（移除历史参考文件）：必填 file_id。
+""".strip()
+
+
 def prompt_contracts() -> str:
-    schemas = {kind: model.model_json_schema() for kind, model in CONTRACTS.items()}
-    return "\n业务 payload 的 JSON Schema（未提供的信息必须询问，禁止猜测）：\n" + json.dumps(schemas, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n" + CONTRACT_PROMPT_SPEC

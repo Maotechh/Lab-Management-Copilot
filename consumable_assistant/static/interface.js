@@ -12,7 +12,10 @@ window.renderMessageRecovery=function(){
   if(!pending)return;
   recovery.replaceChildren();const text=document.createElement('span');text.textContent='上一条消息的结果尚未确认，请重试原消息。';
   const retry=document.createElement('button');retry.type='button';retry.className='quiet';retry.textContent='重试原消息';
-  retry.addEventListener('click',()=>{if(pending.files.length&&!$('#chatFile').files.length){toast('请重新选择原消息的附件');$('#chatFile').click();return;}$('#chatText').value=pending.text;$('#chatText').dispatchEvent(new Event('input'));sendChatMessage();});recovery.append(text,retry);
+  retry.addEventListener('click',()=>{if(pending.files.length&&!$('#chatFile').files.length){toast('请重新选择原消息的附件');$('#chatFile').click();return;}$('#chatText').value=pending.text;$('#chatText').dispatchEvent(new Event('input'));sendChatMessage();});
+  const dismiss=document.createElement('button');dismiss.type='button';dismiss.className='quiet';dismiss.textContent='放弃此消息';
+  dismiss.addEventListener('click',()=>{localStorage.removeItem('lab-chat-pending');window.renderMessageRecovery();});
+  recovery.append(text,retry,dismiss);
 };
 const sidebarHome = document.createComment('desktop sidebar');
 $('#sidebar').before(sidebarHome);

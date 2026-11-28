@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows local tooling
+    fcntl = None
 import ipaddress
 import json
 import os
@@ -151,18 +154,14 @@ def tick() -> None:
 
 
 def main() -> None:
-    from .genai import check_health
     from .settings import DB_PATH
 
     worker_lock = (DB_PATH.parent / ".notification-worker.lock").open("a")
-    fcntl.flock(worker_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    last_check = 0.0
+    if fcntl is not None:
+        fcntl.flock(worker_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     while True:
         try:
             tick()
-            if time.monotonic() - last_check >= 300:
-                check_health()
-                last_check = time.monotonic()
         except Exception as exc:  # noqa: BLE001 - Keep scheduled checks running after an individual failure.
             print("Worker check failed:", type(exc).__name__, flush=True)
         time.sleep(10)

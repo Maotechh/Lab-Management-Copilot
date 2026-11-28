@@ -20,9 +20,10 @@ def stream_client():
 
 
 class SchoolStream(Response):
-    def __init__(self, payload: dict):
+    def __init__(self, payload: dict, url: str | None = None):
         super().__init__()
         self.payload = payload
+        self.url = url or settings.resolve_response_gateway() or settings.SCHOOL_RESPONSE_URL
 
     async def __call__(self, scope, receive, send):
         stack = AsyncExitStack()
@@ -37,7 +38,7 @@ class SchoolStream(Response):
                 try:
                     client = await stack.enter_async_context(stream_client())
                     upstream = await stack.enter_async_context(client.stream(
-                        "POST", settings.SCHOOL_RESPONSE_URL, json=self.payload,
+                        "POST", self.url, json=self.payload,
                         headers={"Authorization": f"Bearer {settings.GENAI_API_KEY}", "Accept": "text/event-stream"},
                     ))
                     if upstream.status_code != 200 or upstream.headers.get("content-type", "").split(";")[0].strip().lower() != "text/event-stream":
@@ -69,16 +70,18 @@ async def relay(request: Request):
     if (not request.client or request.client.host not in {"127.0.0.1", "::1"} or not expected
             or not secrets.compare_digest(authorization, f"Bearer {expected}".encode())):
         raise HTTPException(403, "Local DSH authentication required")
-    if not settings.GENAI_API_KEY or settings.GENAI_BASE_URL != settings.SCHOOL_RESPONSE_URL:
+    upstream_url = settings.resolve_response_gateway()
+    if not settings.GENAI_API_KEY or not upstream_url:
         raise HTTPException(503, "School gateway not configured")
     try:
         body = await request.json()
     except ValueError:
         raise HTTPException(400, "Invalid Responses request") from None
-    if (not isinstance(body, dict) or body.get("model") != "deepseek-pro" or body.get("stream") is not True
+    if (not isinstance(body, dict) or body.get("model") not in settings.QUALIFIED_MODELS or body.get("stream") is not True
             or not isinstance(body.get("input"), (str, list))):
-        raise HTTPException(400, "Expected a streaming deepseek-pro Responses request")
+        raise HTTPException(400, "Expected a streaming qualified Responses request")
     payload = {key: body[key] for key in ("model", "input", "instructions", "stream", "tools", "tool_choice") if key in body}
+    payload["model"] = settings.GENAI_MODEL
     inputs = payload["input"]
     if isinstance(inputs, list) and inputs and isinstance(inputs[0], dict) and inputs[0].get("role") in {"system", "developer"}:
         system = inputs[0].get("content")
@@ -91,4 +94,4 @@ async def relay(request: Request):
     ):
         raise HTTPException(400, "Only application function tools are supported")
     payload.update(max_output_tokens=settings.GENAI_MAX_OUTPUT_TOKENS, temperature=settings.GENAI_TEMPERATURE)
-    return SchoolStream(payload)
+    return SchoolStream(payload, url=upstream_url)

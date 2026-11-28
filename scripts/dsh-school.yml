@@ -12,9 +12,15 @@
         compat:
           supportsDeveloperRole: false
         models:
+          - id: deepseek-flash
+            input: [text, image]
+            contextWindow: 1048576
+            maxTokens: 16384
+            reasoningEfforts:
+              high: high
           - id: deepseek-pro
             input: [text, image]
             contextWindow: 1048576
-            maxTokens: 1000
+            maxTokens: 16384
             reasoningEfforts:
               high: high
